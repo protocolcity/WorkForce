@@ -136,6 +136,15 @@ def worker_to_spec(w: Worker) -> Dict[str, Any]:
     spec.pop("name", None)
     # Keep the file readable — drop empty strings / empty dicts that are defaults
     # except required paths already validated.
+    #
+    # scope_home / perimeter_grants: only write when set. Empty keys still break
+    # older running daemons whose Worker dataclass rejects unknown fields
+    # (2026-07-21: hire codex wrote empties → entire roster unreadable until
+    # stripped). Non-empty values require a daemon that knows the fields.
+    if not spec.get("scope_home"):
+        spec.pop("scope_home", None)
+    if not spec.get("perimeter_grants"):
+        spec.pop("perimeter_grants", None)
     return spec
 
 

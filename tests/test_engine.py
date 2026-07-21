@@ -359,3 +359,74 @@ def test_ghost_audit_skipped_in_dry_run(tmp_path):
     assert engine.dispatch(w, local(tmp_path), dry_run=True) == 0
     assert not marker.exists(), "ghost audit must not spawn in dry-run"
     assert "GHOST" not in ledger_text(tmp_path)
+
+
+# §6 scope enforcement
+
+def test_scope_home_not_set_always_dispatches(tmp_path):
+    """No scope_home → no scope check; dispatch proceeds normally."""
+    w = make_worker(tmp_path)
+    assert w.scope_home == ""
+    assert engine.dispatch(w, local(tmp_path)) == 0
+    assert "SCOPE_DENY" not in ledger_text(tmp_path)
+
+
+def test_scope_home_allow_within_home(tmp_path):
+    """workdir under scope_home → allowed; no SCOPE_DENY."""
+    home = tmp_path / "home"
+    home.mkdir()
+    hood = home / "neighborhood"
+    hood.mkdir()
+    w = make_worker(tmp_path, workdir=str(hood), scope_home=str(home))
+    assert engine.dispatch(w, local(tmp_path)) == 0
+    assert "SCOPE_DENY" not in ledger_text(tmp_path)
+    assert "DONE" in ledger_text(tmp_path)
+
+
+def test_scope_home_deny_cross_cabinet(tmp_path):
+    """workdir outside scope_home with no grants → SCOPE_DENY, rc=1, no START."""
+    home = tmp_path / "home-A"
+    home.mkdir()
+    cross = tmp_path / "cabinet-B"
+    cross.mkdir()
+    w = make_worker(tmp_path, workdir=str(cross), scope_home=str(home))
+    assert engine.dispatch(w, local(tmp_path)) == 1
+    text = ledger_text(tmp_path)
+    assert "SCOPE_DENY" in text
+    assert "START" not in text
+
+
+def test_scope_deny_logs_workdir_and_home(tmp_path):
+    """SCOPE_DENY ledger entry includes workdir= and home= fields."""
+    home = tmp_path / "home-A"
+    home.mkdir()
+    cross = tmp_path / "cabinet-B"
+    cross.mkdir()
+    w = make_worker(tmp_path, workdir=str(cross), scope_home=str(home))
+    engine.dispatch(w, local(tmp_path))
+    text = ledger_text(tmp_path)
+    assert "workdir=" in text and "home=" in text
+
+
+def test_scope_perimeter_grant_allows_cross_cabinet(tmp_path):
+    """workdir outside scope_home but listed in perimeter_grants → allowed."""
+    home = tmp_path / "home-A"
+    home.mkdir()
+    cross = tmp_path / "cabinet-B"
+    cross.mkdir()
+    w = make_worker(tmp_path, workdir=str(cross), scope_home=str(home),
+                    perimeter_grants=[str(cross)])
+    assert engine.dispatch(w, local(tmp_path)) == 0
+    assert "SCOPE_DENY" not in ledger_text(tmp_path)
+    assert "DONE" in ledger_text(tmp_path)
+
+
+def test_scope_check_fires_in_dry_run(tmp_path):
+    """Scope enforcement is not skipped during dry-run — misconfiguration must be caught."""
+    home = tmp_path / "home-A"
+    home.mkdir()
+    cross = tmp_path / "cabinet-B"
+    cross.mkdir()
+    w = make_worker(tmp_path, workdir=str(cross), scope_home=str(home))
+    assert engine.dispatch(w, local(tmp_path), dry_run=True) == 1
+    assert "SCOPE_DENY" in ledger_text(tmp_path)

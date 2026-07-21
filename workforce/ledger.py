@@ -1,8 +1,8 @@
 """Ledger — the append-only per-worker record of shifts (RUNNER_SPEC §8).
 
 One file per worker under ``local/ledger/<worker>.log``. Events:
-START / DONE / STOP / SKIP / ERROR / WARN, each UTC-timestamped, with
-key=value pairs. The board reads this; nothing ever rewrites it.
+START / DONE / STOP / SKIP / ERROR / WARN / SCOPE_DENY, each UTC-timestamped,
+with key=value pairs. The board reads this; nothing ever rewrites it.
 """
 
 import datetime
@@ -11,7 +11,7 @@ import re
 from typing import List, Optional, Union
 
 
-EVENTS = ("START", "DONE", "STOP", "SKIP", "ERROR", "WARN", "GHOST")
+EVENTS = ("START", "DONE", "STOP", "SKIP", "ERROR", "WARN", "GHOST", "SCOPE_DENY")
 
 
 def _utcnow() -> str:
@@ -106,7 +106,7 @@ def parse_shifts(text: str, limit: int = 20) -> List[dict]:
             current["reason"] = reason
             current["end_ts"] = ev["ts"]
             current = None
-        elif kind in ("SKIP", "ERROR", "WARN"):
+        elif kind in ("SKIP", "ERROR", "WARN", "SCOPE_DENY"):
             shifts.append({"ts": ev["ts"], "outcome": kind.lower(), "passes": 0,
                            "queue": "", "reason": ev.get("reason", ""),
                            "budget_secs": 0, "dry_run": False, "end_ts": ev["ts"],

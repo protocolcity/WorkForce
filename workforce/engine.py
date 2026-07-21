@@ -310,6 +310,25 @@ def _classify_exit(out_path: str) -> str:
     return "agent exit"
 
 
+def _scope_check(worker: Worker, ledger: Ledger) -> bool:
+    """Return True if workdir is within the allowed scope; log SCOPE_DENY and return False if not.
+
+    When scope_home is empty, enforcement is off (backward-compatible default).
+    Allowed set = realpath(scope_home) + realpath(grant) for each perimeter_grants entry.
+    The worker's workdir must equal or be a descendant of at least one allowed root.
+    """
+    if not worker.scope_home:
+        return True
+    home = os.path.realpath(worker.scope_home)
+    allowed = [home] + [os.path.realpath(g) for g in worker.perimeter_grants]
+    wd = os.path.realpath(worker.workdir)
+    for root in allowed:
+        if wd == root or wd.startswith(root + os.sep):
+            return True
+    ledger.append("SCOPE_DENY", workdir=wd, home=home)
+    return False
+
+
 def _run_ghost_audit(worker: Worker, env: Dict[str, str], ledger: Ledger) -> None:
     """Run the roster ghost_audit command (§8 SHOULD). Non-fatal.
 
@@ -344,6 +363,8 @@ def dispatch(worker: Worker, local_root: str, dry_run: bool = False) -> int:
     lock = _Lock(os.path.join(local_root, "locks"), worker.name, worker.budget_secs, ledger)
     try:
         queue_count = _preflight(worker)
+        if not _scope_check(worker, ledger):
+            return 1
         lock.acquire()
     except _Skip as skip:
         ledger.append("SKIP", reason=str(skip))

@@ -58,6 +58,8 @@ class Worker:
     authority_chain_required: bool = False  # when True, dispatch fails closed (NO_AUTHORITY_CHAIN) if authority_chain is empty
     staff: bool = False                    # permanent Office seat — boards group separately; hire gate blocks re-hire
     ghost_audit: List[str] = field(default_factory=list)  # §8 pre-shift reconciler argv; empty = no audit
+    scope_home: str = ""                # when set, realpath(workdir) must fall within realpath(scope_home) or a perimeter grant; empty = no enforcement
+    perimeter_grants: List[str] = field(default_factory=list)  # additional allowed roots (PERIMETER row grants)
 
     def validate(self) -> None:
         if not self.name:

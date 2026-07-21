@@ -636,6 +636,13 @@ button.callin:disabled { color:var(--dim); border-color:var(--line); cursor:defa
   border:1px solid var(--line); color:var(--dim); cursor:default; }
 .rt-chip.available { border-color:var(--ok); color:var(--ok); }
 .rt-chip.absent { opacity:.35; }
+/* wf-77: live shift-output tail in personnel-file drawer */
+.pf-tail { font:11px/1.4 ui-monospace,Menlo,monospace;
+  background:var(--crt-bg,#0a120a); color:var(--crt-ok,#33ff66);
+  border:1px solid var(--line); border-radius:4px; padding:10px;
+  max-height:200px; overflow-y:auto; white-space:pre-wrap;
+  word-break:break-all; margin-top:4px; }
+.pf-tail .pf-tail-note { color:var(--dim); font-style:italic; }
 """
 
 # setInterval only — requestAnimationFrame suspends in background panes (the
@@ -1691,8 +1698,39 @@ document.addEventListener("click",function(e){
 
 /* ── the personnel-file drawer: workers open ON the floor ── */
 var PF_NAME=null;
+/* wf-77: live SSE tail while worker in_flight */
+var PF_SSE=null;
+function stopPFTail(){if(PF_SSE){PF_SSE.close();PF_SSE=null;}}
+function startPFTail(name){
+  stopPFTail();
+  var el=$("pfTail"); if(!el)return;
+  PF_SSE=new EventSource("/api/out/"+encodeURIComponent(name)+"/stream");
+  PF_SSE.addEventListener("idle",function(){
+    if($("pfTail"))$("pfTail").innerHTML='<span class="pf-tail-note">not on shift</span>';
+    stopPFTail();});
+  PF_SSE.addEventListener("waiting",function(){
+    if($("pfTail"))$("pfTail").innerHTML='<span class="pf-tail-note">waiting for output\\u2026</span>';});
+  PF_SSE.addEventListener("chunk",function(e){
+    var box=$("pfTail"); if(!box)return;
+    try{var d=JSON.parse(e.data);
+      var note=box.querySelector(".pf-tail-note"); if(note)note.remove();
+      box.appendChild(document.createTextNode(String(d.text||"")));
+      box.scrollTop=box.scrollHeight;}catch(err){}});
+  PF_SSE.addEventListener("ping",function(){});
+  PF_SSE.addEventListener("end",function(){
+    var box=$("pfTail"); if(box){
+      var s=document.createElement("span"); s.className="pf-tail-note";
+      s.textContent="\\u2014 shift ended \\u2014"; box.appendChild(s);
+      box.scrollTop=box.scrollHeight;}
+    stopPFTail();});
+  PF_SSE.onerror=function(){
+    var box=$("pfTail"); if(box){
+      var s=document.createElement("span"); s.className="pf-tail-note";
+      s.textContent="\\u2014 stream error \\u2014"; box.appendChild(s);}
+    stopPFTail();};}
 function pfCloseBtn(){return '<button class="pf-close" onclick="closePF()" title="close (esc)">\\u00d7</button>';}
 function closePF(){
+  stopPFTail();
   PF_NAME=null;HIRE_CTX=null;$("pf").classList.remove("open");$("pfscrim").classList.remove("open");
   /* HISTORY LAW: Esc closes overlay; browser Back leaves the room.
      PF is app-owned — no sticky query to clear. Full file = /worker/<name>. */
@@ -1706,7 +1744,7 @@ function openPF(name){
   $("pfFoot").innerHTML="";
   fetch("/api/worker/"+encodeURIComponent(name),{cache:"no-store"})
   .then(function(r){if(!r.ok)throw 0; return r.json();})
-  .then(function(w){if(PF_NAME===name)renderPF(w);})
+  .then(function(w){if(PF_NAME===name){renderPF(w);if(inFlight(w))startPFTail(name);}})
   .catch(function(){if(PF_NAME===name)
     $("pfBody").innerHTML='<div class="pf-sec">NO FILE ON RECORD</div>';});}
 function renderPF(w){
@@ -1803,6 +1841,12 @@ function renderPF(w){
       '<span class="'+oc+'">'+esc(s.outcome)+(s.dry_run?" (dry)":"")+'</span>'+
       (s.passes?' \\u00b7 '+esc(s.passes)+'p':'')+
       (s.reason?' \\u00b7 <span class="dim">'+esc(s.reason)+'</span>':'')+'</div>';});
+  h+='<div class="pf-sec">SHIFT OUTPUT</div>';
+  if(inFlight(w)){
+    h+='<pre id="pfTail" class="pf-tail"><span class="pf-tail-note">connecting\\u2026</span></pre>';
+  }else{
+    h+='<div class="pf-shift dim">not on shift \\u2014 tail streams here while in_flight</div>';
+  }
   $("pfBody").innerHTML=h;
   $("pfFoot").innerHTML='<a href="/worker/'+esc(w.name)+'">full personnel file \\u2197</a>'+
     '<a href="/shifts/'+esc(w.name)+'">raw ledger</a>'+
