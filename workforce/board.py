@@ -35,6 +35,12 @@ from . import roster as roster_mod
 from . import runtimes as runtimes_mod
 
 DEFAULT_PORT = int(os.environ.get("WORKFORCE_PORT") or "8797")
+# ONE DOOR: this process is the WorkForce API (roster/scene/dispatch).
+# Citizen UI lives on suite :8801/roster. Opt out for host debug:
+# WORKFORCE_API_ONLY=0.
+_API_ONLY_RAW = (os.environ.get("WORKFORCE_API_ONLY") or "1").strip().lower()
+API_ONLY = _API_ONLY_RAW not in ("0", "false", "no", "off")
+SUITE_URL = (os.environ.get("SUITE_URL") or "http://127.0.0.1:8801").rstrip("/")
 
 # pc-23: "lane" is retired vocabulary on rendered surfaces; roster data still
 # says kind=lane until the schema migration lands.
@@ -3845,6 +3851,37 @@ class _Handler(BaseHTTPRequestHandler):
         self._json_response({"ok": False, "msg": "not found"}, 404)
 
     def do_GET(self) -> None:  # noqa: N802
+        path_only = (self.path or "").split("?", 1)[0]
+        # API-only: keep /api/*; retire HTML product pages → suite :8801.
+        if API_ONLY and not path_only.startswith("/api/"):
+            suite = SUITE_URL + "/roster"
+            accept = (self.headers.get("Accept") or "").lower()
+            if "text/html" in accept or "*/*" in accept or not accept:
+                body = (
+                    "<!doctype html><meta charset='utf-8'>"
+                    "<title>WorkForce API</title>"
+                    "<p>WorkForce HTML is retired — open the suite: "
+                    "<a href='%s'>%s</a></p>"
+                    "<p class='dim'>This port serves <code>/api/*</code> only "
+                    "(API_ONLY). Set <code>WORKFORCE_API_ONLY=0</code> for "
+                    "legacy board HTML.</p>"
+                ) % (html.escape(suite), html.escape(suite))
+                data = body.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            else:
+                payload = {
+                    "ok": False,
+                    "error": "workforce HTML retired (WORKFORCE_API_ONLY); "
+                             "open suite at %s" % suite,
+                    "api": "/api/scene",
+                    "suite": suite,
+                }
+                self._json_response(payload, 404)
+            return
         if self.path == "/" or self.path.startswith("/?"):
             # oc-20 root-merge: the living scene IS the room.
             body, code = render_scene(self.local_root,
