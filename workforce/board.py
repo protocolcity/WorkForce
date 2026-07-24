@@ -3876,10 +3876,20 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header("Location", "/")
             self.end_headers()
             return
-        elif self.path == "/api/scene":
-            data = json.dumps(scene_model(self.local_root)).encode("utf-8")
+        elif self.path.split("?")[0] == "/api/scene":
+            # pc-346: ?light=1 skips ledger tails / launchctl / runtime detect
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            light = (q.get("light") or ["0"])[0].lower() in ("1", "true", "yes")
+            try:
+                from .api.roster import scene_model as _sm
+                payload = _sm(self.local_root, light=light)
+            except Exception:
+                payload = scene_model(self.local_root)
+            data = json.dumps(payload).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            if light:
+                self.send_header("Cache-Control", "no-store, max-age=0")
             self.end_headers()
             self.wfile.write(data)
             return
