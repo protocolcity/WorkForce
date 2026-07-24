@@ -3,9 +3,10 @@
   "workers": {
     "claude-example": {
       "kind": "lane",
-      "workdir": "/path/to/neighborhood",
-      "contract": "/path/to/neighborhood/workers/claude-example/CONTRACT.md",
-      "prompt": "/path/to/neighborhood/workers/claude-example/prompt.md",
+      "display": "Example \u00b7 lane",
+      "workdir": "/path/to/project",
+      "contract": "/path/to/project/workers/claude-example/CONTRACT.md",
+      "prompt": "/path/to/project/workers/claude-example/prompt.md",
       "identity": "claude-example",
       "command": [
         "claude",
