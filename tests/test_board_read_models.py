@@ -5,6 +5,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import workforce.api.roster as _api_roster  # noqa: E402
 from workforce.board import (  # noqa: E402
     _contract_rules, _law_stack, _worker_flags, _worker_queue, render_law, worker_model,
 )
@@ -227,8 +228,6 @@ def test_worker_flags_empty_when_label_missing_from_queue_url(tmp_path):
 
 
 def test_worker_flags_queries_backlog_and_parked(tmp_path, monkeypatch):
-    import workforce.board as board_mod
-
     calls = []
 
     def fake_desk(path):
@@ -241,7 +240,7 @@ def test_worker_flags_queries_backlog_and_parked(tmp_path, monkeypatch):
                                "labels": ["needs:founder-decision", "worker:x"]}]}
         return None
 
-    monkeypatch.setattr(board_mod, "_desk_json", fake_desk)
+    monkeypatch.setattr(_api_roster, "_desk_json", fake_desk)
     w = _flag_worker(tmp_path,
                      queue_url="http://127.0.0.1:9999/api?product=workforce&label=worker:x")
     flags = _worker_flags(w)
@@ -253,15 +252,13 @@ def test_worker_flags_queries_backlog_and_parked(tmp_path, monkeypatch):
 
 
 def test_worker_flags_marks_founder_gated(tmp_path, monkeypatch):
-    import workforce.board as board_mod
-
     def fake_desk(path):
         if "status=parked" in path:
             return {"tasks": [{"id": "wf-9", "title": "ghost audit",
                                "labels": ["needs:founder-decision"]}]}
         return {"tasks": []}
 
-    monkeypatch.setattr(board_mod, "_desk_json", fake_desk)
+    monkeypatch.setattr(_api_roster, "_desk_json", fake_desk)
     w = _flag_worker(tmp_path,
                      queue_url="http://127.0.0.1:9999/api?product=workforce&label=worker:x")
     flags = _worker_flags(w)
@@ -270,15 +267,13 @@ def test_worker_flags_marks_founder_gated(tmp_path, monkeypatch):
 
 
 def test_worker_flags_non_gated_ticket_not_marked(tmp_path, monkeypatch):
-    import workforce.board as board_mod
-
     def fake_desk(path):
         if "status=backlog" in path:
             return {"tasks": [{"id": "wf-60", "title": "flags row",
                                "labels": ["worker:x", "ops"]}]}
         return {"tasks": []}
 
-    monkeypatch.setattr(board_mod, "_desk_json", fake_desk)
+    monkeypatch.setattr(_api_roster, "_desk_json", fake_desk)
     w = _flag_worker(tmp_path,
                      queue_url="http://127.0.0.1:9999/api?product=workforce&label=worker:x")
     flags = _worker_flags(w)
@@ -289,7 +284,6 @@ def test_worker_flags_non_gated_ticket_not_marked(tmp_path, monkeypatch):
 def test_worker_model_includes_flags(tmp_path, monkeypatch):
     import json
     import workforce.board as board_mod
-    from workforce.roster import Roster
 
     hood = tmp_path / "city" / "hood"
     hood.mkdir(parents=True)
@@ -312,13 +306,13 @@ def test_worker_model_includes_flags(tmp_path, monkeypatch):
         "queue_url": "http://127.0.0.1:9999/api?product=workforce&label=worker:x",
     }}}))
 
-    monkeypatch.setattr(board_mod, "_worker_holdings", lambda _w: [])
-    monkeypatch.setattr(board_mod, "_worker_ready_teaser", lambda _w, **_kw: [])
-    monkeypatch.setattr(board_mod, "_worker_flags",
+    monkeypatch.setattr(_api_roster, "_worker_holdings", lambda _w: [])
+    monkeypatch.setattr(_api_roster, "_worker_ready_teaser", lambda _w, **_kw: [])
+    monkeypatch.setattr(_api_roster, "_worker_flags",
                         lambda _w: [{"id": "wf-60", "title": "flags row",
                                      "status": "backlog", "founder_gated": False,
                                      "labels": [], "priority": 3, "href": ""}])
-    monkeypatch.setattr(board_mod, "_worker_queue", lambda _w: "5")
+    monkeypatch.setattr(_api_roster, "_worker_queue", lambda _w: "5")
 
     model = board_mod.worker_model(str(local), "x")
     assert model is not None

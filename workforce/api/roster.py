@@ -399,8 +399,15 @@ def scene_model(local_root: str, light: bool = False) -> Dict[str, object]:
     if roster:
         for name in sorted(roster.workers):
             w = roster.workers[name]
-            q = _worker_queue(w)
-            health = _worker_health(local_root, w, q)
+            # light=True must stay network-free: each queue_url probe is up to
+            # 3s, and a hung WorkLane (17 workers) freezes Map bootstrap for
+            # ~50s+ (founder 2026-07-25 outage). Full scene still probes.
+            if light:
+                q = "—"
+                health = {"cls": "ok", "why": "light"}
+            else:
+                q = _worker_queue(w)
+                health = _worker_health(local_root, w, q)
             cron = maybe_cron(w.schedule)
             nf = cron.next_fire(_utcnow()) if cron else None
             last = None

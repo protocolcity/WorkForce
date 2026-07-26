@@ -12,6 +12,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from workforce import board  # noqa: E402
+import workforce.api.roster as _api_roster  # noqa: E402
 from workforce.roster import Roster, Worker  # noqa: E402
 
 
@@ -33,9 +34,9 @@ def _worker(tmp_path, name, workdir, **kw):
 
 
 def _patch_roster(monkeypatch, roster):
-    monkeypatch.setattr(board, "_load_roster", lambda _root: roster)
+    monkeypatch.setattr(_api_roster, "_load_roster", lambda _root: roster)
     # keep the model network-free and deterministic in the test
-    monkeypatch.setattr(board, "_worker_queue", lambda w: "0")
+    monkeypatch.setattr(_api_roster, "_worker_queue", lambda w: "0")
 
 
 def test_scene_model_groups_workers_into_workplace_sectors(tmp_path, monkeypatch):
@@ -125,9 +126,9 @@ def test_scene_model_holding_teaser_only_when_in_flight(tmp_path, monkeypatch):
     idle = _worker(tmp_path, "riley", "hoodR")
     roster = Roster(workers={"morgan": active, "riley": idle}, path="t")
     _patch_roster(monkeypatch, roster)
-    monkeypatch.setattr(board, "heartbeat_status", lambda _root: "running")
+    monkeypatch.setattr(_api_roster, "heartbeat_status", lambda _root: "running")
     monkeypatch.setattr(
-        board, "read_heartbeat",
+        _api_roster, "read_heartbeat",
         lambda _root: {"pid": 1, "last_tick": "2026-07-16T12:00:00Z",
                        "state": "scheduling", "in_flight": ["morgan"]})
     calls = []
@@ -137,7 +138,7 @@ def test_scene_model_holding_teaser_only_when_in_flight(tmp_path, monkeypatch):
         return [{"id": "ts-1", "title": "Land the bay claim line",
                  "status": "in_progress", "href": "http://desk/t/ts-1"}]
 
-    monkeypatch.setattr(board, "_worker_holdings", fake_holdings)
+    monkeypatch.setattr(_api_roster, "_worker_holdings", fake_holdings)
     model = board.scene_model(str(local))
     workers = {row["name"]: row
                for s in model["sectors"]
@@ -216,7 +217,7 @@ def test_scene_tape_keeps_only_closed_status_changes(tmp_path, monkeypatch):
         {"entry_type": "status_change", "task_id": "oc-8", "task_title": "dead idea",
          "new_status": "canceled", "created_at": "2026-07-14T17:06:00Z"},
     ]
-    monkeypatch.setattr(board, "_desk_json", lambda path: _feed(entries))
+    monkeypatch.setattr(_api_roster, "_desk_json", lambda path: _feed(entries))
 
     tape = board.scene_tape(str(local))
 
@@ -231,7 +232,7 @@ def test_scene_tape_keeps_only_closed_status_changes(tmp_path, monkeypatch):
 
 def test_scene_tape_degrades_when_desk_unreachable(tmp_path, monkeypatch):
     local = _local(tmp_path)
-    monkeypatch.setattr(board, "_desk_json", lambda path: None)  # desk down
+    monkeypatch.setattr(_api_roster, "_desk_json", lambda path: None)  # desk down
 
     tape = board.scene_tape(str(local))
 
@@ -248,7 +249,7 @@ def test_scene_tape_hits_the_activity_feed(tmp_path, monkeypatch):
         seen["path"] = path
         return _feed([])
 
-    monkeypatch.setattr(board, "_desk_json", _spy)
+    monkeypatch.setattr(_api_roster, "_desk_json", _spy)
     board.scene_tape(str(local))
     # reuses render_board's desk proxy path; host stays in DESK config
     assert seen["path"].startswith("/api/dev/activity")
@@ -366,7 +367,7 @@ def test_report_model_verdicts_quiet_and_fires(tmp_path, monkeypatch):
     idle = _worker(tmp_path, "idle", "hoodR")  # manual, never dispatched
     roster = Roster(workers={"fresh": fresh, "idle": idle}, path="t")
     _patch_roster(monkeypatch, roster)
-    monkeypatch.setattr(board, "_desk_json", lambda _p: None)
+    monkeypatch.setattr(_api_roster, "_desk_json", lambda _p: None)
     ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     (local / "ledger" / "fresh.log").write_text(
         "{0} START identity=x kind=lane model=m budget_secs=1500 "
@@ -392,7 +393,7 @@ def test_report_model_joins_desk_authors_by_identity(tmp_path, monkeypatch):
     local = _local(tmp_path)
     w = _worker(tmp_path, "claude-hood", "hoodJ")
     _patch_roster(monkeypatch, Roster(workers={"claude-hood": w}, path="t"))
-    monkeypatch.setattr(board, "_desk_json", lambda _p: {
+    monkeypatch.setattr(_api_roster, "_desk_json", lambda _p: {
         "ok": True, "window_days": 7,
         "authors": [{"author": "claude-hood", "filed": 3, "closed": 5},
                     {"author": "owner-terminal", "filed": 9, "closed": 2}],
