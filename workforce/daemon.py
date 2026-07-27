@@ -480,6 +480,9 @@ def plist_xml(base: str, python: Optional[str] = None, path: Optional[str] = Non
     <key>WorkingDirectory</key><string>%s</string>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
+    <key>ProcessType</key><string>Background</string>
+    <key>AbandonProcessGroup</key><true/>
+    <key>ThrottleInterval</key><integer>30</integer>
     <key>ExitTimeOut</key><integer>3900</integer>
     <key>StandardOutPath</key><string>%s</string>
     <key>StandardErrorPath</key><string>%s</string>

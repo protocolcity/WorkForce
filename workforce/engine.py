@@ -4,7 +4,7 @@ Every MUST in ProtocolCity's docs/specs/RUNNER_SPEC.md maps to a step here:
 
   §2 identity/signing   -> _build_env (exactly one identity; ambient store
                            scoping vars stripped from the child env)
-  §3 single-flight      -> _Lock (atomic mkdir, stale reclaim, SKIP on held)
+  §3 single-flight      -> _Lock (atomic mkdir, pid-based orphan reclaim, stale reclaim, SKIP on held)
   §4 preflight          -> _preflight (CLI present, desk/queue probe, disk)
   §5 credentials        -> _fetch_secret (dispatch-time keychain read; never
                            persisted, never logged)
@@ -65,8 +65,26 @@ class _Skip(Exception):
     """Clean, recoverable non-dispatch (exit 0)."""
 
 
+def _pid_alive(pid: int) -> bool:
+    """Return True if pid is currently running on this host."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # process exists, different owner
+
+
 class _Lock:
-    """Atomic per-worker mutex with stale reclaim (§3)."""
+    """Atomic per-worker mutex with pid-based orphan reclaim and stale fallback (§3).
+
+    Lock dir contains a 'pid' file so a kill-9 orphan (empty dir or dead pid)
+    is reclaimed immediately on the next acquire, without waiting for the
+    stale-age timeout.
+    """
+
+    _PID_FILE = "pid"
 
     def __init__(self, root: str, worker: str, budget_secs: int, ledger: Ledger) -> None:
         self.path = os.path.join(root, "%s.lock" % worker)
@@ -75,24 +93,60 @@ class _Lock:
         self.held = False
         os.makedirs(root, exist_ok=True)
 
+    def _pid_path(self) -> str:
+        return os.path.join(self.path, self._PID_FILE)
+
+    def _write_pid(self) -> None:
+        with open(self._pid_path(), "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
+
+    def _reclaim(self, reason: str, **kw: object) -> None:
+        self.ledger.append("WARN", reason=reason, **kw)
+        try:
+            os.unlink(self._pid_path())
+        except OSError:
+            pass
+        os.rmdir(self.path)
+        os.mkdir(self.path)
+        self._write_pid()
+        self.held = True
+
     def acquire(self) -> None:
         try:
             os.mkdir(self.path)
+            self._write_pid()
             self.held = True
             return
         except FileExistsError:
             pass
+
+        # Lock dir exists — check pid to distinguish orphan from live hold.
+        try:
+            with open(self._pid_path(), "r", encoding="utf-8") as fh:
+                pid = int(fh.read().strip())
+            alive = _pid_alive(pid)
+        except (OSError, ValueError):
+            # No pid file or unreadable: orphan empty dir (crash/kill-9 before
+            # pid write, or old-format lock from a pre-fix deployment).
+            self._reclaim("orphan-no-pid")
+            return
+
+        if not alive:
+            self._reclaim("orphan-pid-dead", pid=pid)
+            return
+
         age = time.time() - os.stat(self.path).st_mtime
         if age > self.budget_secs + LOCK_GRACE_SECS:
-            self.ledger.append("WARN", reason="stale-lock-reclaim", age_secs=int(age))
-            os.rmdir(self.path)
-            os.mkdir(self.path)
-            self.held = True
+            self._reclaim("stale-lock-reclaim", age_secs=int(age))
             return
         raise _Skip("lock held (age %ds)" % int(age))
 
     def release(self) -> None:
         if self.held:
+            try:
+                os.unlink(self._pid_path())
+            except OSError:
+                pass
             try:
                 os.rmdir(self.path)
             except OSError:

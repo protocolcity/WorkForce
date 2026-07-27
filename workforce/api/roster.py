@@ -33,8 +33,15 @@ _KIND_LABELS = {"lane": "worker"}
 def generation_token(local_root: str) -> Dict[str, object]:
     """Cheap freshness token for suite pulse bus.
 
-    Covers roster, daemon heartbeat (in_flight), ledger and run-file mtimes.
-    Tokens only — no worker bodies.
+    Token changes on any of:
+    - hire/fire: roster.json mtime/size changes
+    - in_flight change: daemon.json mtime changes AND in_flight list hashed
+      explicitly (belt-and-suspenders so the suite Map detects dispatch
+      start/stop without waiting for the next ledger write)
+    - ledger write, run artifact, or lock acquire/release
+
+    Returns {"token": str, "ts": ISO8601Z, "in_flight": list, "daemon": str}.
+    Tokens only — no worker bodies; stays cheap enough for sub-second polling.
     """
     parts: List[str] = []
     for name in ("roster.json", "daemon.json", "platforms.json"):
@@ -383,8 +390,14 @@ def scene_model(local_root: str, light: bool = False) -> Dict[str, object]:
     except a bounded desk probe for workers currently in_flight (live claim
     teaser on the bay) — idle floors still hit zero desk URLs.
 
-    light=True: skip ledger tails, launchctl services, runtime detect
-    — for suite Overview / pulse-adjacent brief. Full scene still default.
+    light=True: skip ledger tails, launchctl services,
+    runtime detect, queue probes, and in_flight holdings — for suite Map
+    people bootstrap. Stripped fields are fixed to sentinel values so suite
+    consumers need no null-guards:
+        cli=""  queue="—"  health="ok"  why="light"  holding=[]
+        last_shift=null  services=[]  runtimes={detected:[],pool:[]}
+    Stable fields present in both modes: name, kind, display, model,
+    schedule, owned, owner, skill, next_fire, daemon, in_flight, last_tick.
     """
     roster = _load_roster(local_root)
     status = heartbeat_status(local_root)

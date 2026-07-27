@@ -76,6 +76,15 @@ def main(argv=None) -> int:
     sub.add_parser("runtimes",
                    help="list installed agent runtimes and their employment status")
 
+    p_doctor = sub.add_parser(
+        "doctor",
+        help="check roster health — dual-home drift between engine and suite homes",
+    )
+    p_doctor.add_argument(
+        "--suite-roster", default="",
+        help="suite roster path to compare (default: $WORKFORCE_SUITE_ROSTER)",
+    )
+
     args = parser.parse_args(argv)
     _data_env = os.environ.get("WORKFORCE_DATA_DIR", "").strip()
     # _base: the WorkForce home directory — source of local/ state and roster.
@@ -150,6 +159,47 @@ def main(argv=None) -> int:
         print(result.get("msg") or ("hired %s" % args.name))
         for step in result.get("next_steps") or []:
             print("  next: %s" % step)
+        return 0
+
+    if args.cmd == "doctor":
+        faults = []
+        engine_workers = set()
+        try:
+            er = roster_mod.load(args.file, base=_base)
+            engine_workers = set(er.workers)
+            print("Engine roster: %s (%d workers)" % (er.path, len(engine_workers)))
+        except roster_mod.RosterError as exc:
+            faults.append("ENGINE: %s" % exc)
+            print("Engine roster: LOAD ERROR — %s" % exc)
+
+        suite_path = (getattr(args, "suite_roster", None) or "").strip() or \
+            os.environ.get("WORKFORCE_SUITE_ROSTER", "").strip()
+        if suite_path:
+            suite_workers = set()
+            try:
+                sr = roster_mod.load(path=suite_path)
+                suite_workers = set(sr.workers)
+                print("Suite roster:  %s (%d workers)" % (sr.path, len(suite_workers)))
+            except roster_mod.RosterError as exc:
+                faults.append("SUITE: %s" % exc)
+                print("Suite roster:  LOAD ERROR — %s" % exc)
+            if engine_workers and suite_workers:
+                only_engine = engine_workers - suite_workers
+                only_suite = suite_workers - engine_workers
+                if only_engine:
+                    faults.append("DRIFT: in engine only: %s" % ", ".join(sorted(only_engine)))
+                if only_suite:
+                    faults.append("DRIFT: in suite only: %s" % ", ".join(sorted(only_suite)))
+                if not only_engine and not only_suite:
+                    print("Dual-home:     OK — worker keys match")
+        else:
+            print("Suite roster:  not configured (set WORKFORCE_SUITE_ROSTER or --suite-roster)")
+
+        if faults:
+            for f in faults:
+                print("FAULT: %s" % f, file=sys.stderr)
+            return 1
+        print("doctor: OK")
         return 0
 
     if args.cmd == "runtimes":

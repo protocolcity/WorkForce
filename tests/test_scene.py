@@ -435,3 +435,90 @@ def test_days_param_parses_and_survives_junk():
     assert board._days_param("/report?days=30") == 30
     assert board._days_param("/api/report?days=abc") is None
     assert board._days_param("/report") is None
+
+
+# ── wf-84: light scene schema contract + generation token ─────────────────
+
+
+def test_light_scene_schema_sentinels(tmp_path, monkeypatch):
+    """light=1 payload uses fixed sentinels; stable fields still present."""
+    local = _local(tmp_path)
+    w = _worker(tmp_path, "kai", "hoodK", schedule="*/5 * * * *")
+    roster = Roster(workers={"kai": w}, path="t")
+    _patch_roster(monkeypatch, roster)
+
+    model = _api_roster.scene_model(str(local), light=True)
+
+    assert model["light"] is True
+    assert model["services"] == []
+    assert model["runtimes"] == {"detected": [], "pool": []}
+
+    workers = {row["name"]: row
+               for s in model["sectors"]
+               for row in s["workers"]}
+    k = workers["kai"]
+    # stripped fields → sentinels (no null-guards needed in suite consumers)
+    assert k["cli"] == ""
+    assert k["queue"] == "—"
+    assert k["health"] == "ok"
+    assert k["why"] == "light"
+    assert k["holding"] == []
+    assert k["last_shift"] is None
+    # stable fields still present and typed
+    for field in ("name", "kind", "display", "model", "schedule",
+                  "owned", "owner", "skill", "next_fire"):
+        assert field in k, "missing stable field: %s" % field
+    assert k["name"] == "kai"
+    assert k["owned"] is True
+
+
+def test_generation_token_moves_on_roster_change(tmp_path):
+    """Token must differ after roster.json is written (hire/fire path)."""
+    local = tmp_path / "local"
+    (local / "ledger").mkdir(parents=True)
+    roster_file = local / "roster.json"
+    roster_file.write_text('{"workers": {}}')
+
+    t1 = _api_roster.generation_token(str(local))["token"]
+
+    import time
+    time.sleep(0.01)
+    roster_file.write_text('{"workers": {"otto": {}}}')
+
+    t2 = _api_roster.generation_token(str(local))["token"]
+    assert t1 != t2, "token did not change after roster.json rewrite"
+
+
+def test_generation_token_moves_on_in_flight_change(tmp_path):
+    """Token must differ when the in_flight list changes (daemon dispatch)."""
+    import json as _json
+    local = tmp_path / "local"
+    (local / "ledger").mkdir(parents=True)
+
+    hb_file = local / "daemon.json"
+    hb_file.write_text(_json.dumps({"pid": 1, "last_tick": "2026-07-26T00:00:00Z",
+                                    "state": "scheduling", "in_flight": []}))
+
+    t1 = _api_roster.generation_token(str(local))["token"]
+
+    import time
+    time.sleep(0.01)
+    hb_file.write_text(_json.dumps({"pid": 1, "last_tick": "2026-07-26T00:00:01Z",
+                                    "state": "scheduling", "in_flight": ["otto"]}))
+
+    t2 = _api_roster.generation_token(str(local))["token"]
+    assert t1 != t2, "token did not change when in_flight grew"
+
+
+def test_generation_token_in_flight_field_mirrors_heartbeat(tmp_path):
+    """The token response carries the current in_flight list for suite Map."""
+    import json as _json
+    local = tmp_path / "local"
+    (local / "ledger").mkdir(parents=True)
+    hb_file = local / "daemon.json"
+    hb_file.write_text(_json.dumps({"pid": 1, "last_tick": "2026-07-26T00:00:00Z",
+                                    "state": "scheduling", "in_flight": ["kai", "morgan"]}))
+
+    result = _api_roster.generation_token(str(local))
+    assert sorted(result["in_flight"]) == ["kai", "morgan"]
+    assert result["daemon"] in ("running", "stopped", "draining")

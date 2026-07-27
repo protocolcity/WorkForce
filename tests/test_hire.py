@@ -101,7 +101,14 @@ def test_hire_plants_papers_and_arms_roster(tmp_path):
     raw = json.loads(roster_path.read_text())
     assert "neo" in raw["workers"]
     assert raw["workers"]["neo"]["identity"] == "neo"
-    assert "gridfinity" in raw["workers"]["neo"]["queue_url"]
+    qurl = raw["workers"]["neo"]["queue_url"]
+    assert "gridfinity" in qurl
+    # Exclusive hand feed — product alone is not enough (starves siblings / dual-claims)
+    assert "label=worker:neo" in qurl
+    assert "product=gridfinity" in qurl
+    body = contract.read_text()
+    assert "worker:neo" in body
+    assert "lane:neo" not in body
     # Live load still validates
     r = load(path=str(roster_path), base=str(tmp_path))
     assert "neo" in r.workers

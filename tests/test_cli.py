@@ -79,3 +79,96 @@ def test_daemon_plist_bakes_data_dir_when_env_set(tmp_path, monkeypatch, capsys)
     # data_dir appears as both WorkingDirectory and an EnvironmentVariables entry.
     assert str(tmp_path) in captured.out
     assert "WORKFORCE_DATA_DIR" in captured.out
+
+
+# --- doctor subcommand ---
+
+import json  # noqa: E402
+
+
+def _write_roster(path, names):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    workers = {}
+    for n in names:
+        workers[n] = {
+            "workdir": str(path.parent),
+            "contract": str(path.parent / "c.md"),
+            "prompt": str(path.parent / "p.md"),
+            "identity": n,
+            "command": ["true"],
+        }
+    path.write_text(json.dumps({"workers": workers}))
+
+
+def test_doctor_no_suite_roster_exits_ok(tmp_path, monkeypatch, capsys):
+    """Without a suite roster configured, doctor reports unconfigured and exits 0."""
+    data = tmp_path / "engine"
+    roster = data / "local" / "roster.json"
+    _write_roster(roster, ["alpha"])
+    monkeypatch.setenv("WORKFORCE_DATA_DIR", str(data))
+    monkeypatch.delenv("WORKFORCE_SUITE_ROSTER", raising=False)
+    rc = cli.main(["doctor"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "not configured" in out
+    assert "doctor: OK" in out
+
+
+def test_doctor_matching_rosters_exits_ok(tmp_path, monkeypatch, capsys):
+    """Identical worker keys in both homes → no drift, exits 0."""
+    data = tmp_path / "engine"
+    roster = data / "local" / "roster.json"
+    _write_roster(roster, ["alpha", "beta"])
+    suite = tmp_path / "suite" / "roster.json"
+    _write_roster(suite, ["alpha", "beta"])
+    monkeypatch.setenv("WORKFORCE_DATA_DIR", str(data))
+    rc = cli.main(["doctor", "--suite-roster", str(suite)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "OK" in out
+    assert "DRIFT" not in out
+
+
+def test_doctor_detects_engine_only_worker(tmp_path, monkeypatch, capsys):
+    """Worker present in engine but missing from suite → DRIFT fault, exits 1."""
+    data = tmp_path / "engine"
+    roster = data / "local" / "roster.json"
+    _write_roster(roster, ["alpha", "beta"])
+    suite = tmp_path / "suite" / "roster.json"
+    _write_roster(suite, ["alpha"])
+    monkeypatch.setenv("WORKFORCE_DATA_DIR", str(data))
+    rc = cli.main(["doctor", "--suite-roster", str(suite)])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "beta" in captured.err
+    assert "engine only" in captured.err
+
+
+def test_doctor_detects_suite_only_worker(tmp_path, monkeypatch, capsys):
+    """Worker present in suite but missing from engine → DRIFT fault, exits 1."""
+    data = tmp_path / "engine"
+    roster = data / "local" / "roster.json"
+    _write_roster(roster, ["alpha"])
+    suite = tmp_path / "suite" / "roster.json"
+    _write_roster(suite, ["alpha", "ghost"])
+    monkeypatch.setenv("WORKFORCE_DATA_DIR", str(data))
+    rc = cli.main(["doctor", "--suite-roster", str(suite)])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "ghost" in captured.err
+    assert "suite only" in captured.err
+
+
+def test_doctor_suite_path_from_env(tmp_path, monkeypatch, capsys):
+    """WORKFORCE_SUITE_ROSTER env var is respected as the suite path."""
+    data = tmp_path / "engine"
+    roster = data / "local" / "roster.json"
+    _write_roster(roster, ["alpha"])
+    suite = tmp_path / "suite" / "roster.json"
+    _write_roster(suite, ["alpha"])
+    monkeypatch.setenv("WORKFORCE_DATA_DIR", str(data))
+    monkeypatch.setenv("WORKFORCE_SUITE_ROSTER", str(suite))
+    rc = cli.main(["doctor"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "OK" in out

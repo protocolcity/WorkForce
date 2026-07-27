@@ -48,7 +48,8 @@ _FALLBACK_CONTRACT = """# {slug} — Employment Contract (L2)
 
 ## Lane — what this worker may claim
 
-- Tickets labeled `lane:{slug}` in store `{store}`, and nothing else.
+- Tickets labeled `worker:{slug}` in store `{store}`, and nothing else.
+  (Vocabulary law: routing label is worker:<id>, not lane: — pc-23 / STAFFING.)
 
 ## Never touch
 
@@ -67,7 +68,7 @@ _FALLBACK_PROMPT = """You are `{slug}`, a worker in the {neighborhood} neighborh
 
 1. Read your contract: `workers/{slug}/CONTRACT.md`.
 2. Read the neighborhood law: `AGENTS.md` at the repo root.
-3. Check the queue: tickets labeled `lane:{slug}` in store `{store}`.
+3. Check the queue: tickets labeled `worker:{slug}` in store `{store}` only.
 4. Do ONE slice of ONE ticket. Sign everything as `{slug}`.
 5. Queue empty or stop rule hit: stop cleanly and say why.
 """
@@ -270,16 +271,23 @@ def hire(
     if display:
         disp = display.strip()
     elif role_title:
-        # Title-case the persona for the board label
-        persona = name.strip() or slug
+        # Board label "Reed · Role" — title-case raw slug personas
+        raw = (name.strip() or slug)
+        if raw.lower() == slug:
+            persona = slug[:1].upper() + slug[1:] if slug else slug
+        else:
+            persona = raw
         disp = "%s · %s" % (persona, role_title)
     else:
         disp = name.strip() or slug
 
     store = project or os.path.basename(workdir).lower().replace(" ", "-")
     if not queue_url and kind == "lane":
+        # Exclusive hand feed: never bare product ready —
+        # unfiltered queues let one hire drain the whole neighborhood.
         queue_url = (
-            "http://127.0.0.1:8799/api/admin/tasks/ready?project=%s" % store
+            "http://127.0.0.1:8799/api/admin/tasks/ready"
+            "?product=%s&label=worker:%s" % (store, slug)
         )
 
     contract = os.path.join(workdir, "workers", slug, "CONTRACT.md")

@@ -232,6 +232,16 @@ def test_dispatch_endpoint_fires_and_readonly_board_refuses(tmp_path):
         httpd.shutdown()
 
 
+def test_plist_background_hardening(tmp_path):
+    """wf-91: mirror pc-536 — ProcessType Background prevents jetsam kills;
+    AbandonProcessGroup lets dispatch children outlive a daemon restart;
+    ThrottleInterval 30 dampens rapid restart loops."""
+    xml = plist_xml(str(tmp_path), python="/usr/bin/python3")
+    assert "<key>ProcessType</key><string>Background</string>" in xml
+    assert "<key>AbandonProcessGroup</key><true/>" in xml
+    assert "<key>ThrottleInterval</key><integer>30</integer>" in xml
+
+
 def test_plist_carries_service_path(tmp_path):
     """launchd's bare PATH broke the first scheduled fire (SKIP: CLI not
     installed, 2026-07-14T01:40Z) — the plist must set a usable PATH."""

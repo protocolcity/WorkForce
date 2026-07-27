@@ -31,7 +31,22 @@ workforce dispatch <worker> --dry-run   # rehearse one shift, spend nothing
 workforce ledger <worker>            # the shift record
 workforce daemon                     # the scheduler — one service, serves the board
 workforce open                       # open the Roster board in your browser
+workforce-mcp                        # stdio MCP for chat agents
 ```
+
+### MCP (chat agents)
+
+```bash
+# Point at a city roster (BluePrint path):
+export WORKFORCE_ROSTER=~/my-city/.protocolcity/workforce/local/roster.json
+# or: export WORKFORCE_DATA_DIR=~/my-city/.protocolcity/workforce
+python -m workforce.mcp --author you
+# tools: wf_status · wf_roster · wf_show · wf_hire · wf_dispatch
+```
+
+Wire next to WorkLane MCP (`python -m worklane.mcp` / `worklane-mcp`)
+so agents can hire and dispatch as well as file work orders. Prefer
+`dry_run=true` on hire/dispatch until you trust the seat.
 
 Part of the [ProtocolCity](https://github.com/protocolcity) suite: pairs
 naturally with **WorkLane** (the ticket desk your workers pull work from),

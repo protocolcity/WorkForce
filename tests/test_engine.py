@@ -90,12 +90,42 @@ def test_missing_cli_skips(tmp_path):
 
 
 def test_lock_held_skips(tmp_path):
+    # Lock held by a live process (our own pid) → SKIP.
+    w = make_worker(tmp_path)
+    lock_dir = tmp_path / "local" / "locks"
+    lock_dir.mkdir(parents=True)
+    lock = lock_dir / "tester.lock"
+    lock.mkdir()
+    (lock / "pid").write_text(str(os.getpid()))
+    assert engine.dispatch(w, local(tmp_path)) == 0
+    assert "lock held" in ledger_text(tmp_path)
+
+
+def test_orphan_empty_lock_is_reclaimed(tmp_path):
+    # Empty lock dir (no pid file) left by a kill-9 → reclaimed, dispatch succeeds.
     w = make_worker(tmp_path)
     lock_dir = tmp_path / "local" / "locks"
     lock_dir.mkdir(parents=True)
     (lock_dir / "tester.lock").mkdir()
     assert engine.dispatch(w, local(tmp_path)) == 0
-    assert "lock held" in ledger_text(tmp_path)
+    assert "orphan-no-pid" in ledger_text(tmp_path)
+    assert "START" in ledger_text(tmp_path)
+
+
+def test_orphan_dead_pid_is_reclaimed(tmp_path):
+    # Lock dir with a dead pid → reclaimed, dispatch succeeds.
+    import subprocess as _sp
+    w = make_worker(tmp_path)
+    lock_dir = tmp_path / "local" / "locks"
+    lock_dir.mkdir(parents=True)
+    lock = lock_dir / "tester.lock"
+    lock.mkdir()
+    proc = _sp.Popen(["/bin/sh", "-c", "exit 0"])
+    proc.wait()
+    (lock / "pid").write_text(str(proc.pid))
+    assert engine.dispatch(w, local(tmp_path)) == 0
+    assert "orphan-pid-dead" in ledger_text(tmp_path)
+    assert "START" in ledger_text(tmp_path)
 
 
 def test_budget_kill_is_infra_error(tmp_path):
