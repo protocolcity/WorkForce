@@ -106,6 +106,26 @@ class _Handler(BaseHTTPRequestHandler):
                 code = 200 if ok else 409
             self._json_response(payload, code)
             return
+        if self.path.startswith("/api/skip/"):
+            # wf-94: skip next scheduled fire only (Map Approaching abandon)
+            name = self.path.strip("/").split("/")[-1]
+            if self.daemon is None:
+                payload = {
+                    "ok": False,
+                    "msg": "board is read-only (no daemon in this process)",
+                }
+                code = 409
+            else:
+                ok, msg, skipped, nxt = self.daemon.skip_now(name)
+                payload = {
+                    "ok": ok,
+                    "msg": msg,
+                    "skipped_fire": skipped,
+                    "next_fire": nxt,
+                }
+                code = 200 if ok else 409
+            self._json_response(payload, code)
+            return
         if self.path == "/api/hire" or self.path.startswith("/api/hire?"):
             # STAFFING §2 — employment write path (papers + roster). Localhost
             # bind is the gate; daemon not required (roster reload is next tick).

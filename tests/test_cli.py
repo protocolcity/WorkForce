@@ -172,3 +172,42 @@ def test_doctor_suite_path_from_env(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "OK" in out
+
+
+# --- one-file roster law ---
+
+
+def test_doctor_single_home_symlink_exits_ok(tmp_path, monkeypatch, capsys):
+    """Engine roster is a symlink to the canonical (suite) file → samefile True → single-home OK."""
+    canonical = tmp_path / "city" / "local" / "roster.json"
+    _write_roster(canonical, ["alpha", "beta"])
+    data = tmp_path / "engine"
+    local_dir = data / "local"
+    local_dir.mkdir(parents=True)
+    symlink = local_dir / "roster.json"
+    symlink.symlink_to(canonical)
+    monkeypatch.setenv("WORKFORCE_DATA_DIR", str(data))
+    rc = cli.main(["doctor", "--suite-roster", str(canonical)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "single-home" in out
+    assert "one physical roster" in out
+    assert "FAULT" not in out
+    assert "DRIFT" not in out
+
+
+def test_doctor_single_home_via_env_symlink_exits_ok(tmp_path, monkeypatch, capsys):
+    """WORKFORCE_SUITE_ROSTER pointing at the symlink target is also recognised as single-home."""
+    canonical = tmp_path / "city" / "local" / "roster.json"
+    _write_roster(canonical, ["gamma"])
+    data = tmp_path / "engine"
+    local_dir = data / "local"
+    local_dir.mkdir(parents=True)
+    (local_dir / "roster.json").symlink_to(canonical)
+    monkeypatch.setenv("WORKFORCE_DATA_DIR", str(data))
+    monkeypatch.setenv("WORKFORCE_SUITE_ROSTER", str(canonical))
+    rc = cli.main(["doctor"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "single-home" in out
+    assert "one physical roster" in out

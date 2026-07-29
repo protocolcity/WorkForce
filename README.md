@@ -15,9 +15,9 @@ shows you who is employed, who is on the floor, and what every shift cost.
 ## Install the whole suite (recommended)
 
 ```bash
-brew install protocolcity/tap/protocolcity
-protocolcity found ~/my-city
-protocolcity serve --with-engines
+brew install protocolcity/tap/blueprint
+blueprint setup ~/my-city
+blueprint serve --root ~/my-city --with-engines
 # → http://127.0.0.1:8801/  (Map · Desk · Roster)
 ```
 

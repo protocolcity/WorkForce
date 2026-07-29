@@ -217,6 +217,44 @@ class Daemon:
         self._log("manual dispatch %s" % name)
         return True, "dispatched"
 
+    def skip_now(self, name: str) -> Tuple[bool, str, Optional[str], Optional[str]]:
+        """Skip the *next* scheduled fire only.
+
+        Marks the upcoming fire minute as already fired so the tick path
+        advances to the following cron match. Does not kill an in-flight shift
+        (returns 409-shaped false). Does not pause the hire forever.
+        """
+        roster = self._roster()
+        if not roster:
+            return False, "roster unreadable", None, None
+        if name not in roster.workers:
+            return False, "no such worker", None, None
+        prev = self._threads.get(name)
+        if prev and prev.is_alive():
+            return False, "shift already in flight — cannot skip while LIVE", None, None
+        w = roster.workers[name]
+        cron = maybe_cron(w.schedule)
+        if not cron:
+            return False, "worker has no schedule", None, None
+        now = _utcnow()
+        # Next match at or after now; if already matched this minute, next after
+        nxt = cron.next_fire(now)
+        if nxt is None:
+            return False, "no upcoming fire", None, None
+        minute_key = nxt.strftime("%Y-%m-%dT%H:%M")
+        self._fired[name] = minute_key
+        self._write_heartbeat(now, roster)
+        # Following fire after the skipped one (for response)
+        following = cron.next_fire(nxt + datetime.timedelta(minutes=1))
+        self._log("skip_now %s skipped_fire=%s next=%s" % (
+            name, minute_key, _iso(following) if following else ""))
+        return (
+            True,
+            "skipped upcoming fire",
+            minute_key,
+            _iso(following) if following else None,
+        )
+
     # ── wf-74 event trigger (Desk feed → fire_now) ────────────────────
 
     def _load_event_cursors(self) -> Dict[str, int]:

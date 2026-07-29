@@ -153,7 +153,7 @@ def _template_dir() -> Optional[Path]:
     env = os.environ.get("PROTOCOLCITY_TEMPLATES", "").strip()
     if env and os.path.isdir(env):
         return Path(env)
-    # Developer/workforce/workforce/hire.py → Developer/ProtocolCity/templates
+    # <city root>/workforce/workforce/hire.py → <city root>/ProtocolCity/templates
     sibling = Path(__file__).resolve().parents[2] / "ProtocolCity" / "templates"
     if sibling.is_dir():
         return sibling
@@ -268,8 +268,14 @@ def hire(
         raise RosterError("identity %r is reserved (synthetic citizen)" % identity)
 
     role_title = (role or "").strip()
+    kind_norm = (kind or "lane").strip().lower()
     if display:
         disp = display.strip()
+    elif kind_norm == "job" and role_title:
+        # Scheduled jobs: public label is the function/role only (not
+        # "Github-desk · Public Issues Desk"). Map OPS_TASK_LABELS + dig-in
+        # then share one readable name across BP cities.
+        disp = role_title
     elif role_title:
         # Board label "Reed · Role" — title-case raw slug personas
         raw = (name.strip() or slug)

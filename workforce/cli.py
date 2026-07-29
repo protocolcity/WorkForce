@@ -164,10 +164,12 @@ def main(argv=None) -> int:
     if args.cmd == "doctor":
         faults = []
         engine_workers = set()
+        er_path = ""
         try:
             er = roster_mod.load(args.file, base=_base)
             engine_workers = set(er.workers)
-            print("Engine roster: %s (%d workers)" % (er.path, len(engine_workers)))
+            er_path = er.path or ""
+            print("Engine roster: %s (%d workers)" % (er_path, len(engine_workers)))
         except roster_mod.RosterError as exc:
             faults.append("ENGINE: %s" % exc)
             print("Engine roster: LOAD ERROR — %s" % exc)
@@ -175,23 +177,43 @@ def main(argv=None) -> int:
         suite_path = (getattr(args, "suite_roster", None) or "").strip() or \
             os.environ.get("WORKFORCE_SUITE_ROSTER", "").strip()
         if suite_path:
-            suite_workers = set()
-            try:
-                sr = roster_mod.load(path=suite_path)
-                suite_workers = set(sr.workers)
-                print("Suite roster:  %s (%d workers)" % (sr.path, len(suite_workers)))
-            except roster_mod.RosterError as exc:
-                faults.append("SUITE: %s" % exc)
-                print("Suite roster:  LOAD ERROR — %s" % exc)
-            if engine_workers and suite_workers:
-                only_engine = engine_workers - suite_workers
-                only_suite = suite_workers - engine_workers
-                if only_engine:
-                    faults.append("DRIFT: in engine only: %s" % ", ".join(sorted(only_engine)))
-                if only_suite:
-                    faults.append("DRIFT: in suite only: %s" % ", ".join(sorted(only_suite)))
-                if not only_engine and not only_suite:
-                    print("Dual-home:     OK — worker keys match")
+            # One-file law (2026-07-27): same inode / realpath → no dual-home drift.
+            same_home = False
+            if er_path:
+                try:
+                    same_home = os.path.samefile(er_path, suite_path)
+                except OSError:
+                    same_home = (
+                        os.path.realpath(er_path) == os.path.realpath(suite_path)
+                    )
+            if same_home:
+                print("Suite roster:  same file as engine (single-home / symlink) — OK")
+                print("Dual-home:     N/A — one physical roster")
+            else:
+                suite_workers = set()
+                try:
+                    sr = roster_mod.load(path=suite_path)
+                    suite_workers = set(sr.workers)
+                    print("Suite roster:  %s (%d workers)" % (sr.path, len(suite_workers)))
+                except roster_mod.RosterError as exc:
+                    faults.append("SUITE: %s" % exc)
+                    print("Suite roster:  LOAD ERROR — %s" % exc)
+                if engine_workers and suite_workers:
+                    only_engine = engine_workers - suite_workers
+                    only_suite = suite_workers - engine_workers
+                    if only_engine:
+                        faults.append(
+                            "DRIFT: in engine only: %s" % ", ".join(sorted(only_engine))
+                        )
+                    if only_suite:
+                        faults.append(
+                            "DRIFT: in suite only: %s" % ", ".join(sorted(only_suite))
+                        )
+                    if not only_engine and not only_suite:
+                        print(
+                            "Dual-home:     OK — keys match "
+                            "(prefer one file + symlink; two copies still drift risk)"
+                        )
         else:
             print("Suite roster:  not configured (set WORKFORCE_SUITE_ROSTER or --suite-roster)")
 
