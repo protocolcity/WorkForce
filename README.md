@@ -9,8 +9,9 @@
 
 WorkForce turns AI agents into a staffed workforce. Each worker has identity
 papers (a contract and a prompt), a schedule, a budget, and a tamper-evident
-shift ledger. One daemon dispatches every shift; one board — the **Roster** —
-shows you who is employed, who is on the floor, and what every shift cost.
+shift ledger. One daemon dispatches every shift; the **Roster** — visual in
+the BluePrint suite, queryable via CLI and MCP — shows who is employed, who
+is on the floor, and what every shift cost.
 
 ## Install the whole suite (recommended)
 
@@ -29,8 +30,7 @@ pip install protocolcity-workforce
 workforce roster                     # who is employed
 workforce dispatch <worker> --dry-run   # rehearse one shift, spend nothing
 workforce ledger <worker>            # the shift record
-workforce daemon                     # the scheduler — one service, serves the board
-workforce open                       # open the Roster board in your browser
+workforce daemon                     # the scheduler — the only OS service you run
 workforce-mcp                        # stdio MCP for chat agents
 ```
 
@@ -63,10 +63,7 @@ workforce roster
 workforce dispatch <worker> --dry-run
 workforce ledger <worker>
 workforce daemon
-workforce open
 ```
-
-The board serves at `http://127.0.0.1:8797` by default.
 
 ## How it works
 
@@ -96,7 +93,7 @@ multi-directory setups, use these variables:
 | `WORKFORCE_PORT` | `8797` | HTTP port for `workforce board` and `workforce daemon`. |
 | `WORKFORCE_ROSTER` | `$WORKFORCE_DATA_DIR/local/roster.json` | Explicit roster path — overrides the default search under `WORKFORCE_DATA_DIR`. |
 | `WORKFORCE_DESK` | `http://127.0.0.1:8799` | WorkLane / Desk API URL used by the board's activity join. |
-| `WORKFORCE_CITYHALL` | `http://127.0.0.1:8796` | City-hall API URL used by the board's city join. |
+| `WORKFORCE_CITYHALL` | _(unset)_ | City-hall API URL for the board's city join (the prior :8796 default is retired). |
 | `WORKFORCE_BRAND` | `city` | Board brand mode: `city` (ProtocolCity suite) or `standalone`. |
 | `PROTOCOLCITY_TEMPLATES` | _(sibling checkout)_ | Path to ProtocolCity templates for `workforce hire --no-plant`. |
 

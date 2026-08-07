@@ -1,0 +1,44 @@
+{
+  "schema": "workforce.capacity_policy/v1",
+  "# comment": "User-editable pin rails. Citizen copies this file to local/capacity_policy.json. Chief-of-staff staging and workforce repin read ONLY this envelope — never invent pairs from chat. Hands never write the live file.",
+  "seats_per_day": 10,
+  "cooldown_hours": 6,
+  "allowed_fields": ["model", "command"],
+  "pin_pairs": [
+    {
+      "id": "generalist-claude-grok",
+      "tier": "generalist",
+      "description": "Generalist seats (claude-sonnet-4-6 / Claude CLI). Emergency re-pin to Grok when Claude pool is walled; restore to Claude when capacity clears (CAPACITY_RESTORE_RUNBOOK).",
+      "a": {
+        "model": "claude-sonnet-4-6",
+        "runtime": "claude"
+      },
+      "b": {
+        "model": "grok-4.5",
+        "runtime": "grok"
+      },
+      "bidirectional": true
+    },
+    {
+      "id": "patrol-haiku-grok",
+      "tier": "patrol",
+      "description": "Patrol / haiku tier. Restore to haiku pin after pool clear; emergency fallback Grok only when the wall hits this tier.",
+      "a": {
+        "model": "claude-haiku-4-5-20251001",
+        "runtime": "claude"
+      },
+      "b": {
+        "model": "grok-4.5",
+        "runtime": "grok"
+      },
+      "bidirectional": true
+    }
+  ],
+  "stay_pinned_tiers": ["heavy_multipass"],
+  "stay_pinned_note": "Heavy multipass seats stay on their CONTRACT pin (typically Grok). Pool restore does not move them — stagers check CONTRACT intended pin, not this list alone.",
+  "notes": [
+    "Founder rails encoded 2026-08-03 from docs/CAPACITY_RESTORE_RUNBOOK.md + 2026-08-02 capacity restore wave.",
+    "Edit seats_per_day / cooldown_hours / pin_pairs locally without a law edit.",
+    "Mode B only: staging never merges live roster.json (STAFFING §5)."
+  ]
+}

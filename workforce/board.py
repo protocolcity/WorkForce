@@ -13,17 +13,21 @@ Own port (default 8797), own theme. Law lens: /law/<worker>/<contract|prompt>
 renders the exact file the next shift will read — a lens, never a copy.
 """
 
+import concurrent.futures
+import datetime
 import html
 import json
 import os
+import re
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, Optional
 
-from .daemon import heartbeat_status, read_heartbeat
+from .daemon import adaptive_backoff_secs, heartbeat_status, read_heartbeat
+from .engine import empty_run_streak
 from .ledger import Ledger, parse_shifts
 from .roster import RosterError
-from .schedule import maybe_cron
+from .schedule import maybe_cron, next_fire_utc
 
 from .api.roster import (
     DEFAULT_PORT, DESK, CITYHALL, _BRAND_TITLE,
@@ -87,12 +91,37 @@ class _Handler(BaseHTTPRequestHandler):
             return {}
         return data if isinstance(data, dict) else {}
 
+    def _client_gone_write(self, data: bytes) -> None:
+        """Write response body; swallow client disconnect.
+
+        When /api/scene (or any slow GET) exceeds the client's patience, the
+        peer closes mid-write → BrokenPipeError / ConnectionResetError. That is
+        not a server fault and must not dump a full traceback into daemon.log
+        (hundreds of lines during a desk-spin window). One-line context only.
+        """
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            path = (self.path or "").split("?", 1)[0]
+            try:
+                n = len(data)
+            except Exception:
+                n = -1
+            # stdout joins daemon.log when the board is in-process
+            print("board client-gone path=%s bytes=%s (%s)" % (
+                path, n, type(exc).__name__), flush=True)
+
     def _json_response(self, payload: Dict[str, object], code: int = 200) -> None:
         data = json.dumps(payload).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self._client_gone_write(data)
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            path = (self.path or "").split("?", 1)[0]
+            print("board client-gone path=%s phase=headers (%s)" % (
+                path, type(exc).__name__), flush=True)
 
     def do_POST(self) -> None:  # noqa: N802
         if self.path.startswith("/api/dispatch/"):
@@ -126,6 +155,24 @@ class _Handler(BaseHTTPRequestHandler):
                 code = 200 if ok else 409
             self._json_response(payload, code)
             return
+        if self.path == "/api/wake" or self.path.startswith("/api/wake?"):
+            # wf-149 wake-on-route: WorkLane nudges {"worker": <hand>} on route
+            # events so a freshly seated ticket fires within seconds instead of
+            # waiting for the lane's next clock. Fire-and-forget contract: the
+            # caller never blocks a ticket write on this.
+            body = self._read_json_body()
+            name = str(body.get("worker") or "")
+            if not _safe_worker_name(name):
+                self._json_response({"ok": False, "msg": "bad worker name"}, 400)
+                return
+            if self.daemon is None:
+                self._json_response(
+                    {"ok": False,
+                     "msg": "board is read-only (no daemon in this process)"}, 409)
+                return
+            ok, msg = self.daemon.wake_now(name)
+            self._json_response({"ok": ok, "msg": msg}, 200 if ok else 409)
+            return
         if self.path == "/api/hire" or self.path.startswith("/api/hire?"):
             # STAFFING §2 — employment write path (papers + roster). Localhost
             # bind is the gate; daemon not required (roster reload is next tick).
@@ -134,6 +181,9 @@ class _Handler(BaseHTTPRequestHandler):
                 from . import hire as hire_mod
                 # Board local_root is …/local; hire base is the package cwd parent.
                 base = os.path.dirname(os.path.abspath(self.local_root)) or os.getcwd()
+                # staff: omit → auto (city-ops workdir); explicit bool overrides
+                staff_body = body.get("staff", None)
+                staff_arg = None if staff_body is None else bool(staff_body)
                 result = hire_mod.hire(
                     name=str(body.get("name") or ""),
                     workdir=str(body.get("workdir") or ""),
@@ -158,6 +208,8 @@ class _Handler(BaseHTTPRequestHandler):
                     roster_path=os.path.join(self.local_root, "roster.json")
                     if os.path.isdir(self.local_root) else None,
                     dry_run=bool(body.get("dry_run", False)),
+                    staff=staff_arg,
+                    worker_type=str(body.get("type") or ""),
                 )
                 self._json_response(result, 200)
             except RosterError as exc:
@@ -218,11 +270,14 @@ class _Handler(BaseHTTPRequestHandler):
             # brief (future), and anything above this board
             data = json.dumps(report_model(
                 self.local_root, days=_days_param(self.path))).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Cache-Control", "no-store, max-age=0")
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-store, max-age=0")
+                self.end_headers()
+                self._client_gone_write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             return
         elif self.path == "/dispatch" or self.path.startswith("/dispatch?"):
             # legacy address from the pre-merge layout — the room moved to /
@@ -240,22 +295,29 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception:
                 payload = scene_model(self.local_root)
             data = json.dumps(payload).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            if light:
-                self.send_header("Cache-Control", "no-store, max-age=0")
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                if light:
+                    self.send_header("Cache-Control", "no-store, max-age=0")
+                self.end_headers()
+                self._client_gone_write(data)
+            except (BrokenPipeError, ConnectionResetError) as exc:
+                print("board client-gone path=/api/scene phase=headers (%s)" % (
+                    type(exc).__name__,), flush=True)
             return
         elif self.path == "/api/generation" or self.path == "/api/pulse":
             # LIVE-B2: tokens only for suite pulse bus
             data = json.dumps({"ok": True, **generation_token(self.local_root)}).encode(
                 "utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Cache-Control", "no-store, max-age=0")
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-store, max-age=0")
+                self.end_headers()
+                self._client_gone_write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             return
         elif (self.path.startswith("/api/out/")
               and ("/stream" in self.path.split("?")[0])):
@@ -346,10 +408,13 @@ class _Handler(BaseHTTPRequestHandler):
             # separate cadence so scene_model stays network-free. Degrades on
             # its own (desk_ok:false) when the desk is unreachable.
             data = json.dumps(scene_tape(self.local_root)).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self._client_gone_write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             return
         elif self.path.startswith("/api/worker/"):
             # oc-21: the personnel-file read model behind the in-scene drawer
@@ -358,10 +423,13 @@ class _Handler(BaseHTTPRequestHandler):
                      if len(parts) == 3 else None)
             data = json.dumps(model if model is not None
                               else {"error": "no such worker"}).encode("utf-8")
-            self.send_response(200 if model is not None else 404)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.send_response(200 if model is not None else 404)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self._client_gone_write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             return
         elif self.path.startswith("/law/"):
             parts = self.path.strip("/").split("/")
@@ -389,23 +457,66 @@ class _Handler(BaseHTTPRequestHandler):
                     if len(parts) == 2 else None)
             code = 200 if body else 404
             body = body or "<p>no such legacy log</p>"
-        elif self.path == "/api/workers":
+        elif self.path.split("?")[0] == "/api/workers":
             # the §8 machine-readable seam: roster × health × next fire,
-            # for anything above this board (e.g. a city lens)
+            # for anything above this board (e.g. a city lens).
+            # ?light=1: skip probes/health/shifts — for callers with <1s budgets
+            # (e.g. WorkLane hired-hands lookup).  Non-light: parallel fan-out.
+            _q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            light = (_q.get("light") or ["0"])[0].lower() in ("1", "true", "yes")
             roster = _load_roster(self.local_root)
             status = heartbeat_status(self.local_root)
+            # wf-149: wake stamps floor the streak so a woken lane reads as
+            # back at base cadence, matching the daemon's own gate.
+            _hb = read_heartbeat(self.local_root) or {}
+            wakes = _hb.get("wakes") if isinstance(_hb.get("wakes"), dict) else {}
             workers = []
             if roster:
-                for name in sorted(roster.workers):
+                names = sorted(roster.workers)
+                queue_by: Dict[str, str] = {}
+                if not light:
+                    wlist = [roster.workers[n] for n in names]
+                    with concurrent.futures.ThreadPoolExecutor(
+                            max_workers=min(len(wlist) or 1, 16)) as pool:
+                        queue_by = dict(zip(names, pool.map(_worker_queue, wlist)))
+                for name in names:
                     w = roster.workers[name]
-                    q = _worker_queue(w)
+                    q = "—" if light else queue_by[name]
                     cron = maybe_cron(w.schedule)
-                    nf = cron.next_fire(_utcnow()) if cron else None
-                    shifts = parse_shifts(
-                        Ledger(os.path.join(self.local_root, "ledger"), name).tail(60), limit=3)
-                    last = next((s for s in shifts if not s["dry_run"]), None)
+                    nf = next_fire_utc(cron, _utcnow()) if cron else None
+                    if light:
+                        last = None
+                        health_cls = "ok"
+                        e_streak = 0
+                        backoff_secs = 0
+                        resting = False
+                    else:
+                        shifts = parse_shifts(
+                            Ledger(os.path.join(self.local_root, "ledger"), name).tail(60), limit=3)
+                        last = next((s for s in shifts if not s["dry_run"]), None)
+                        health_cls = _worker_health(self.local_root, w, q)["cls"]
+                        e_streak, e_last = empty_run_streak(
+                            self.local_root, name, since_ts=wakes.get(name) or None)
+                        # wf-149: effective idle gate for honest Map "resting"
+                        backoff_secs = (int(w.empty_run_backoff or 0)
+                                        or adaptive_backoff_secs(w, e_streak))
+                        threshold = max(1, int(w.empty_run_threshold or 3))
+                        if w.empty_run_pause and w.queue_url and e_streak >= threshold:
+                            resting = True  # wf-125 probe gate holds while empty
+                        elif backoff_secs > 0 and e_last:
+                            try:
+                                _lastdt = datetime.datetime.strptime(
+                                    e_last, "%Y-%m-%dT%H:%M:%SZ"
+                                ).replace(tzinfo=datetime.timezone.utc)
+                                resting = (_utcnow() - _lastdt).total_seconds() < backoff_secs
+                            except ValueError:
+                                resting = False
+                        else:
+                            resting = False
                     workers.append({
-                        "name": name, "kind": w.kind, "workdir": os.path.abspath(w.workdir),
+                        "name": name, "kind": w.kind,
+                        "staff": bool(w.staff), "type": w.worker_type,
+                        "workdir": os.path.abspath(w.workdir),
                         "display": w.display or "", "succeeds": w.succeeds or "",
                         "identity": w.identity,
                         "cli": _cli_label(w), "model": w.model,
@@ -414,35 +525,57 @@ class _Handler(BaseHTTPRequestHandler):
                         "skill": w.skill or "",
                         "next_fire": nf.strftime("%Y-%m-%dT%H:%M:%SZ") if nf else "",
                         "queue": q, "queue_url": w.queue_url or "",
-                        "health": _worker_health(self.local_root, w, q)["cls"],
+                        "health": health_cls,
+                        "empty_streak": e_streak,
+                        "backoff_secs": backoff_secs,
+                        "resting": resting,
                         "last_shift": ({"ts": last["ts"], "outcome": last["outcome"],
                                         "passes": last["passes"], "reason": last["reason"]}
                                        if last else None),
                     })
             data = json.dumps({"daemon": status, "workers": workers}).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self._client_gone_write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             return
         elif self.path == "/api/health":
             payload = {"ok": True, "port": DEFAULT_PORT}
             data = json.dumps(payload).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self._client_gone_write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             return
         else:
             body, code = "<p>not found</p>", 404
         data = body.encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self._client_gone_write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def log_message(self, fmt: str, *args: object) -> None:
         pass  # quiet; the ledger is the record that matters
+
+    def log_error(self, fmt: str, *args: object) -> None:
+        # BaseHTTPRequestHandler dumps full tracebacks for client disconnects
+        # via socketserver.handle_error → log_error. Suppress the noisy ones;
+        # _client_gone_write already records a one-line breadcrumb.
+        msg = fmt % args if args else str(fmt)
+        if "BrokenPipeError" in msg or "ConnectionResetError" in msg:
+            return
+        # fall through for real faults (keep default shape, no super spam)
+        print("board error: " + msg.splitlines()[0][:200], flush=True)
 
 
 def make_server(port: Optional[int] = None, local_root: str = "local",
@@ -457,5 +590,5 @@ def make_server(port: Optional[int] = None, local_root: str = "local",
 
 def serve(port: Optional[int] = None, local_root: str = "local") -> None:
     httpd = make_server(port, local_root)
-    print("%s: http://127.0.0.1:%d" % (_BRAND_TITLE, httpd.server_address[1]))
+    print("%s: engine API at http://127.0.0.1:%d (API only)" % (_BRAND_TITLE, httpd.server_address[1]))
     httpd.serve_forever()

@@ -12,7 +12,9 @@ stays one-lane-at-a-time: flipping a lane IS the roster edit.
 
 Mechanics:
   - Tick on the minute boundary; a worker fires when its cron matches the
-    tick's UTC minute. Missed minutes (host asleep) are not replayed —
+    tick's **host local** minute (wf-146 — seed_ops / contracts promise
+    LOCAL machine time). Heartbeat ``last_tick`` and ledger stamps stay
+    UTC (``...Z``). Missed minutes (host asleep) are not replayed —
     conservative skips are correct, the next matching minute picks up.
   - Each fire runs engine.dispatch in its own thread; the engine's §3
     per-worker lock already guarantees single-flight, so an overrunning
@@ -35,8 +37,8 @@ import urllib.parse
 import urllib.request
 from typing import Dict, List, Optional, Set, Tuple
 
-from . import engine, roster as roster_mod
-from .schedule import maybe_cron
+from . import capacity as capacity_mod, engine, roster as roster_mod
+from .schedule import fire_minute_key, matches_at, maybe_cron, next_fire_utc
 
 HEARTBEAT = "daemon.json"
 EVENT_CURSOR = "event_cursors.json"
@@ -47,6 +49,26 @@ DESK_URL = os.environ.get(
 )
 # Debounce: do not re-fire the same worker more often than this (seconds).
 EVENT_FIRE_COOLDOWN_SECS = 90
+
+# wf-149 — adaptive idle backoff ladder: streak depth past threshold picks the
+# effective cadence floor. Caps at the daily heartbeat, never a full stop — the
+# daily probe doubles as the desk-reachability canary.
+ADAPTIVE_BACKOFF_LADDER = (3600, 14400, 86400)
+# wf-149 — wake debounce: WorkLane debounces per hand (~10s) on its side too;
+# this daemon-side floor keeps a bulk-file storm from stacking probe threads.
+WAKE_DEBOUNCE_SECS = 10.0
+
+
+def adaptive_backoff_secs(worker: "roster_mod.Worker", streak: int) -> int:
+    """wf-149 — effective idle backoff for a lane at this empty-run streak.
+
+    0 = no gate (below threshold, or adaptive disabled on the seat).
+    """
+    threshold = max(1, int(getattr(worker, "empty_run_threshold", 3) or 3))
+    if streak < threshold or not bool(getattr(worker, "empty_run_adaptive", True)):
+        return 0
+    step = min(streak - threshold, len(ADAPTIVE_BACKOFF_LADDER) - 1)
+    return ADAPTIVE_BACKOFF_LADDER[step]
 
 
 def _utcnow() -> datetime.datetime:
@@ -103,6 +125,13 @@ class Daemon:
         # wf-74 event-trigger: poll cursor per WorkLane project + last fire time
         self._event_cursors: Dict[str, int] = self._load_event_cursors()
         self._event_last_fire: Dict[str, float] = {}  # worker -> monotonic ts
+        self._cap_day: str = ""  # last UTC day the capacity hook ran
+        self._cost_day: str = ""  # last UTC day the daily cost hook ran
+        # wf-149 wake-on-route: worker -> last wake stamp (ISO, resets adaptive
+        # backoff) and monotonic ts (debounce). Memory-only — a restart forgets
+        # wakes, which is safe: the clock fire is the guaranteed fallback.
+        self._wakes: Dict[str, str] = {}
+        self._wake_monotonic: Dict[str, float] = {}
 
     def _reload_fired(self) -> Dict[str, str]:
         """Last-fired minute keys from the prior heartbeat, or {} on a fresh
@@ -141,10 +170,11 @@ class Daemon:
         if roster:
             for name in sorted(roster.workers):
                 cron = maybe_cron(roster.workers[name].schedule)
+                nf = next_fire_utc(cron, now) if cron else None
                 workers[name] = {
                     "schedule": roster.workers[name].schedule,
                     "owned": bool(cron),
-                    "next_fire": _iso(cron.next_fire(now)) if cron else "",
+                    "next_fire": _iso(nf),
                 }
         payload = {
             "pid": os.getpid(),
@@ -153,6 +183,7 @@ class Daemon:
             "state": "draining" if self._draining else "scheduling",
             "in_flight": self.in_flight(),
             "fired": dict(self._fired),   # last-fired minute per worker; reloaded on restart
+            "wakes": dict(self._wakes),   # wf-149 last wake stamp per worker (streak floor)
             "workers": workers,
         }
         path = os.path.join(self.local_root, HEARTBEAT)
@@ -165,17 +196,148 @@ class Daemon:
         rc = engine.dispatch(worker, self.local_root)
         self._log("fired %s rc=%d" % (worker.name, rc))
 
+    def _heartbeat_reconcile_lane(self, worker: roster_mod.Worker) -> None:
+        """wf-155 — empty-pause path: release stranded claims without a shift."""
+        try:
+            report = engine.heartbeat_reconcile(worker, self.local_root)
+        except Exception as exc:
+            self._log("WARN heartbeat reconcile %s: %s" % (worker.name, exc))
+            return
+        released = report.get("released") or []
+        cleaned = bool(report.get("lock_cleaned"))
+        errors = report.get("errors") or []
+        if released or cleaned or errors:
+            self._log(
+                "heartbeat reconcile %s: lock_cleaned=%s released=%s errors=%d"
+                % (
+                    worker.name,
+                    cleaned,
+                    ",".join(released) if released else "-",
+                    len(errors),
+                )
+            )
+
+    def _fire_allowed_by_empty_policy(
+        self, worker: roster_mod.Worker, now: Optional[datetime.datetime] = None
+    ) -> bool:
+        """ALWAYS_WORK §4 / wf-111+wf-125+wf-149 — cron suppress after empty streak.
+
+        Precedence once streak >= threshold:
+        1. empty_run_pause=True + queue_url: probe queue; suppress if still empty,
+           allow when work appears (queue-probe gate, wf-125).
+        2. empty_run_backoff > 0: fixed time-gate — withhold until newest empty is
+           older than backoff seconds.
+        3. empty_run_adaptive (default): ladder time-gate — cadence stretches with
+           streak depth (1h → 4h → daily heartbeat) and resets to base on any wake
+           or non-empty probe.
+        4. Otherwise: allow (adaptive=False, backoff=0 = signal-only mode).
+
+        The streak is floored at the last wake stamp, so a wake returns the lane
+        to base cadence in every mode. Manual fire_now bypasses this gate.
+        """
+        threshold = max(1, int(getattr(worker, "empty_run_threshold", 3) or 3))
+        streak, last_ts = engine.empty_run_streak(
+            self.local_root, worker.name, since_ts=self._wakes.get(worker.name))
+        if streak < threshold:
+            return True
+
+        # Queue-probe gate: suppress until ready appears or fire_now
+        pause = bool(getattr(worker, "empty_run_pause", False))
+        if pause and getattr(worker, "queue_url", ""):
+            count = engine.queue_probe_count(worker)
+            if count is not None and count <= 0:
+                return False  # queue still empty — hold until ready
+            return True  # count > 0 or probe failed (fail open → let engine decide)
+
+        # Fixed time-gate or adaptive ladder
+        backoff = int(getattr(worker, "empty_run_backoff", 0) or 0)
+        if backoff <= 0:
+            backoff = adaptive_backoff_secs(worker, streak)
+        if backoff <= 0 or not last_ts:
+            return True
+        try:
+            last = datetime.datetime.strptime(
+                last_ts, "%Y-%m-%dT%H:%M:%SZ"
+            ).replace(tzinfo=datetime.timezone.utc)
+        except ValueError:
+            return True
+        age = ((now or _utcnow()) - last).total_seconds()
+        return age >= backoff
+
+    def _should_suppress_max_fires_per_day(
+        self, worker: roster_mod.Worker, now: Optional[datetime.datetime] = None
+    ) -> Tuple[bool, int, int]:
+        """wf-166 — optional cron suppress after N START events on the local day.
+
+        Returns (suppress, fires_today, max_fires_per_day).
+        max_fires_per_day=0 disables (unlimited). Day boundary is host local
+        wall via schedule.host_wall (same as cron fields). Manual fire_now
+        does not call this gate.
+        """
+        max_n = int(getattr(worker, "max_fires_per_day", 0) or 0)
+        if max_n <= 0:
+            return False, 0, 0
+        count = engine.fires_on_local_day(
+            self.local_root, worker.name, now=now or _utcnow()
+        )
+        if count >= max_n:
+            return True, count, max_n
+        return False, count, max_n
+
+    def _should_suppress_vendor_limit(
+        self, worker: roster_mod.Worker, now: Optional[datetime.datetime] = None
+    ) -> Tuple[bool, int, int]:
+        """wf-126 — optional cron suppress after vendor_limit streak.
+
+        Returns (suppress, streak, backoff_secs).
+        threshold=0 disables entirely; backoff=0 = signal-only (never suppress).
+        Suppresses when streak >= threshold AND newest capacity fail is within backoff seconds.
+        Gate clears automatically when a non-vendor_limit finished shift lands or window expires.
+        """
+        threshold = int(getattr(worker, "vendor_limit_threshold", 3) or 0)
+        if threshold == 0:
+            return False, 0, 0
+        backoff = int(getattr(worker, "vendor_limit_backoff", 0) or 0)
+        if backoff <= 0:
+            return False, 0, 0  # signal-only mode; no suppression
+        shifts = capacity_mod._read_worker_shifts(self.local_root, worker.name)
+        streak = capacity_mod.consecutive_capacity_streak(shifts)
+        if streak < threshold:
+            return False, streak, backoff
+        newest_ts: Optional[str] = None
+        for s in shifts:
+            if capacity_mod.is_capacity_outcome(s.get("outcome") or "", s.get("reason") or ""):
+                newest_ts = s.get("end_ts") or s.get("ts") or None
+                break
+        if not newest_ts:
+            return False, streak, backoff
+        try:
+            last = datetime.datetime.strptime(
+                newest_ts, "%Y-%m-%dT%H:%M:%SZ"
+            ).replace(tzinfo=datetime.timezone.utc)
+        except ValueError:
+            return False, streak, backoff
+        age = ((now or _utcnow()) - last).total_seconds()
+        if age < backoff:
+            return True, streak, backoff
+        return False, streak, backoff
+
     def tick(self, now: Optional[datetime.datetime] = None, wait: bool = False) -> int:
         """One scheduler pass; returns the number of workers fired."""
         now = now or _utcnow()
-        minute_key = now.strftime("%Y-%m-%dT%H:%M")
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=datetime.timezone.utc)
+        else:
+            now = now.astimezone(datetime.timezone.utc)
+        # Fire-slot identity is local wall (cron fields); stamps stay UTC.
+        minute_key = fire_minute_key(now)
         roster = self._roster()
         fired = 0
         if roster and not self._draining:
             for name in sorted(roster.workers):
                 w = roster.workers[name]
                 cron = maybe_cron(w.schedule)
-                if not cron or not cron.matches(now):
+                if not cron or not matches_at(cron, now):
                     continue
                 if self._fired.get(name) == minute_key:
                     continue  # already fired this minute (late/duplicate tick)
@@ -183,6 +345,44 @@ class Daemon:
                 if prev and prev.is_alive():
                     # engine lock would SKIP anyway; don't stack threads on it
                     self._log("skip %s: previous shift thread still running" % name)
+                    self._fired[name] = minute_key
+                    continue
+                if not self._fire_allowed_by_empty_policy(w, now):
+                    if getattr(w, "empty_run_pause", False):
+                        self._log("skip %s: empty-run pause (streak>=threshold, queue still empty)" % name)
+                        # wf-155: pause mode never fires → never hits dispatch
+                        # empty-SKIP reconcile. Run heartbeat reconcile here so
+                        # stranded in_progress cannot starve the seat forever.
+                        self._heartbeat_reconcile_lane(w)
+                    else:
+                        eff = int(getattr(w, "empty_run_backoff", 0) or 0)
+                        if eff <= 0:
+                            s, _ = engine.empty_run_streak(
+                                self.local_root, name,
+                                since_ts=self._wakes.get(name))
+                            eff = adaptive_backoff_secs(w, s)
+                        self._log(
+                            "skip %s: empty-run backoff (streak>=threshold, within "
+                            "%ds)" % (name, eff)
+                    )
+                    self._fired[name] = minute_key
+                    continue
+                suppress, streak, backoff_secs = self._should_suppress_vendor_limit(w, now)
+                if suppress:
+                    self._log(
+                        "skip %s: vendor-limit backoff (streak=%d, within %ds)"
+                        % (name, streak, backoff_secs)
+                    )
+                    self._fired[name] = minute_key
+                    continue
+                day_sup, day_count, day_max = self._should_suppress_max_fires_per_day(
+                    w, now
+                )
+                if day_sup:
+                    self._log(
+                        "skip %s: max_fires_per_day (count=%d >= max=%d local day)"
+                        % (name, day_count, day_max)
+                    )
                     self._fired[name] = minute_key
                     continue
                 self._fired[name] = minute_key
@@ -194,7 +394,79 @@ class Daemon:
                 if wait:
                     t.join()
         self._write_heartbeat(now, roster)
+        if roster:
+            self._run_cost_hook(roster, now)
+            self._run_capacity_hook(roster, now)
         return fired
+
+    def _run_cost_hook(
+        self, roster: roster_mod.Roster, now: datetime.datetime
+    ) -> None:
+        """Daily cost-rollup wire — writes local/reports/cost/YYYY-MM-DD.md once per UTC day.
+
+        Idempotent: write_daily_cost_report skips if the file already exists.
+        Only called when roster is available; exceptions are logged, not raised.
+        """
+        day = now.strftime("%Y-%m-%d")
+        if self._cost_day == day:
+            return
+        self._cost_day = day
+        try:
+            from .reports import write_daily_cost_report
+            write_daily_cost_report(self.local_root, now.date(), roster.workers)
+            self._log("daily cost report written for %s" % day)
+        except Exception as exc:
+            self._log("cost hook error: %s" % exc)
+
+    def _run_capacity_hook(
+        self, roster: roster_mod.Roster, now: datetime.datetime
+    ) -> None:
+        """Capacity detector wire — runs live once per UTC day.
+
+        Dry-run is the CLI default; here we use live so the daemon drops
+        a For You gold card without a host session. Idempotent via inbox_label.
+        Only called when roster is available; exceptions are logged, not raised.
+        """
+        day = now.strftime("%Y-%m-%d")
+        if self._cap_day == day:
+            return
+        self._cap_day = day
+        try:
+            alerts = capacity_mod.detect_capacity_alerts(roster, self.local_root)
+        except Exception as exc:
+            self._log("capacity hook detect error: %s" % exc)
+            return
+        if not alerts:
+            return
+        try:
+            report_path = capacity_mod.write_capacity_report(
+                self.local_root, alerts, day=day
+            )
+        except Exception as exc:
+            self._log("capacity hook write_report error: %s" % exc)
+            report_path = ""
+        workspace = os.path.dirname(self.base.rstrip(os.sep))
+        rel = (
+            capacity_mod.city_rel_report_path(report_path, workspace)
+            if report_path
+            else ""
+        )
+        for a in alerts:
+            try:
+                receipt = capacity_mod.drop_capacity_for_you(
+                    a,
+                    report_path=report_path,
+                    dry_run=False,
+                    city_rel_path=rel,
+                )
+                self._log(
+                    "capacity drop pool=%s action=%s"
+                    % (a["pool"], receipt.get("action"))
+                )
+            except Exception as exc:
+                self._log(
+                    "capacity hook drop error pool=%s: %s" % (a["pool"], exc)
+                )
 
     def fire_now(self, name: str) -> Tuple[bool, str]:
         """Manual trigger — the third trigger source (time/event/manual).
@@ -217,6 +489,39 @@ class Daemon:
         self._log("manual dispatch %s" % name)
         return True, "dispatched"
 
+    def wake_now(self, name: str) -> Tuple[bool, str]:
+        """wf-149 wake-on-route — the route event IS the dispatch signal.
+
+        Same engine path as a clock fire: probe first, spawn only if the queue
+        has work, §3 lock keeps single-flight. Softer contract than fire_now —
+        a wake during an in-flight shift is a clean ok-no-op (the lock would
+        SKIP anyway), rapid wakes debounce, and every wake stamps the lane so
+        the adaptive idle backoff resets to base cadence. Callers treat this
+        as fire-and-forget; the clock fire stays the guaranteed fallback.
+        """
+        roster = self._roster()
+        if not roster:
+            return False, "roster unreadable"
+        if name not in roster.workers:
+            return False, "no such worker"
+        mono = time.monotonic()
+        last = self._wake_monotonic.get(name)
+        if last is not None and (mono - last) < WAKE_DEBOUNCE_SECS:
+            return True, "debounced (woken <%ds ago)" % int(WAKE_DEBOUNCE_SECS)
+        self._wake_monotonic[name] = mono
+        self._wakes[name] = _iso(_utcnow())  # reset adaptive backoff to base
+        if self._draining:
+            return False, "draining — no new fires"
+        prev = self._threads.get(name)
+        if prev and prev.is_alive():
+            return True, "shift in flight — wake noted (backoff reset)"
+        t = threading.Thread(target=self._fire, args=(roster.workers[name],),
+                             daemon=False, name="wake-%s" % name)
+        self._threads[name] = t
+        t.start()
+        self._log("wake dispatch %s" % name)
+        return True, "dispatched"
+
     def skip_now(self, name: str) -> Tuple[bool, str, Optional[str], Optional[str]]:
         """Skip the *next* scheduled fire only.
 
@@ -237,15 +542,16 @@ class Daemon:
         if not cron:
             return False, "worker has no schedule", None, None
         now = _utcnow()
-        # Next match at or after now; if already matched this minute, next after
-        nxt = cron.next_fire(now)
+        # Next match after now (local wall eval); keys + ISO stay consistent
+        # with tick.
+        nxt = next_fire_utc(cron, now)
         if nxt is None:
             return False, "no upcoming fire", None, None
-        minute_key = nxt.strftime("%Y-%m-%dT%H:%M")
+        minute_key = fire_minute_key(nxt)
         self._fired[name] = minute_key
         self._write_heartbeat(now, roster)
         # Following fire after the skipped one (for response)
-        following = cron.next_fire(nxt + datetime.timedelta(minutes=1))
+        following = next_fire_utc(cron, nxt + datetime.timedelta(minutes=1))
         self._log("skip_now %s skipped_fire=%s next=%s" % (
             name, minute_key, _iso(following) if following else ""))
         return (
@@ -434,6 +740,34 @@ class Daemon:
         self._log("board serving on http://127.0.0.1:%d" % httpd.server_address[1])
         return t
 
+    def startup_reconcile(self, roster: Optional[roster_mod.Roster] = None) -> dict:
+        """wf-155 — on boot, clean orphan locks and release stranded claims.
+
+        Uses the prior heartbeat's ``in_flight`` list so a SIGKILL mid-shift
+        still reconciles even if the lock dir was already wiped. Never touches
+        a live lock. Safe to call from tests with a fixture roster.
+        """
+        hb = read_heartbeat(self.local_root)
+        prior = []
+        if hb and isinstance(hb.get("in_flight"), list):
+            prior = [str(x) for x in hb["in_flight"]]
+        rost = roster if roster is not None else self._roster()
+        workers = rost.workers if rost else {}
+        report = engine.startup_reconcile(
+            workers, self.local_root, prior_in_flight=prior,
+        )
+        cleaned = int(report.get("lock_cleaned") or 0)
+        released = report.get("released") or []
+        errors = report.get("errors") or []
+        if cleaned or released or errors:
+            self._log(
+                "startup reconcile: locks_cleaned=%d released=%s errors=%d"
+                % (cleaned, ",".join(released) if released else "-", len(errors))
+            )
+        else:
+            self._log("startup reconcile: clean (no orphan locks / strands)")
+        return report
+
     def run(self, with_board: bool = True) -> int:
         hb = read_heartbeat(self.local_root)
         if hb and hb.get("pid") != os.getpid() and pid_alive(hb.get("pid", 0)):
@@ -441,6 +775,12 @@ class Daemon:
                   % hb["pid"], file=sys.stderr)
             return 1
         self._log("start pid=%d base=%s" % (os.getpid(), self.base))
+        # wf-155: un-strand in_progress claims left by a killed predecessor
+        # before the first clock tick (else empty ready probe → catch-22).
+        try:
+            self.startup_reconcile()
+        except Exception as exc:
+            self._log("WARN startup reconcile failed: %s" % exc)
         signal.signal(signal.SIGTERM, lambda s, f: self.begin_drain(s))
         signal.signal(signal.SIGINT, lambda s, f: self.begin_drain(s))
         if with_board:

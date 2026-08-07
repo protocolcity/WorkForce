@@ -4,6 +4,7 @@ Pure-Python side: constants, helpers, JSON data models. No HTML.
 HTML surfaces live in workforce.surfaces.roster.
 """
 
+import concurrent.futures
 import datetime
 import hashlib
 import json
@@ -11,15 +12,16 @@ import os
 import plistlib
 import re
 import subprocess
+import time
 import urllib.parse
 import urllib.request
 from typing import Dict, List, Optional, Tuple
 
 from ..daemon import heartbeat_status, read_heartbeat
-from ..engine import _dig
-from ..ledger import Ledger, parse_shifts
+from ..engine import _dig, _http_get_json, _is_timeout_exc, empty_run_streak
+from ..ledger import Ledger, open_claims, parse_shifts
 from ..roster import Roster, RosterError, Worker
-from ..schedule import calendar_intervals_to_cron, maybe_cron
+from ..schedule import calendar_intervals_to_cron, maybe_cron, next_fire_utc
 from .. import roster as roster_mod
 from .. import runtimes as runtimes_mod
 
@@ -82,7 +84,64 @@ def generation_token(local_root: str) -> Dict[str, object]:
             "%Y-%m-%dT%H:%M:%SZ"),
         "in_flight": list(inflight),
         "daemon": daemon_state,
+        "recent_failures": recent_failures(local_root),
     }
+
+
+# Outcomes that count as "failure" for wf-118 pulse visibility.
+_FAILURE_OUTCOMES = frozenset(("vendor_limit", "error", "crashed"))
+_RECENT_FAILURE_WINDOW_SECS = 1800  # 30 minutes — matches daemon cadence
+
+
+def recent_failures(local_root: str,
+                    window_secs: int = _RECENT_FAILURE_WINDOW_SECS
+                    ) -> List[Dict[str, str]]:
+    """Workers with a failed shift in the last ``window_secs``.
+
+    Surfaces vendor_limit / error / crashed outcomes for fast-fail shifts
+    (e.g. 1-second vendor-limit hits) that finish before the suite Map polls.
+    Only reads ledger files whose mtime falls within the window; bounded for
+    sub-second callers on the pulse bus.
+    """
+    ledger_dir = os.path.join(local_root, "ledger")
+    cutoff = (datetime.datetime.now(datetime.timezone.utc)
+              - datetime.timedelta(seconds=window_secs)).timestamp()
+    out: List[Dict[str, str]] = []
+    try:
+        entries = os.listdir(ledger_dir)
+    except OSError:
+        return out
+    for fn in sorted(entries):
+        if not fn.endswith(".log"):
+            continue
+        path = os.path.join(ledger_dir, fn)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                continue
+            size = os.path.getsize(path)
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                fh.seek(max(0, size - 4096))
+                tail = fh.read()
+        except OSError:
+            continue
+        shifts = parse_shifts(tail, limit=1)
+        if not shifts:
+            continue
+        last = shifts[0]
+        outcome = last.get("outcome") or ""
+        reason = last.get("reason") or ""
+        # Reclassify when the START line fell outside the 4 KB tail window
+        if outcome == "error" and reason.startswith("vendor limit:"):
+            outcome = "vendor_limit"
+        if outcome not in _FAILURE_OUTCOMES:
+            continue
+        out.append({
+            "worker": fn[:-4],
+            "outcome": outcome,
+            "reason": reason,
+            "ts": last.get("end_ts") or last.get("ts") or "",
+        })
+    return out
 
 
 def _kind_label(kind: str) -> str:
@@ -91,7 +150,7 @@ def _kind_label(kind: str) -> str:
 
 LAUNCH_AGENTS = os.path.expanduser("~/Library/LaunchAgents")
 DESK = os.environ.get("WORKFORCE_DESK", os.environ.get("WORKFORCE_DESK", "http://127.0.0.1:8799"))
-CITYHALL = os.environ.get("WORKFORCE_CITYHALL", os.environ.get("WORKFORCE_CITYHALL", "http://127.0.0.1:8796"))
+CITYHALL = os.environ.get("WORKFORCE_CITYHALL", os.environ.get("WORKFORCE_CITYHALL", ""))
 
 # ── Dashboard branding ──────
 # In a founded city the room name leads: "ProtocolCity — Roster · Workers".
@@ -195,7 +254,9 @@ def _legacy_plist(label: str) -> Dict[str, str]:
     cal = data.get("StartCalendarInterval")
     if cal is not None:
         cron = calendar_intervals_to_cron(cal)
-        next_fire = _fmt_fire(cron.next_fire(_utcnow())) if cron else "calendar"
+        next_fire = (
+            _fmt_fire(next_fire_utc(cron, _utcnow())) if cron else "calendar"
+        )
     elif "StartInterval" in data:
         next_fire = "every %ss" % data["StartInterval"]
     elif data.get("KeepAlive"):
@@ -230,9 +291,11 @@ def _launchctl_rota(local_root: str) -> List[Dict[str, str]]:
 
 # ── Desk JSON proxy ───────────────────────────────────────────────────────
 
-def _desk_json(path: str) -> Optional[dict]:
+def _desk_json(path: str, timeout: float = 5.0) -> Optional[dict]:
+    """GET DESK+path as JSON. *timeout* is host-neutral; board/scene paths
+    pass a shorter bound so a hung desk cannot freeze Map."""
     try:
-        with urllib.request.urlopen(DESK + path, timeout=5) as resp:
+        with urllib.request.urlopen(DESK + path, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception:
         return None
@@ -264,16 +327,148 @@ def _queue_human_link(w: Worker) -> str:
     return url
 
 
+# Board/scene display probe. Shorter than engine dispatch so
+# a hung desk cannot freeze Map. Sockets always close via engine._http_get_json.
+#
+# wf-147: do **not** retry on timeout — with ~36 lanes fanned out, a 3s timeout
+# + one retry made full /api/scene wall-clock ~6–16s when any product filter
+# stalled (Map felt dead; clients hung up → BrokenPipe bursts on write).
+# One short attempt: degrade to '?' and keep the glass under the 2s target.
+# Retry only transient connection drops (reset / refused), not spent budget.
+_BOARD_PROBE_TIMEOUT_SECS = 0.9
+_BOARD_PROBE_RETRY_BACKOFF_SECS = 0.15
+# Holdings / owner desk calls on the scene path share this tighter bound.
+_BOARD_DESK_TIMEOUT_SECS = 1.0
+
+
+def _is_connection_exc(exc: BaseException) -> bool:
+    """True when a retry might help (peer reset / refused), not a timeout."""
+    if _is_timeout_exc(exc):
+        return False
+    if isinstance(exc, (ConnectionError, BrokenPipeError)):
+        return True
+    name = type(exc).__name__
+    if name in ("ConnectionResetError", "ConnectionRefusedError",
+                "RemoteDisconnected"):
+        return True
+    msg = str(exc).lower()
+    return ("connection reset" in msg or "connection refused" in msg
+            or "remote end closed" in msg or "broken pipe" in msg)
+
+
 def _worker_queue(w: Worker) -> str:
-    """Ready count for this worker's lane — '?' when unprobed/unreachable."""
+    """Ready count for this worker's lane — '?' when unprobed/unreachable.
+
+    Uses the shared HTTP GET helper so timed-out polls close their sockets
+   . One short attempt on timeout; one retry only on
+    transient connection errors. Permanent failures still return '?'.
+    """
     if not w.queue_url:
         return "—"
+    for attempt in range(2):
+        try:
+            data = _http_get_json(w.queue_url, timeout=_BOARD_PROBE_TIMEOUT_SECS)
+            return str(int(_dig(data, w.queue_count_key)))
+        except Exception as exc:
+            if attempt == 0 and _is_connection_exc(exc):
+                time.sleep(_BOARD_PROBE_RETRY_BACKOFF_SECS)
+                continue
+            break
+    return "?"
+
+
+def _ledger_holdings(
+    local_root: str, worker_name: str, *, owner: str = "",
+) -> List[Dict[str, object]]:
+    """Open CLAIM events from the worker ledger → scene holding shape.
+
+    Local disk only — safe on the light path. Empty when no shift is open or
+    the ready probe was count-only (no task ids recorded).
+    """
+    path = os.path.join(local_root, "ledger", "%s.log" % worker_name)
     try:
-        with urllib.request.urlopen(w.queue_url, timeout=3) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        return str(int(_dig(data, w.queue_count_key)))
-    except Exception:
-        return "?"
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return []
+    out: List[Dict[str, object]] = []
+    for c in open_claims(text)[:3]:
+        tid = str(c.get("ticket") or c.get("id") or "").strip()
+        if not tid:
+            continue
+        product = str(c.get("product") or "")
+        href = ""
+        if tid:
+            href = "%s/admin/desk?open=%s" % (
+                DESK.rstrip("/"), urllib.parse.quote(tid))
+        pri: object = c.get("priority")
+        if pri is not None and str(pri) != "":
+            try:
+                pri = int(str(pri))
+            except (TypeError, ValueError):
+                pass
+        else:
+            pri = None
+        out.append({
+            "id": tid,
+            "title": str(c.get("title") or ""),
+            "status": "in_progress",
+            "priority": pri,
+            "product": product,
+            "owner": owner,
+            "updated_at": str(c.get("ts") or ""),
+            "href": href,
+            "source": "ledger",
+        })
+    return out
+
+
+def _worker_full_data(
+    local_root: str, w: Worker, in_flight_set: set
+) -> Dict[str, object]:
+    """Per-worker full-path data in one thread: queue probe, health, last shift, holdings.
+
+    Called from scene_model's ThreadPoolExecutor fan-out so all workers run
+    concurrently instead of serially.  _worker_health and _worker_holdings are
+    defined later in this module — Python resolves at call time, not definition
+    time, so forward refs here are fine.
+
+    wf-147: when the worker is in_flight, queue probe and holdings run in
+    parallel inside this worker slot so the two desk round-trips do not stack
+    (serial path was ~timeout_q + timeout_hold under a slow desk).
+
+    wf-158: prefer engine-owned CLAIM ledger rows over a desk holdings probe
+    when present so the live work line survives a dark desk.
+    """
+    holding: List[Dict[str, object]] = []
+    if w.name in in_flight_set:
+        owner = (w.identity or w.name or "").split()[0]
+        ledger_held = _ledger_holdings(local_root, w.name, owner=owner)
+        if ledger_held:
+            holding = ledger_held
+            q = _worker_queue(w)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _inner:
+                fq = _inner.submit(_worker_queue, w)
+                # scene bay = live claims only (in_progress); skip in_review round-trip
+                fh = _inner.submit(
+                    _worker_holdings, w,  # type: ignore[name-defined]
+                    ("in_progress",),
+                )
+                q = fq.result()
+                try:
+                    holding = (fh.result() or [])[:3]
+                except Exception:
+                    holding = []
+    else:
+        q = _worker_queue(w)
+    health = _worker_health(local_root, w, q)  # type: ignore[name-defined]
+    shifts = parse_shifts(
+        Ledger(os.path.join(local_root, "ledger"), w.name).tail(60),
+        limit=3,
+    )
+    last = next((s for s in shifts if not s["dry_run"]), None)
+    return {"q": q, "health": health, "last": last, "holding": holding}
 
 
 def _platforms(local_root: str) -> List[Dict[str, str]]:
@@ -327,7 +522,7 @@ def _sector_for_worker(
     base = os.path.basename(workdir) if workdir else ""
     public = names.get(base, names.get(base.lower(), base or "unknown"))
 
-    if getattr(w, "staff", False):
+    if getattr(w, "staff", False) in (True, 1, "1", "true", "True"):
         return ("__office_staff__", "Office staff", "staff")
 
     if base.lower() in ("workforce", "workforce") or public == "WorkForce":
@@ -390,12 +585,14 @@ def scene_model(local_root: str, light: bool = False) -> Dict[str, object]:
     except a bounded desk probe for workers currently in_flight (live claim
     teaser on the bay) — idle floors still hit zero desk URLs.
 
-    light=True: skip ledger tails, launchctl services,
-    runtime detect, queue probes, and in_flight holdings — for suite Map
-    people bootstrap. Stripped fields are fixed to sentinel values so suite
-    consumers need no null-guards:
-        cli=""  queue="—"  health="ok"  why="light"  holding=[]
+    light=True: skip launchctl services, runtime detect,
+    queue probes, and desk holdings — for suite Map people bootstrap.
+    Stripped fields are fixed to sentinel values so suite consumers need no
+    null-guards:
+        cli=""  queue="—"  health="ok"  why="light"
         last_shift=null  services=[]  runtimes={detected:[],pool:[]}
+    holding is still filled from engine-owned CLAIM ledger rows when the
+    worker is in_flight — local disk only, no desk round-trip.
     Stable fields present in both modes: name, kind, display, model,
     schedule, owned, owner, skill, next_fire, daemon, in_flight, last_tick.
     """
@@ -409,27 +606,70 @@ def scene_model(local_root: str, light: bool = False) -> Dict[str, object]:
     in_flight_set = {str(x) for x in in_flight_raw}
 
     sectors: Dict[str, Dict[str, object]] = {}
+    services: List[Dict[str, str]] = []
+    _pool: object = None  # set in fan-out (not light) or light sentinel below
     if roster:
-        for name in sorted(roster.workers):
+        _sorted_names = sorted(roster.workers)
+        _wdata_by: Dict[str, Dict[str, object]] = {}
+        if not light:
+            _wlist = [roster.workers[n] for n in _sorted_names]
+            _n = max(len(_wlist), 1)
+
+            def _rt_task() -> object:
+                _d = runtimes_mod.detect()
+                return runtimes_mod.staffing_pool(_d, roster, local_root=local_root)
+
+            # Fan out: per-worker I/O (queue probe + health + ledger + holdings),
+            # launchctl subprocess, and runtime detect all run concurrently.
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(_n + 2, 18)) as _tp:
+                _wfuts = [
+                    _tp.submit(_worker_full_data, local_root, w, in_flight_set)
+                    for w in _wlist
+                ]
+                _lctl_fut = _tp.submit(_launchctl_rota, local_root)
+                _rt_fut = _tp.submit(_rt_task)
+            # All futures complete when the `with` block exits.
+            _wdata_by = dict(zip(_sorted_names, [f.result() for f in _wfuts]))
+            try:
+                for row in _lctl_fut.result():
+                    if row.get("kind") == "service":
+                        services.append({
+                            "label": row.get("label") or "",
+                            "kind": "service",
+                            "pid": row.get("pid") or "",
+                            "next_fire": row.get("next_fire") or "",
+                            "state": row.get("state") or "",
+                        })
+            except Exception:
+                services = []
+            try:
+                _pool = _rt_fut.result()
+            except Exception:
+                pass
+        for name in _sorted_names:
             w = roster.workers[name]
             # light=True must stay network-free: each queue_url probe is up to
             # 3s, and a hung WorkLane (17 workers) freezes Map bootstrap for
-            # ~50s+ (founder 2026-07-25 outage). Full scene still probes.
+            # ~50s+ (founder 2026-07-25 outage). Full scene probes via fan-out.
             if light:
                 q = "—"
                 health = {"cls": "ok", "why": "light"}
+                last = None
+                # wf-158: local CLAIM ledger only — never desk on light path
+                if name in in_flight_set:
+                    owner = (w.identity or w.name or "").split()[0]
+                    holding = _ledger_holdings(local_root, name, owner=owner)
+                else:
+                    holding = []
             else:
-                q = _worker_queue(w)
-                health = _worker_health(local_root, w, q)
+                _wd = _wdata_by[name]
+                q = _wd["q"]
+                health = _wd["health"]
+                last = _wd["last"]
+                holding = _wd["holding"]
             cron = maybe_cron(w.schedule)
-            nf = cron.next_fire(_utcnow()) if cron else None
-            last = None
-            if not light:
-                shifts = parse_shifts(
-                    Ledger(os.path.join(local_root, "ledger"), name).tail(60),
-                    limit=3,
-                )
-                last = next((s for s in shifts if not s["dry_run"]), None)
+            nf = next_fire_utc(cron, _utcnow()) if cron else None
             gkey, workplace, role = _sector_for_worker(name, w, names)
             workdir = os.path.abspath(w.workdir) if w.workdir else ""
             sec = sectors.setdefault(gkey, {
@@ -440,14 +680,6 @@ def scene_model(local_root: str, light: bool = False) -> Dict[str, object]:
             # Prefer ProtocolCity workdir for Office staff papers when present
             if role == "staff" and "ProtocolCity" in workdir:
                 sec["workdir"] = workdir
-            # Live claim teaser only while the daemon has them in flight —
-            # keeps the idle scene network-free (desk can be slow/down).
-            holding: List[Dict[str, object]] = []
-            if (not light) and name in in_flight_set:
-                try:
-                    holding = _worker_holdings(w)[:3]
-                except Exception:
-                    holding = []
             sec["workers"].append({  # type: ignore[union-attr]
                 "name": name, "kind": _kind_label(w.kind),
                 "display": w.display or "",
@@ -496,26 +728,16 @@ def scene_model(local_root: str, light: bool = False) -> Dict[str, object]:
 
     daemon = ("draining" if (hb.get("state") == "draining" and status != "stopped")
               else status)
-    services: List[Dict[str, str]] = []
-    if not light:
-        try:
-            for row in _launchctl_rota(local_root):
-                if row.get("kind") == "service":
-                    services.append({
-                        "label": row.get("label") or "",
-                        "kind": "service",
-                        "pid": row.get("pid") or "",
-                        "next_fire": row.get("next_fire") or "",
-                        "state": row.get("state") or "",
-                    })
-        except Exception:
-            services = []
     sector_list = [you_sec] + sorted(sectors.values(), key=_sector_sort)
     if light:
         _pool = {"detected": [], "pool": []}
-    else:
-        _detected = runtimes_mod.detect()
-        _pool = runtimes_mod.staffing_pool(_detected, roster)
+    elif _pool is None:
+        # roster was None (no roster.json) — runtimes fan-out never ran
+        try:
+            _detected = runtimes_mod.detect()
+            _pool = runtimes_mod.staffing_pool(_detected, roster, local_root=local_root)
+        except Exception:
+            _pool = []
     return {
         "generated_at": _utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "daemon": daemon,
@@ -628,7 +850,7 @@ def report_model(local_root: str, days: Optional[int] = None) -> Dict[str, objec
             q = _worker_queue(w)
             health = _worker_health(local_root, w, q)
             cron = maybe_cron(w.schedule)
-            nf = cron.next_fire(now) if cron else None
+            nf = next_fire_utc(cron, now) if cron else None
             shifts = [s for s in parse_shifts(
                 Ledger(os.path.join(local_root, "ledger"), name).tail(2000),
                 limit=400) if not s["dry_run"]]
@@ -731,7 +953,10 @@ def report_model(local_root: str, days: Optional[int] = None) -> Dict[str, objec
 
 def _desk_owner_of(task_id: str) -> str:
     """Latest Owner: marker on a ticket (PROCESS.md §5)."""
-    d = _desk_json("/api/admin/tasks/" + urllib.parse.quote(str(task_id)))
+    d = _desk_json(
+        "/api/admin/tasks/" + urllib.parse.quote(str(task_id)),
+        timeout=_BOARD_DESK_TIMEOUT_SECS,
+    )
     task = (d or {}).get("task") if isinstance(d, dict) else None
     if not isinstance(task, dict):
         task = d if isinstance(d, dict) and d.get("id") else None
@@ -755,15 +980,31 @@ def _worker_identity_aliases(w: Worker) -> List[str]:
     return out
 
 
-def _worker_holdings(w: Worker) -> List[Dict[str, object]]:
-    """Tickets this worker currently holds (in_progress / in_review + Owner:)."""
+def _worker_holdings(
+    w: Worker,
+    statuses: Tuple[str, ...] = ("in_progress", "in_review"),
+) -> List[Dict[str, object]]:
+    """Tickets this worker currently holds (in_progress / in_review + Owner:).
+
+    When the lane queue_url carries ``label=worker:<id>`` (steady-state routing),
+    filter the desk list by that label and skip per-ticket Owner: walks — one
+    GET per status, not N+1 owner probes. Owner fallback
+    remains for unlabeled legacy rows, with a hard cap on detail fetches.
+
+    *statuses* defaults to both live and parked holds (personnel drawer). The
+    scene bay teaser passes ``("in_progress",)`` only so one desk round-trip
+    stays inside the Map latency budget.
+    """
     product = ""
+    label = ""
     if w.queue_url:
         try:
             qs = urllib.parse.parse_qs(urllib.parse.urlsplit(w.queue_url).query)
             product = (qs.get("product") or qs.get("project") or [""])[0]
+            label = (qs.get("label") or [""])[0]
         except Exception:
             product = ""
+            label = ""
     if not product or product == "all":
         product = os.path.basename(os.path.abspath(w.workdir or "")).lower()
     if not product:
@@ -771,20 +1012,37 @@ def _worker_holdings(w: Worker) -> List[Dict[str, object]]:
     aliases = set(_worker_identity_aliases(w))
     held: List[Dict[str, object]] = []
     seen: set = set()
-    for status in ("in_progress", "in_review"):
-        d = _desk_json(
-            "/api/admin/tasks?product=%s&status=%s&limit=40"
-            % (urllib.parse.quote(product), status))
+    owner_lookups = 0
+    _owner_cap = 5  # hard bound on N+1 Owner: detail GETs (legacy path)
+    for status in statuses:
+        if label:
+            path = (
+                "/api/admin/tasks?product=%s&status=%s&label=%s&limit=10"
+                % (urllib.parse.quote(product), status,
+                   urllib.parse.quote(label)))
+        else:
+            path = (
+                "/api/admin/tasks?product=%s&status=%s&limit=40"
+                % (urllib.parse.quote(product), status))
+        d = _desk_json(path, timeout=_BOARD_DESK_TIMEOUT_SECS)
         for t in (d or {}).get("tasks") or []:
             if not isinstance(t, dict):
                 continue
             tid = str(t.get("id") or "")
             if not tid or tid in seen:
                 continue
-            owner = _desk_owner_of(tid)
-            tok = owner.strip().split()[0].rstrip(".,;:").lower() if owner else ""
-            if tok not in aliases:
-                continue
+            if label:
+                # Lane label is the routing seat — trust it over Owner: walk.
+                owner = (w.identity or w.name or "").split()[0]
+            else:
+                if owner_lookups >= _owner_cap:
+                    continue
+                owner = _desk_owner_of(tid)
+                owner_lookups += 1
+                tok = (owner.strip().split()[0].rstrip(".,;:").lower()
+                       if owner else "")
+                if tok not in aliases:
+                    continue
             seen.add(tid)
             held.append({
                 "id": tid,
@@ -901,7 +1159,7 @@ def worker_model(local_root: str, name: str) -> Optional[Dict[str, object]]:
     q = _worker_queue(w)
     health = _worker_health(local_root, w, q)
     cron = maybe_cron(w.schedule)
-    nf = cron.next_fire(_utcnow()) if cron else None
+    nf = next_fire_utc(cron, _utcnow()) if cron else None
     law = []
     for i, entry in enumerate(_law_stack(w)):
         law.append({
@@ -1011,7 +1269,8 @@ _WEDGE_SHIFTS = 3  # consecutive no-progress shifts on a nonempty queue = wedged
 
 def _worker_health(local_root: str, w: Worker, queue: str) -> Dict[str, str]:
     """One dot per worker: ok | amber (starving) | err (last shift failed)
-    | wedged (fires but never claims — the no-sitting law, oc-34)."""
+    | wedged (fires but never claims — the no-sitting law, oc-34)
+    | idle (empty-queue streak at/past threshold — wf-125)."""
     shifts = parse_shifts(Ledger(os.path.join(local_root, "ledger"), w.name).tail(60), limit=6)
     real = [s for s in shifts if not s["dry_run"]]
     if not real:
@@ -1022,6 +1281,14 @@ def _worker_health(local_root: str, w: Worker, queue: str) -> Dict[str, str]:
     if last["outcome"] in ("error", "crashed"):
         return {"cls": "err", "why": "last desk run %s: %s"
                                      % (last["outcome"].upper(), last["reason"] or "?")}
+    # wf-125: empty-queue streak at/past threshold → idle (paused, not broken)
+    _threshold = max(1, int(getattr(w, "empty_run_threshold", 3) or 3))
+    _streak, _ = empty_run_streak(local_root, w.name)
+    if _streak >= _threshold:
+        return {
+            "cls": "idle",
+            "why": "empty-queue streak (%d consecutive queue empty)" % _streak,
+        }
     try:
         q_n = int(queue)
     except ValueError:

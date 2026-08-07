@@ -10,6 +10,12 @@ Supported field syntax: ``*``, ``N``, ``A-B``, ``*/S``, ``A-B/S`` and comma
 lists of those. Day-of-week 0-7 with both 0 and 7 = Sunday. Standard cron
 day semantics: when day-of-month and day-of-week are BOTH restricted, a date
 matches if either does.
+
+Timezone:
+  Cron *fields* are host **local** wall-clock (seed_ops + worker contracts
+  promise LOCAL machine time). Absolute instants for ledger / heartbeat /
+  next_fire ISO stay **UTC** with a ``Z`` suffix. ``host_wall`` is the
+  single convert seam — tests may monkeypatch it to pin a fixed offset.
 """
 
 import calendar
@@ -17,10 +23,43 @@ import datetime
 from typing import FrozenSet, List, Optional, Tuple
 
 FIELD_RANGES = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))  # min hr dom mon dow
+UTC = datetime.timezone.utc
 
 
 class ScheduleError(ValueError):
     """A five-field expression that fails to parse as cron."""
+
+
+def host_wall(dt: datetime.datetime) -> datetime.datetime:
+    """Absolute time → host local wall for cron field matching.
+
+    Naive datetimes are treated as UTC. Monkeypatch this in tests to pin a
+    zone without depending on the runner host.
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone()  # system local
+
+
+def matches_at(cron: "Cron", when: datetime.datetime) -> bool:
+    """Whether absolute ``when`` matches ``cron`` on the host local wall."""
+    return cron.matches(host_wall(when))
+
+
+def next_fire_utc(
+    cron: "Cron", after: datetime.datetime
+) -> Optional[datetime.datetime]:
+    """Next fire after absolute ``after``, fields vs local wall, result UTC."""
+    wall = host_wall(after)
+    nxt = cron.next_fire(wall)
+    if nxt is None:
+        return None
+    return nxt.astimezone(UTC)
+
+
+def fire_minute_key(when: datetime.datetime) -> str:
+    """Dedup key for a scheduled fire slot (local wall minute, wf-146)."""
+    return host_wall(when).strftime("%Y-%m-%dT%H:%M")
 
 
 def _parse_field(field: str, lo: int, hi: int) -> FrozenSet[int]:

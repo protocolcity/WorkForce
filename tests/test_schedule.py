@@ -9,10 +9,12 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from workforce.schedule import (  # noqa: E402
-    Cron, ScheduleError, calendar_intervals_to_cron, maybe_cron,
+    Cron, ScheduleError, calendar_intervals_to_cron, fire_minute_key,
+    host_wall, matches_at, maybe_cron, next_fire_utc,
 )
 
 UTC = datetime.timezone.utc
+CDT = datetime.timezone(datetime.timedelta(hours=-5))
 
 
 def dt(*args):
@@ -83,3 +85,39 @@ def test_calendar_interval_weekly():
 def test_calendar_interval_irregular_union_not_guessed():
     assert calendar_intervals_to_cron([{"Minute": 0}, {"Hour": 5}]) is None
     assert calendar_intervals_to_cron([{"Minute": 0, "Hour": 1}, {"Minute": 30, "Hour": 2}]) is None
+
+
+def test_next_fire_utc_evaluates_local_wall(monkeypatch):
+    """wf-146: next_fire_utc converts local field match back to UTC Z instant."""
+    def _cdt_wall(when):
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=UTC)
+        return when.astimezone(CDT)
+
+    monkeypatch.setattr("workforce.schedule.host_wall", _cdt_wall)
+    c = Cron("0 11 * * *")  # 11:00 local
+    # After 10:00 CDT (15:00Z) → next is 11:00 CDT = 16:00Z same day
+    nf = next_fire_utc(c, datetime.datetime(2026, 8, 3, 15, 0, tzinfo=UTC))
+    assert nf == datetime.datetime(2026, 8, 3, 16, 0, tzinfo=UTC)
+    # At 11:00 UTC (06:00 CDT) does not match local 11
+    assert not matches_at(c, datetime.datetime(2026, 8, 3, 11, 0, tzinfo=UTC))
+    assert matches_at(c, datetime.datetime(2026, 8, 3, 16, 0, tzinfo=UTC))
+    assert fire_minute_key(datetime.datetime(2026, 8, 3, 16, 0, tzinfo=UTC)) == (
+        "2026-08-03T11:00"
+    )
+
+
+def test_host_wall_naive_treated_as_utc_then_local(monkeypatch):
+    """Naive input is stamped UTC before projection to the host wall."""
+    import workforce.schedule as sched
+
+    def _fixed(when):
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=UTC)
+        return when.astimezone(CDT)
+
+    monkeypatch.setattr(sched, "host_wall", _fixed)
+    wall = sched.host_wall(datetime.datetime(2026, 8, 3, 16, 0))  # naive
+    assert wall.tzinfo is not None
+    assert wall.hour == 11
+    assert wall.utcoffset() == datetime.timedelta(hours=-5)

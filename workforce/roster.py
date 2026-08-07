@@ -10,11 +10,18 @@ the seams live in config, never in code.
 """
 
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+_log = logging.getLogger(__name__)
+
 DEFAULT_ROSTER_PATHS = ("local/roster.json", "roster.json")
+
+# wf-154 · citizen three-tier taxonomy: derived from kind + staff.
+# Wire values stay kind=lane|job; type is never persisted, always derived.
+WORKER_TYPES = ("agent", "staff", "job")
 
 
 class RosterError(ValueError):
@@ -27,7 +34,9 @@ class Worker:
 
     ``kind`` is the Charter's lanes-vs-jobs split: a ``lane`` claims work
     orders; a ``job`` observes and never claims (its queue probe is its
-    trigger condition, or absent for calendar jobs).
+    trigger condition, or absent for calendar jobs).  Wire values are
+    strictly ``lane`` or ``job``; citizen UIs may label these "worker" or
+    "Agent" — those surface labels are not valid roster values.
     """
 
     name: str
@@ -39,7 +48,14 @@ class Worker:
     kind: str = "lane"                 # lane | job
     model: str = ""                    # pin; empty = vendor default (explicit choice)
     budget_secs: int = 1500            # wall-clock hard-kill budget (whole shift)
-    max_passes: int = 1                # §6 multi-pass ceiling; 1 = single-pass
+    # §6 multi-pass ceiling:
+    #   0 = budget-driven drain (stop only on empty / no-progress / budget floor /
+    #       fault; engine enforces MAX_PASSES_HARD safety rail)
+    #   1 = single-pass (legacy default for jobs / explicit lane opt-out)
+    #   N>1 = soft ceiling after N successful passes
+    # Dataclass default 1 keeps Worker() tests single-pass; load() and hire
+    # default 0 for kind=lane when the key is absent (founder drain-loop ruling).
+    max_passes: int = 1
     min_pass_secs: int = 600           # never start a pass you can't finish
     schedule: str = ""                 # five-field cron = daemon-owned; else informational
     predirty_env: str = ""             # env var name for the §7 snapshot path (host guards may expect their own name); empty = WORKFORCE_PREDIRTY
@@ -60,6 +76,40 @@ class Worker:
     ghost_audit: List[str] = field(default_factory=list)  # §8 pre-shift reconciler argv; empty = no audit
     scope_home: str = ""                # when set, realpath(workdir) must fall within realpath(scope_home) or a perimeter grant; empty = no enforcement
     perimeter_grants: List[str] = field(default_factory=list)  # additional allowed roots (PERIMETER row grants)
+    fallback_runtime: str = ""          # CLI name to retry on quota hit (must be in KNOWN_RUNTIMES); empty = no fallback
+    fallback_model: str = ""            # model pin for the fallback shift; empty = vendor default
+    # ALWAYS_WORK §4 / wf-111 — empty-run hygiene (host may pin per seat)
+    empty_run_threshold: int = 3        # N consecutive queue-empty SKIPs → one WARN health signal
+    empty_run_backoff: int = 0          # seconds to suppress cron fires after threshold; 0 = signal only
+    # wf-125 — pause until ready: probe queue on each tick after threshold; suppress if still empty
+    empty_run_pause: bool = False       # requires queue_url; auto-resumes when queue returns ready
+    # wf-149 — adaptive idle backoff: after threshold, cadence stretches 1h → 4h → daily
+    # heartbeat (never stops — the daily probe is the desk-reachability canary). Any wake
+    # or non-empty probe resets to base. Only engages when pause/backoff are unset.
+    empty_run_adaptive: bool = True     # False = legacy signal-only when backoff=0
+    # wf-126 — vendor-limit backoff: suppress cron fires after N consecutive vendor_limit shifts
+    vendor_limit_threshold: int = 3    # N consecutive vendor_limit shifts to trigger (0 = off)
+    vendor_limit_backoff: int = 0      # seconds to suppress after threshold; 0 = signal only
+    # wf-166 — daily fire ceiling: suppress further scheduled fires after N START
+    # events on the host-local calendar day. 0 = unlimited (host-neutral default).
+    # Recommended pin for aggressive hourly seats (e.g. CoS): max_fires_per_day: 1.
+    # Manual fire_now bypasses; only the daemon tick path enforces.
+    max_fires_per_day: int = 0
+    # wf-153 — shift worktree isolation: spawn cwd under local/worktrees/<name>
+    # so founder/other dirty on the primary checkout cannot enter hand commits.
+    # Dataclass default false (safe for direct Worker() in tests). load() and
+    # hire default true for kind=lane when the key is absent (slice 4); jobs
+    # stay false. Explicit false on a lane row is a permanent opt-out.
+    shift_worktree: bool = False
+
+    @property
+    def worker_type(self) -> str:
+        """Citizen tier: agent = claims from a ready feed;
+        staff = shipped workspace seat (kind=job + staff); job = plumbing.
+        Derived, never stored — kind stays the lane|job wire value."""
+        if self.kind == "lane":
+            return "agent"
+        return "staff" if self.staff else "job"
 
     def validate(self) -> None:
         if not self.name:
@@ -71,12 +121,19 @@ class Worker:
             raise RosterError("worker %r missing command" % self.name)
         if self.kind not in ("lane", "job"):
             raise RosterError("worker %r kind must be lane|job, got %r" % (self.name, self.kind))
-        if self.max_passes < 1:
-            raise RosterError("worker %r max_passes must be >= 1" % self.name)
-        if self.max_passes > 1 and not self.queue_url:
+        if self.max_passes < 0:
             raise RosterError(
-                "worker %r wants multi-pass but has no queue probe — the "
-                "no-progress stop (§6) needs one" % self.name)
+                "worker %r max_passes must be >= 0 (0 = budget-driven drain)"
+                % self.name
+            )
+        # Budget-driven drain (0) and multi-pass (N>1) both re-probe the ready
+        # feed between passes — need a queue_url for the no-progress stop.
+        if self.max_passes != 1 and not self.queue_url:
+            raise RosterError(
+                "worker %r wants multi-pass/drain (max_passes=%s) but has no "
+                "queue probe — the no-progress stop (§6) needs one"
+                % (self.name, self.max_passes)
+            )
         if bool(self.keychain_service) != bool(self.keychain_env):
             raise RosterError(
                 "worker %r must set keychain_service and keychain_env together" % self.name
@@ -85,6 +142,38 @@ class Worker:
             if not k or not v or not isinstance(v, str):
                 raise RosterError(
                     "worker %r usage_fields must map ledger keys to dot-paths" % self.name)
+        if self.fallback_runtime:
+            from .runtimes import KNOWN_RUNTIMES
+            if self.fallback_runtime not in KNOWN_RUNTIMES:
+                raise RosterError(
+                    "worker %r fallback_runtime %r not in KNOWN_RUNTIMES (%s)"
+                    % (self.name, self.fallback_runtime, ", ".join(KNOWN_RUNTIMES))
+                )
+        if int(self.empty_run_threshold) < 1:
+            raise RosterError(
+                "worker %r empty_run_threshold must be >= 1" % self.name
+            )
+        if int(self.empty_run_backoff) < 0:
+            raise RosterError(
+                "worker %r empty_run_backoff must be >= 0" % self.name
+            )
+        if int(self.vendor_limit_threshold) < 0:
+            raise RosterError(
+                "worker %r vendor_limit_threshold must be >= 0" % self.name
+            )
+        if int(self.vendor_limit_backoff) < 0:
+            raise RosterError(
+                "worker %r vendor_limit_backoff must be >= 0" % self.name
+            )
+        if int(self.vendor_limit_backoff) > 0 and int(self.vendor_limit_threshold) < 1:
+            raise RosterError(
+                "worker %r vendor_limit_backoff > 0 requires vendor_limit_threshold >= 1"
+                % self.name
+            )
+        if int(self.max_fires_per_day) < 0:
+            raise RosterError(
+                "worker %r max_fires_per_day must be >= 0 (0 = unlimited)" % self.name
+            )
 
 
 _OWNER_SPECIAL = frozenset({"owner-terminal", "you", "founder"})
@@ -98,9 +187,9 @@ def _validate_owners(workers: Dict[str, Worker]) -> None:
             continue
         if own in _OWNER_SPECIAL or own in workers:
             continue
-        raise RosterError(
-            "worker %r owner %r is not owner-terminal/you and not on this roster"
-            % (w.name, own)
+        _log.error(
+            "roster: worker %r owner %r is not on this roster — owner field ignored",
+            w.name, own,
         )
 
 
@@ -151,20 +240,50 @@ def load(path: Optional[str] = None, base: Optional[str] = None) -> Roster:
     identities = {}
     workers: Dict[str, Worker] = {}
     for name, spec in workers_raw.items():
-        if not isinstance(spec, dict):
-            raise RosterError("worker %r spec must be an object" % name)
-        known = {f for f in Worker.__dataclass_fields__ if f != "name"}
-        unknown = set(spec) - known
-        if unknown:
-            raise RosterError("worker %r has unknown fields: %s" % (name, ", ".join(sorted(unknown))))
-        w = Worker(name=name, **spec)
-        w.validate()
-        if w.identity in identities:
-            raise RosterError(
-                "identity %r used by both %r and %r — one worker, one identity"
-                % (w.identity, identities[w.identity], name)
-            )
-        identities[w.identity] = name
-        workers[name] = w
+        try:
+            if not isinstance(spec, dict):
+                raise RosterError("worker %r spec must be an object" % name)
+            known = {f for f in Worker.__dataclass_fields__ if f != "name"}
+            unknown = set(spec) - known
+            if unknown:
+                raise RosterError("worker %r has unknown fields: %s" % (name, ", ".join(sorted(unknown))))
+            # Resolve relative paths to absolute using base.
+            # Absolute entries (legacy or hand-written) pass through unchanged.
+            for _f in ("workdir", "contract", "prompt"):
+                _v = spec.get(_f, "")
+                if _v and not os.path.isabs(_v):
+                    spec[_f] = os.path.normpath(os.path.join(base, _v))
+            # wf-153 slice 4 — absent key inherits hire defaults: lanes on,
+            # jobs off. Explicit false on a lane is an opt-out (must be
+            # persisted; see worker_to_spec). Matches hire kind defaults so
+            # pre-flag live rosters isolate without a citizen roster rewrite.
+            _kind = spec.get("kind") or "lane"
+            if isinstance(_kind, str):
+                _kind = _kind.strip().lower()
+            else:
+                _kind = "lane"
+            if "shift_worktree" not in spec:
+                spec["shift_worktree"] = (_kind == "lane")
+            # wf-174 — absent max_passes: lanes *with* a ready feed drain until
+            # budget/empty/fault; jobs and queue-less rows stay single-pass
+            # (drain needs a probe for the no-progress stop). Explicit 1 on a
+            # lane remains a single-pass opt-out (doctor notes drain-stunted).
+            if "max_passes" not in spec:
+                has_queue = bool((spec.get("queue_url") or "").strip())
+                if _kind == "lane" and has_queue:
+                    spec["max_passes"] = 0
+                else:
+                    spec["max_passes"] = 1
+            w = Worker(name=name, **spec)
+            w.validate()
+            if w.identity in identities:
+                raise RosterError(
+                    "identity %r used by both %r and %r — one worker, one identity"
+                    % (w.identity, identities[w.identity], name)
+                )
+            identities[w.identity] = name
+            workers[name] = w
+        except (RosterError, TypeError) as exc:
+            _log.error("roster: skipping worker %r — %s", name, exc)
     _validate_owners(workers)
     return Roster(workers=workers, path=path)

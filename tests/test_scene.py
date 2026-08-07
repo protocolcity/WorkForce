@@ -120,6 +120,36 @@ def test_scene_model_cli_from_command_path(tmp_path, monkeypatch):
     assert workers["kai"]["model"] == "grok-4.5"
 
 
+def test_scene_model_prefers_ledger_claim_over_desk(tmp_path, monkeypatch):
+    """wf-158: full scene uses CLAIM ledger when present (desk is fallback)."""
+    import datetime
+    local = _local(tmp_path)
+    w = _worker(tmp_path, "morgan", "hoodM")
+    roster = Roster(workers={"morgan": w}, path="t")
+    _patch_roster(monkeypatch, roster)
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    (local / "ledger" / "morgan.log").write_text(
+        "%s START identity=morgan kind=lane queue=1 dry_run=0\n"
+        "%s CLAIM ticket=wf-158 title=from-ledger product=workforce\n"
+        % (now, now)
+    )
+    (local / "daemon.json").write_text(json.dumps({
+        "state": "running", "in_flight": ["morgan"], "last_tick": now,
+    }))
+
+    def fake_holdings(w, statuses=None, **_kw):
+        return [{"id": "desk-only", "title": "from desk", "status": "in_progress"}]
+
+    monkeypatch.setattr(_api_roster, "_worker_holdings", fake_holdings)
+    model = board.scene_model(str(local))
+    workers = {row["name"]: row
+               for s in model["sectors"]
+               for row in s["workers"]}
+    held = workers["morgan"]["holding"]
+    assert held[0]["id"] == "wf-158"
+    assert held[0]["source"] == "ledger"
+
+
 def test_scene_model_holding_teaser_only_when_in_flight(tmp_path, monkeypatch):
     local = _local(tmp_path)
     active = _worker(tmp_path, "morgan", "hoodM")
@@ -133,7 +163,8 @@ def test_scene_model_holding_teaser_only_when_in_flight(tmp_path, monkeypatch):
                        "state": "scheduling", "in_flight": ["morgan"]})
     calls = []
 
-    def fake_holdings(w):
+    def fake_holdings(w, statuses=None, **_kw):
+        # statuses kw is scene-path (in_progress-only teaser, wf-147)
         calls.append(w.name)
         return [{"id": "ts-1", "title": "Land the bay claim line",
                  "status": "in_progress", "href": "http://desk/t/ts-1"}]
@@ -462,7 +493,7 @@ def test_light_scene_schema_sentinels(tmp_path, monkeypatch):
     assert k["queue"] == "—"
     assert k["health"] == "ok"
     assert k["why"] == "light"
-    assert k["holding"] == []
+    assert k["holding"] == []  # not in_flight, no CLAIM
     assert k["last_shift"] is None
     # stable fields still present and typed
     for field in ("name", "kind", "display", "model", "schedule",
@@ -471,6 +502,82 @@ def test_light_scene_schema_sentinels(tmp_path, monkeypatch):
     assert k["name"] == "kai"
     assert k["owned"] is True
 
+
+def test_light_scene_holding_from_ledger_claim(tmp_path, monkeypatch):
+    """wf-158: light path surfaces open CLAIM without a desk round-trip."""
+    import datetime
+    local = _local(tmp_path)
+    w = _worker(tmp_path, "kai", "hoodK", schedule="*/5 * * * *")
+    roster = Roster(workers={"kai": w}, path="t")
+    _patch_roster(monkeypatch, roster)
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    (local / "ledger" / "kai.log").write_text(
+        "%s START identity=kai kind=lane queue=1 dry_run=0\n"
+        "%s CLAIM ticket=wf-158 title=\"Engine claim\" product=workforce\n"
+        % (now, now)
+    )
+    # mark in_flight via heartbeat
+    (local / "daemon.json").write_text(json.dumps({
+        "state": "running", "in_flight": ["kai"], "last_tick": now,
+    }))
+
+    desk_calls = {"n": 0}
+
+    def boom(*_a, **_k):
+        desk_calls["n"] += 1
+        raise AssertionError("light path must not hit desk holdings")
+
+    monkeypatch.setattr(_api_roster, "_worker_holdings", boom)
+    monkeypatch.setattr(_api_roster, "_desk_json", boom)
+
+    model = _api_roster.scene_model(str(local), light=True)
+    workers = {row["name"]: row
+               for s in model["sectors"]
+               for row in s["workers"]}
+    held = workers["kai"]["holding"]
+    assert len(held) == 1
+    assert held[0]["id"] == "wf-158"
+    assert held[0]["source"] == "ledger"
+    assert desk_calls["n"] == 0
+
+
+def test_staff_string_does_not_mis_bay_lane_hand(tmp_path, monkeypatch):
+    """wf-105: staff='demo' (truthy string) must not place a lane hand in Office staff bay.
+
+    Only boolean True / integer 1 / string 'true' count as staff.
+    A lane hand with a workdir must land in its project sector.
+    """
+    local = _local(tmp_path)
+    # Lane hand — workdir "recipes", staff set to a non-boolean truthy string
+    recipes_hand = _worker(tmp_path, "recipes-hand", "recipes", staff="demo")
+    # True staff member for control
+    true_staff = _worker(tmp_path, "vera", "officehood", staff=True)
+    roster = Roster(
+        workers={"recipes-hand": recipes_hand, "vera": true_staff}, path="t"
+    )
+    _patch_roster(monkeypatch, roster)
+
+    model = board.scene_model(str(local))
+    by_place = {s["workplace"]: s for s in model["sectors"]}
+    by_role = {s["role"]: s for s in model["sectors"] if s["role"] != "you"}
+
+    # recipes-hand must NOT be in the Office staff bay
+    staff_names = {w["name"] for w in by_place.get("Office staff", {}).get("workers", [])}
+    assert "recipes-hand" not in staff_names, (
+        "lane hand with staff='demo' was mis-bayed as Office staff"
+    )
+
+    # recipes-hand must appear under its workdir sector
+    recipes_names = {
+        w["name"]
+        for s in model["sectors"]
+        if s["workplace"] not in ("You", "Office staff")
+        for w in s["workers"]
+    }
+    assert "recipes-hand" in recipes_names
+
+    # True staff member must still reach Office staff bay
+    assert "vera" in staff_names
 
 def test_generation_token_moves_on_roster_change(tmp_path):
     """Token must differ after roster.json is written (hire/fire path)."""
@@ -522,3 +629,142 @@ def test_generation_token_in_flight_field_mirrors_heartbeat(tmp_path):
     result = _api_roster.generation_token(str(local))
     assert sorted(result["in_flight"]) == ["kai", "morgan"]
     assert result["daemon"] in ("running", "stopped", "draining")
+
+
+# ── wf-106: scene_model parallel fan-out ─────────────────────────────────────
+
+
+def test_scene_model_fanout_preserves_per_worker_queue_values(tmp_path, monkeypatch):
+    """Parallel fan-out in scene_model must map distinct queue values per worker."""
+    local = _local(tmp_path)
+    w1 = _worker(tmp_path, "alpha", "hoodA")
+    w2 = _worker(tmp_path, "beta", "hoodB")
+    w3 = _worker(tmp_path, "gamma", "hoodA")
+    roster = Roster(workers={"alpha": w1, "beta": w2, "gamma": w3}, path="t")
+
+    queue_map = {"alpha": "3", "beta": "7", "gamma": "0"}
+
+    monkeypatch.setattr(_api_roster, "_load_roster", lambda _root: roster)
+    monkeypatch.setattr(_api_roster, "_worker_queue", lambda w: queue_map[w.name])
+
+    model = _api_roster.scene_model(str(local), light=False)
+
+    all_workers = {row["name"]: row
+                   for s in model["sectors"]
+                   for row in s["workers"]
+                   if row["name"] != "you"}
+    assert all_workers["alpha"]["queue"] == "3"
+    assert all_workers["beta"]["queue"] == "7"
+    assert all_workers["gamma"]["queue"] == "0"
+
+
+# ── wf-118: recent_failures — pulse visibility for fast-fail shifts ───────
+
+
+def _write_vendor_limit_ledger(path):
+    path.write_text(
+        "2026-08-02T19:00:00Z START identity=x kind=lane model=m "
+        "budget_secs=1500 queue=5 contract_sha=aa prompt_sha=bb dry_run=0\n"
+        "2026-08-02T19:00:01Z ERROR reason=\"vendor limit: You've hit your limit\"\n"
+    )
+
+
+def _write_ok_ledger(path):
+    path.write_text(
+        "2026-08-02T19:00:00Z START identity=x kind=lane model=m "
+        "budget_secs=1500 queue=1 contract_sha=aa prompt_sha=bb dry_run=0\n"
+        "2026-08-02T19:00:30Z DONE rc=0\n"
+        "2026-08-02T19:00:30Z STOP reason=\"single-pass complete\"\n"
+    )
+
+
+def test_recent_failures_detects_vendor_limit(tmp_path):
+    local = tmp_path / "local"
+    (local / "ledger").mkdir(parents=True)
+    _write_vendor_limit_ledger(local / "ledger" / "figaro.log")
+
+    failures = _api_roster.recent_failures(str(local))
+    names = [f["worker"] for f in failures]
+    assert "figaro" in names
+    f = next(x for x in failures if x["worker"] == "figaro")
+    assert f["outcome"] == "vendor_limit"
+    assert "limit" in f["reason"].lower()
+    assert f["ts"].startswith("2026-08-02")
+
+
+def test_recent_failures_detects_agent_exit_as_error(tmp_path):
+    local = tmp_path / "local"
+    (local / "ledger").mkdir(parents=True)
+    (local / "ledger" / "cheshire.log").write_text(
+        "2026-08-02T19:00:00Z START identity=x kind=lane model=m "
+        "budget_secs=1500 queue=3 contract_sha=aa prompt_sha=bb dry_run=0\n"
+        "2026-08-02T19:00:02Z ERROR reason=\"agent exit\" rc=1 on_pass=1\n"
+    )
+
+    failures = _api_roster.recent_failures(str(local))
+    names = [f["worker"] for f in failures]
+    assert "cheshire" in names
+    f = next(x for x in failures if x["worker"] == "cheshire")
+    assert f["outcome"] == "error"
+
+
+def test_recent_failures_excludes_successful_shifts(tmp_path):
+    local = tmp_path / "local"
+    (local / "ledger").mkdir(parents=True)
+    _write_ok_ledger(local / "ledger" / "salem.log")
+
+    names = [f["worker"] for f in _api_roster.recent_failures(str(local))]
+    assert "salem" not in names
+
+
+def test_recent_failures_respects_window(tmp_path):
+    """Ledger files with mtime before the cutoff must be skipped."""
+    import time
+    local = tmp_path / "local"
+    (local / "ledger").mkdir(parents=True)
+    old = local / "ledger" / "old.log"
+    _write_vendor_limit_ledger(old)
+    # Push mtime outside the default 30-minute window
+    old_ts = time.time() - 7200
+    os.utime(str(old), (old_ts, old_ts))
+
+    names = [f["worker"] for f in _api_roster.recent_failures(str(local))]
+    assert "old" not in names
+
+
+def test_recent_failures_reclassifies_vendor_limit_outside_start_window(tmp_path):
+    """When START falls outside the 4 KB tail, ERROR + vendor-limit reason → vendor_limit."""
+    local = tmp_path / "local"
+    (local / "ledger").mkdir(parents=True)
+    # Write a ledger where only the ERROR line is present (simulates truncated tail read)
+    (local / "ledger" / "lili.log").write_text(
+        "2026-08-02T19:00:01Z ERROR reason=\"vendor limit: resets in 2h\" rc=1\n"
+    )
+
+    failures = _api_roster.recent_failures(str(local))
+    names = [f["worker"] for f in failures]
+    assert "lili" in names
+    f = next(x for x in failures if x["worker"] == "lili")
+    assert f["outcome"] == "vendor_limit"
+
+
+def test_generation_token_includes_recent_failures_key(tmp_path):
+    """generation_token() must carry recent_failures for the pulse bus."""
+    local = tmp_path / "local"
+    (local / "ledger").mkdir(parents=True)
+    _write_vendor_limit_ledger(local / "ledger" / "vera.log")
+
+    result = _api_roster.generation_token(str(local))
+    assert "recent_failures" in result
+    names = [f["worker"] for f in result["recent_failures"]]
+    assert "vera" in names
+
+
+def test_generation_token_recent_failures_empty_when_all_ok(tmp_path):
+    """No recent_failures entries when all recent shifts succeeded."""
+    local = tmp_path / "local"
+    (local / "ledger").mkdir(parents=True)
+    _write_ok_ledger(local / "ledger" / "garfield.log")
+
+    result = _api_roster.generation_token(str(local))
+    assert result["recent_failures"] == []

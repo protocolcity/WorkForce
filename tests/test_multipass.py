@@ -82,6 +82,51 @@ def test_single_pass_ledger_unchanged(tmp_path):
     assert "single-pass complete" in ledger_text(tmp_path)
 
 
+def test_max_passes_zero_drains_until_queue_empty(tmp_path):
+    """wf-174: max_passes=0 is budget-driven drain (soft ceiling off)."""
+    q = tmp_path / "queue.json"
+    w = make_worker(
+        tmp_path, command=drain_command(q), max_passes=0, min_pass_secs=0,
+        budget_secs=30,
+    )
+    q.write_text(json.dumps({"ok": True, "count": 3}))
+    assert engine.dispatch(w, local(tmp_path)) == 0
+    text = ledger_text(tmp_path)
+    assert text.count("DONE") == 3
+    assert "queue empty" in text
+    assert "max passes" not in text
+    assert "drain hard cap" not in text
+
+
+def test_max_passes_zero_hits_hard_cap(tmp_path, monkeypatch):
+    """wf-174: drain mode still stops at MAX_PASSES_HARD (probe never empties)."""
+    monkeypatch.setattr(engine, "MAX_PASSES_HARD", 3)
+    q = tmp_path / "queue.json"
+    # Queue stays at 5 forever — no progress would stop after pass 1 if
+    # count didn't drop; shrink by 1 each pass so progress continues.
+    w = make_worker(
+        tmp_path, command=drain_command(q), max_passes=0, min_pass_secs=0,
+        budget_secs=30,
+    )
+    q.write_text(json.dumps({"ok": True, "count": 99}))
+    assert engine.dispatch(w, local(tmp_path)) == 0
+    text = ledger_text(tmp_path)
+    assert text.count("DONE") == 3
+    assert "drain hard cap (3 passes)" in text
+
+
+def test_effective_pass_ceiling():
+    from workforce.roster import Worker
+
+    base = dict(
+        name="x", workdir="/tmp", contract="/c", prompt="/p",
+        identity="x", command=["true"], queue_url="http://example/q",
+    )
+    assert engine.effective_pass_ceiling(Worker(max_passes=0, **base)) == engine.MAX_PASSES_HARD
+    assert engine.effective_pass_ceiling(Worker(max_passes=1, **base)) == 1
+    assert engine.effective_pass_ceiling(Worker(max_passes=4, **base)) == 4
+
+
 def test_error_pass_is_infra_error(tmp_path):
     w = make_worker(tmp_path, command=["/bin/sh", "-c", "exit 3"],
                     max_passes=4, min_pass_secs=0)

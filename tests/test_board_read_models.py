@@ -9,7 +9,7 @@ import workforce.api.roster as _api_roster  # noqa: E402
 from workforce.board import (  # noqa: E402
     _contract_rules, _law_stack, _worker_flags, _worker_queue, render_law, worker_model,
 )
-from workforce.ledger import parse_shifts  # noqa: E402
+from workforce.ledger import open_claims, parse_shifts  # noqa: E402
 from workforce.roster import Roster, Worker  # noqa: E402
 
 LEDGER = """\
@@ -50,6 +50,63 @@ def test_parse_shifts_dry_run_closes_at_done():
     assert s["outcome"] == "ok" and s["dry_run"] and s["reason"] == "dry-run"
 
 
+def test_open_claims_empty_when_no_open_shift():
+    assert open_claims(LEDGER) == []
+    text = ("2026-07-14T04:00:00Z START identity=x kind=lane queue=1 dry_run=0\n"
+            "2026-07-14T04:00:01Z CLAIM ticket=wf-1 title=hello product=workforce\n"
+            "2026-07-14T04:00:02Z DONE rc=0 on_pass=1\n"
+            "2026-07-14T04:00:02Z STOP reason=\"single-pass complete\"\n")
+    assert open_claims(text) == []
+
+
+def test_open_claims_tracks_running_shift_and_clears_on_error():
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    open_text = (
+        "%s START identity=x kind=lane queue=2 dry_run=0\n"
+        "%s CLAIM ticket=wf-158 title=\"Engine claim\" product=workforce priority=3\n"
+        "%s CLAIM ticket=wf-159 title=other product=workforce\n"
+    ) % (now, now, now)
+    held = open_claims(open_text)
+    assert [c["ticket"] for c in held] == ["wf-158", "wf-159"]
+    assert held[0]["title"] == "Engine claim"
+    assert held[0]["product"] == "workforce"
+    # multi-pass DONE does not clear
+    mid = open_text + "%s DONE rc=0 on_pass=1\n" % now
+    assert len(open_claims(mid)) == 2
+    # ERROR closes the window
+    closed = mid + "%s ERROR reason=\"killed at budget\"\n" % now
+    assert open_claims(closed) == []
+
+
+def test_open_claims_clears_on_dry_run_done():
+    text = ("2026-07-14T04:00:00Z START identity=x kind=lane queue=1 dry_run=1\n"
+            "2026-07-14T04:00:00Z CLAIM ticket=wf-1 title=t product=workforce\n"
+            "2026-07-14T04:00:00Z DONE dry_run=1 argv_head=cli argv_len=3\n")
+    assert open_claims(text) == []
+
+
+def test_ledger_holdings_maps_open_claims(tmp_path):
+    import datetime
+    local = tmp_path / "local"
+    (local / "ledger").mkdir(parents=True)
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    (local / "ledger" / "kai.log").write_text(
+        "%s START identity=kai kind=lane queue=1 dry_run=0\n"
+        "%s CLAIM ticket=wf-158 title=\"Engine-owned claim\" product=workforce priority=3\n"
+        % (now, now)
+    )
+    held = _api_roster._ledger_holdings(str(local), "kai", owner="kai")
+    assert len(held) == 1
+    assert held[0]["id"] == "wf-158"
+    assert held[0]["title"] == "Engine-owned claim"
+    assert held[0]["product"] == "workforce"
+    assert held[0]["priority"] == 3
+    assert held[0]["owner"] == "kai"
+    assert held[0]["source"] == "ledger"
+    assert "open=wf-158" in held[0]["href"]
+
+
 def make_worker(tmp_path):
     hood = tmp_path / "city" / "hood"
     hood.mkdir(parents=True)
@@ -71,6 +128,63 @@ def test_worker_queue_reads_roster_dot_path(tmp_path):
     w.queue_url = probe.as_uri()
     w.queue_count_key = "column_counts.backlog"
     assert _worker_queue(w) == "91"
+
+
+def test_worker_queue_no_retry_on_timeout(tmp_path, monkeypatch):
+    """wf-147: board probe does not retry timeouts (latency bound for Map)."""
+    from workforce.api import roster as roster_mod
+
+    w = make_worker(tmp_path)
+    w.queue_url = "http://127.0.0.1:9/ready"
+    w.queue_count_key = "count"
+    calls = {"n": 0}
+
+    def always_timeout(_url, timeout=1.0):
+        calls["n"] += 1
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(roster_mod, "_http_get_json", always_timeout)
+    assert _worker_queue(w) == "?"
+    assert calls["n"] == 1  # one attempt only — no second 1s burn
+
+
+def test_worker_queue_retries_once_on_connection_reset(tmp_path, monkeypatch):
+    """wf-147: still retry once on transient connection drop (not timeout)."""
+    from workforce.api import roster as roster_mod
+
+    w = make_worker(tmp_path)
+    w.queue_url = "http://127.0.0.1:9/ready"
+    w.queue_count_key = "count"
+    calls = {"n": 0}
+
+    def flaky(_url, timeout=1.0):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ConnectionResetError("connection reset by peer")
+        return {"count": 2}
+
+    monkeypatch.setattr(roster_mod, "_http_get_json", flaky)
+    monkeypatch.setattr(roster_mod, "_BOARD_PROBE_RETRY_BACKOFF_SECS", 0)
+    assert _worker_queue(w) == "2"
+    assert calls["n"] == 2
+
+
+def test_worker_queue_question_after_connection_failures(tmp_path, monkeypatch):
+    """wf-147: two connection failures → '?' (display degrades, no crash)."""
+    from workforce.api import roster as roster_mod
+
+    w = make_worker(tmp_path)
+    w.queue_url = "http://127.0.0.1:9/ready"
+    calls = {"n": 0}
+
+    def always_reset(_url, timeout=1.0):
+        calls["n"] += 1
+        raise ConnectionResetError("connection reset by peer")
+
+    monkeypatch.setattr(roster_mod, "_http_get_json", always_reset)
+    monkeypatch.setattr(roster_mod, "_BOARD_PROBE_RETRY_BACKOFF_SECS", 0)
+    assert _worker_queue(w) == "?"
+    assert calls["n"] == 2
 
 
 def test_law_stack_walks_conventions(tmp_path):
@@ -209,6 +323,45 @@ def test_outcome_cls_maps_vendor_limit_to_amber():
     assert OUTCOME_CLS.get("error") == "err"
 
 
+def test_worker_health_idle_at_empty_queue_threshold(tmp_path):
+    """wf-125: health returns 'idle' cls when empty-queue streak reaches threshold."""
+    import json
+    from workforce.board import _worker_health
+    from workforce.ledger import Ledger
+
+    w = make_worker(tmp_path)
+    w.empty_run_threshold = 2
+    ledger_dir = tmp_path / "local" / "ledger"
+    ledger_dir.mkdir(parents=True)
+    led = Ledger(str(ledger_dir), "x")
+    # Write 2 consecutive queue-empty SKIPs (= threshold) and the resulting WARN
+    led.append("SKIP", reason="queue empty")
+    led.append("SKIP", reason="queue empty")
+    led.append("WARN", reason="empty-run threshold (2 consecutive queue empty)", streak=2)
+
+    health = _worker_health(str(tmp_path / "local"), w, "0")
+    assert health["cls"] == "idle"
+    assert "empty-queue streak" in health["why"]
+
+
+def test_worker_health_ok_below_empty_queue_threshold(tmp_path):
+    """wf-125: health stays 'ok' when empty streak is below threshold."""
+    from workforce.board import _worker_health
+    from workforce.ledger import Ledger
+
+    w = make_worker(tmp_path)
+    w.empty_run_threshold = 3
+    ledger_dir = tmp_path / "local" / "ledger"
+    ledger_dir.mkdir(parents=True)
+    led = Ledger(str(ledger_dir), "x")
+    led.append("SKIP", reason="queue empty")
+    led.append("SKIP", reason="queue empty")
+    # Only 2 < threshold=3 → not idle
+
+    health = _worker_health(str(tmp_path / "local"), w, "0")
+    assert health["cls"] != "idle"
+
+
 # ── FLAGS tests ──────────────────────────────────────────────────────
 
 def _flag_worker(tmp_path, queue_url=""):
@@ -318,3 +471,146 @@ def test_worker_model_includes_flags(tmp_path, monkeypatch):
     assert model is not None
     assert "flags" in model
     assert model["flags"][0]["id"] == "wf-60"
+
+
+# ── wf-106: /api/workers parallel fan-out + ?light=1 ────────────────────────
+
+def _api_workers_setup(tmp_path):
+    """Minimal roster + local dir for /api/workers HTTP tests."""
+    import json as _json
+    contract = tmp_path / "CONTRACT.md"
+    contract.write_text("# c\n")
+    prompt_f = tmp_path / "prompt.md"
+    prompt_f.write_text("p\n")
+    local = tmp_path / "local"
+    (local / "ledger").mkdir(parents=True)
+    workers_data = {}
+    worker_objs = {}
+    for name in ("alpha", "beta"):
+        wd = tmp_path / name
+        wd.mkdir()
+        worker_objs[name] = Worker(
+            name=name, workdir=str(wd), contract=str(contract),
+            prompt=str(prompt_f), identity=name, command=["true"])
+        workers_data[name] = {
+            "workdir": str(wd), "contract": str(contract),
+            "prompt": str(prompt_f), "identity": name, "command": ["true"],
+        }
+    (local / "roster.json").write_text(_json.dumps({"workers": workers_data}))
+    roster = Roster(workers=worker_objs, path="t")
+    return local, roster
+
+
+def test_api_workers_light_skips_probes(tmp_path, monkeypatch):
+    """?light=1 must not call _worker_queue; returns queue='—', health='ok',
+    last_shift=null for each worker."""
+    import json as _json, threading, urllib.request
+    import workforce.board as board_mod
+
+    local, roster = _api_workers_setup(tmp_path)
+    calls = []
+
+    monkeypatch.setattr(board_mod, "_load_roster", lambda _root: roster)
+    monkeypatch.setattr(board_mod, "_worker_queue", lambda w: calls.append(w.name) or "99")
+
+    httpd = board_mod.make_server(port=0, local_root=str(local))
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.handle_request, daemon=True)
+    t.start()
+    try:
+        resp = urllib.request.urlopen(
+            "http://127.0.0.1:%d/api/workers?light=1" % port, timeout=5)
+        data = _json.loads(resp.read())
+    finally:
+        httpd.server_close()
+        t.join(timeout=3)
+
+    assert calls == [], "light=1 must not probe queues; got calls: %s" % calls
+    by_name = {w["name"]: w for w in data["workers"]}
+    assert by_name["alpha"]["queue"] == "—"
+    assert by_name["alpha"]["health"] == "ok"
+    assert by_name["alpha"]["last_shift"] is None
+    assert by_name["beta"]["queue"] == "—"
+
+
+def test_api_workers_no_light_parallel_queue_values(tmp_path, monkeypatch):
+    """No ?light — parallel fan-out returns per-worker queue values."""
+    import json as _json, threading, urllib.request
+    import workforce.board as board_mod
+
+    local, roster = _api_workers_setup(tmp_path)
+    queue_map = {"alpha": "3", "beta": "7"}
+
+    monkeypatch.setattr(board_mod, "_load_roster", lambda _root: roster)
+    monkeypatch.setattr(board_mod, "_worker_queue", lambda w: queue_map[w.name])
+
+    httpd = board_mod.make_server(port=0, local_root=str(local))
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.handle_request, daemon=True)
+    t.start()
+    try:
+        resp = urllib.request.urlopen(
+            "http://127.0.0.1:%d/api/workers" % port, timeout=5)
+        data = _json.loads(resp.read())
+    finally:
+        httpd.server_close()
+        t.join(timeout=3)
+
+    by_name = {w["name"]: w for w in data["workers"]}
+    assert by_name["alpha"]["queue"] == "3"
+    assert by_name["beta"]["queue"] == "7"
+    assert by_name["alpha"]["last_shift"] is None   # no ledger entries
+    assert "health" in by_name["alpha"]
+
+
+# ── wf-147: scene latency bounds + client-gone write ──────────────────────
+
+
+def test_worker_holdings_uses_label_filter_skips_owner_walk(tmp_path, monkeypatch):
+    """Labeled queue_url → one list GET per status; no Owner: detail walks."""
+    from workforce.api import roster as roster_mod
+
+    w = make_worker(tmp_path)
+    w.name = "salem"
+    w.identity = "salem"
+    w.queue_url = (
+        "http://127.0.0.1:8799/api/admin/tasks/ready"
+        "?product=workforce&label=worker:salem"
+    )
+    calls = []
+
+    def fake_desk(path, timeout=5.0):
+        calls.append(path)
+        if "status=in_progress" in path and "label=" in path:
+            return {"tasks": [
+                {"id": "wf-147", "title": "scene latency", "status": "in_progress",
+                 "priority": 2, "updated_at": "2026-08-03T16:00:00Z"},
+            ]}
+        return {"tasks": []}
+
+    monkeypatch.setattr(roster_mod, "_desk_json", fake_desk)
+
+    def boom_owner(_tid):
+        raise AssertionError("Owner walk must not run for labeled lanes")
+
+    monkeypatch.setattr(roster_mod, "_desk_owner_of", boom_owner)
+    held = roster_mod._worker_holdings(w)
+    assert [h["id"] for h in held] == ["wf-147"]
+    assert all("label=worker%3Asalem" in c or "label=worker:salem" in c
+               for c in calls if "status=" in c)
+    assert not any("/api/admin/tasks/wf-" in c for c in calls)
+
+
+def test_client_gone_write_swallows_broken_pipe(tmp_path):
+    """wf-147: client disconnect mid-write must not raise."""
+    import workforce.board as board_mod
+
+    class _Gone:
+        def write(self, _data):
+            raise BrokenPipeError(32, "Broken pipe")
+
+    h = board_mod._Handler.__new__(board_mod._Handler)
+    h.wfile = _Gone()
+    h.path = "/api/scene?light=0"
+    # must not raise
+    h._client_gone_write(b'{"ok":true}')

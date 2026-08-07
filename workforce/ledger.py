@@ -1,8 +1,14 @@
 """Ledger — the append-only per-worker record of shifts (RUNNER_SPEC §8).
 
 One file per worker under ``local/ledger/<worker>.log``. Events:
-START / DONE / STOP / SKIP / ERROR / WARN / SCOPE_DENY, each UTC-timestamped,
-with key=value pairs. The board reads this; nothing ever rewrites it.
+START / DONE / STOP / SKIP / ERROR / WARN / SCOPE_DENY / CLAIM, each
+UTC-timestamped, with key=value pairs. The board reads this; nothing ever
+rewrites it.
+
+CLAIM records which work order the engine handed a shift. Open
+claims live inside a START..(STOP|ERROR|dry-run DONE) window and clear
+when that window closes — no UNCLAIM event. Scene light path reads them
+so the live work line does not need a desk round-trip.
 """
 
 import datetime
@@ -11,7 +17,8 @@ import re
 from typing import List, Optional, Union
 
 
-EVENTS = ("START", "DONE", "STOP", "SKIP", "ERROR", "WARN", "GHOST", "SCOPE_DENY")
+EVENTS = ("START", "DONE", "STOP", "SKIP", "ERROR", "WARN", "GHOST", "SCOPE_DENY",
+          "HOST_MUTATION_DENY", "CLAIM")
 
 
 def _utcnow() -> str:
@@ -77,7 +84,7 @@ def parse_shifts(text: str, limit: int = 20) -> List[dict]:
                        "queue": ev.get("queue", "?"), "reason": "",
                        "budget_secs": int(ev.get("budget_secs", "0") or 0),
                        "dry_run": ev.get("dry_run") == "1", "end_ts": "",
-                       "usage": {}}
+                       "usage": {}, "fallback_runtime": ""}
             shifts.append(current)
         elif kind == "DONE" and current is not None:
             current["passes"] += 1
@@ -89,6 +96,9 @@ def parse_shifts(text: str, limit: int = 20) -> List[dict]:
                 try:
                     num = float(v)
                 except (TypeError, ValueError):
+                    # string passthrough for known non-numeric keys
+                    if k == "fallback_runtime":
+                        current["fallback_runtime"] = v
                     continue
                 current["usage"][k] = current["usage"].get(k, 0) + num
             if current["dry_run"]:  # dry-runs end at DONE; no STOP follows
@@ -128,3 +138,33 @@ def parse_shifts(text: str, limit: int = 20) -> List[dict]:
             s["outcome"] = "crashed"
             s["reason"] = "no terminal event past budget+grace"
     return list(reversed(shifts))[:limit]
+
+
+def open_claims(text: str) -> List[dict]:
+    """CLAIM rows attached to the currently open (running) shift, if any.
+
+    A CLAIM is open while its enclosing START has no terminal STOP / ERROR /
+    dry-run DONE. Multi-pass DONE lines do not clear claims. Empty list when
+    no shift is open — terminal events "clear" by closing the window.
+    """
+    in_shift = False
+    claims: List[dict] = []
+    for line in text.splitlines():
+        ev = _parse_line(line)
+        if ev is None:
+            continue
+        kind = ev["event"]
+        if kind == "START":
+            in_shift = True
+            claims = []
+        elif kind == "CLAIM" and in_shift:
+            row = {k: v for k, v in ev.items() if k not in ("ts", "event")}
+            row["ts"] = ev["ts"]
+            claims.append(row)
+        elif kind == "DONE" and in_shift and ev.get("dry_run") == "1":
+            in_shift = False
+            claims = []
+        elif kind in ("STOP", "ERROR") and in_shift:
+            in_shift = False
+            claims = []
+    return claims if in_shift else []

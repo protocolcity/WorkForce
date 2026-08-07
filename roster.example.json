@@ -32,7 +32,10 @@
       "keychain_service": "claude-cli-oauth",
       "keychain_env": "CLAUDE_CODE_OAUTH_TOKEN",
       "authority_chain": [],
-      "authority_chain_required": false
+      "authority_chain_required": false,
+      "fallback_runtime": "",
+      "fallback_model": "",
+      "shift_worktree": true
     }
   }
 }

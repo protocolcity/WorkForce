@@ -12,7 +12,7 @@ from typing import Dict, List, Optional
 from ...daemon import heartbeat_status, read_heartbeat
 from ...ledger import Ledger, parse_shifts
 from ...roster import Worker
-from ...schedule import maybe_cron
+from ...schedule import maybe_cron, next_fire_utc
 from ...api.roster import (
     DEFAULT_PORT, DESK, CITYHALL, _IN_CITY, _BRAND_TITLE,
     _REPORT_WINDOW_DAYS, _REPORT_WINDOWS,
@@ -508,6 +508,7 @@ button.callin:disabled { color:var(--dim); border-color:var(--line); cursor:defa
   border:1px solid var(--line); color:var(--dim); cursor:default; }
 .rt-chip.available { border-color:var(--ok); color:var(--ok); }
 .rt-chip.absent { opacity:.35; }
+.rt-chip.limit { border-color:var(--amber); color:var(--amber); }
 /* wf-77: live shift-output tail in personnel-file drawer */
 .pf-tail { font:11px/1.4 ui-monospace,Menlo,monospace;
   background:var(--crt-bg,#0a120a); color:var(--crt-ok,#33ff66);
@@ -777,7 +778,9 @@ function workingOn(w){
   if(!isNaN(q)&&q>0) return {text:q+" ready", cls:"", deskReady:q};
   if(w.last_shift&&w.last_shift.outcome){
     var o=w.last_shift.outcome, reason=w.last_shift.reason?(" \\u00b7 "+w.last_shift.reason):"";
-    return {text:"last "+o+reason, cls:"muted"};
+    var OUTCOME_LABEL={"vendor_limit":"quota hit","error":"error","ok":"ok","skip":"skip","crashed":"crashed"};
+    var oLabel=OUTCOME_LABEL[o]||o;
+    return {text:"last "+oLabel+reason, cls:"muted"};
   }
   return {text:"standing by", cls:"muted"};}
 function bay(w){
@@ -809,7 +812,7 @@ function bay(w){
   var stuck=(w.health==="wedged"||w.health==="err")?"1":"0";
   var ready=work.deskReady?"1":"0";
   var body=isCitizen
-    ?('<div class="log">You own this Office — open <a href="'+esc(w.href||"http://127.0.0.1:8796/")+'">Office</a></div>')
+    ?('<div class="log">WorkForce — you own this city</div>')
     :(
       workHtml+
       '<div class="meta-row"><span class="k">'+nextLabel+'</span>'+
@@ -1032,8 +1035,16 @@ function renderRuntimes(d){
   var html='<span class="rt-label">Runtimes</span>';
   pool.forEach(function(r){
     var cls=r.path?(r.workers&&r.workers.length?"employed":"available"):"absent";
-    var tip=cls+(r.path?" \\u00b7 "+r.path:"")+(r.workers&&r.workers.length?" \\u00b7 "+r.workers.join(", "):"");
-    html+='<span class="rt-chip '+cls+'" title="'+esc(tip)+'">'+esc(r.cli)+'</span>';
+    var limitHits=parseInt(r.limit_hits||0,10);
+    if(limitHits>0) cls+=" limit";
+    var employed=parseInt(r.employed||0,10);
+    var tipParts=[cls];
+    if(r.path) tipParts.push(r.path);
+    if(r.workers&&r.workers.length) tipParts.push(r.workers.join(", "));
+    if(limitHits) tipParts.push(limitHits+" quota hit"+(limitHits===1?"":"s")+" (7d)");
+    var tip=tipParts.join(" \\u00b7 ");
+    var suffix=employed?" ("+employed+")":"";
+    html+='<span class="rt-chip '+cls+'" title="'+esc(tip)+'">'+esc(r.cli)+suffix+'</span>';
   });
   el.innerHTML=html;}
 
@@ -1349,7 +1360,7 @@ function maybeNotifyYouAttn(n, prev, d){
   try{
     var note=new Notification(n+" for You · Protocol City",{body:body,tag:"pc-you-attention",renotify:true});
     note.onclick=function(){ try{window.focus();}catch(e){}
-      window.open("http://127.0.0.1:8799/admin/attention","_blank","noopener"); note.close(); };
+      window.open(DESK_URL+"/admin/attention","_blank","noopener"); note.close(); };
   }catch(e){}
 }
 function paintYouAttnRoster(d){
@@ -1360,7 +1371,7 @@ function paintYouAttnRoster(d){
     el=document.createElement("a");
     el.id="youAttn";
     el.className="you-attn";
-    el.href="http://127.0.0.1:8799/admin/attention";
+    el.href=DESK_URL+"/admin/attention";
     el.target="_blank";
     el.rel="noopener";
     host.parentNode.insertBefore(el, host.nextSibling);
@@ -1785,7 +1796,7 @@ def render_board(local_root: str, can_dispatch: bool = False) -> str:
             shifts = parse_shifts(Ledger(os.path.join(local_root, "ledger"), name).tail(120), limit=5)
             last_real = next((s for s in shifts if not s["dry_run"]), None)
             cron = maybe_cron(w.schedule)
-            nf_dt = cron.next_fire(_utcnow()) if cron else None
+            nf_dt = next_fire_utc(cron, _utcnow()) if cron else None
             if nf_dt and (soonest is None or nf_dt < soonest):
                 soonest, soonest_name = nf_dt, name
             if last_real and last_real["outcome"] == "running":
@@ -2451,19 +2462,7 @@ def render_report(local_root: str, days: Optional[int] = None) -> str:
         % (d, " class='on'" if d == days else "", d)
         for d in _REPORT_WINDOWS)
     # Non-f-string script so empty braces don't break formatting.
-    room_back_js = (
-        "<script>(function(){try{"
-        "var p=new URLSearchParams(location.search||'');"
-        "var b=document.getElementById('roomBack');if(!b)return;"
-        "var ret=p.get('return')||'';"
-        "var from=(p.get('from')||'').toLowerCase();"
-        "var ok=/^https?:\\/\\/127\\.0\\.0\\.1:8796\\/?$/.test(ret)"
-        "||/^https?:\\/\\/localhost:8796\\/?$/.test(ret);"
-        "if(from==='office'&&ret&&ok){b.href=ret;b.textContent='\\u2190 Office';}"
-        "else if(document.referrer&&/:8796(?:\\/|$)/.test(document.referrer))"
-        "{b.href='http://127.0.0.1:8796/';b.textContent='\\u2190 Office';}"
-        "}catch(e){}})();</script>"
-    )
+    room_back_js = ""
     return (
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
@@ -2557,7 +2556,7 @@ def render_worker(local_root: str, name: str) -> Optional[str]:
     w = roster.workers[name]
     cron = maybe_cron(w.schedule)
     status = heartbeat_status(local_root)
-    next_fire = (_fmt_fire(cron.next_fire(_utcnow()))
+    next_fire = (_fmt_fire(next_fire_utc(cron, _utcnow()))
                  if cron and status == "running" else
                  ("daemon down" if cron else "manual"))
     q = _worker_queue(w)

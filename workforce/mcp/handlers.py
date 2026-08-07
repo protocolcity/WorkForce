@@ -233,8 +233,8 @@ class WFHandlers:
             "workers": workers_n,
             "kinds": kinds,
             "daemon": daemon,
-            "board_http": "up" if board_up else "down",
-            "board_url": "http://127.0.0.1:8797/",
+            "engine_api_http": "up" if board_up else "down",
+            "engine_api_url": "http://127.0.0.1:8797/",
         }
 
     def roster(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -328,6 +328,8 @@ class WFHandlers:
         paths = resolve_paths(args.get("roster"), args.get("data_dir"))
         os.makedirs(os.path.dirname(paths["roster_path"]), exist_ok=True)
         dry = bool(args.get("dry_run"))
+        staff_raw = args.get("staff", None)
+        staff_arg = None if staff_raw is None else bool(staff_raw)
         try:
             result = hire_mod.hire(
                 name=name,
@@ -342,6 +344,7 @@ class WFHandlers:
                 force_papers=bool(args.get("force_papers")),
                 dry_run=dry,
                 base=paths["data_dir"],
+                staff=staff_arg,
             )
         except hire_mod.RosterError as e:
             raise ToolError(str(e)) from e
