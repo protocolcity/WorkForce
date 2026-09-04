@@ -32,7 +32,8 @@ def test_open_port_flag_still_deprecated(capsys):
     assert "DEPRECATED" in captured.err
 
 
-def test_daemon_plist_stdout_is_clean_xml_url_hint_on_stderr(capsys):
+def test_daemon_plist_stdout_is_clean_xml_url_hint_on_stderr(monkeypatch, capsys):
+    monkeypatch.delenv("WORKFORCE_PORT", raising=False)
     rc = cli.main(["daemon-plist"])
     captured = capsys.readouterr()
 
@@ -43,6 +44,16 @@ def test_daemon_plist_stdout_is_clean_xml_url_hint_on_stderr(capsys):
     assert "http://127.0.0.1" not in captured.out
     # The door is mentioned, on stderr.
     assert "http://127.0.0.1:%d" % board.DEFAULT_PORT in captured.err
+
+
+def test_daemon_plist_honors_workforce_port(monkeypatch, capsys):
+    """wf-221 — CLI door hint must not ignore WORKFORCE_PORT."""
+    monkeypatch.setenv("WORKFORCE_PORT", "9111")
+    rc = cli.main(["daemon-plist"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "http://127.0.0.1:9111" in captured.err
+    assert "http://127.0.0.1:8797" not in captured.err
 
 
 def test_daemon_plist_bakes_data_dir_when_env_set(tmp_path, monkeypatch, capsys):
@@ -58,9 +69,33 @@ def test_daemon_plist_bakes_data_dir_when_env_set(tmp_path, monkeypatch, capsys)
     assert "WORKFORCE_DATA_DIR" in captured.out
 
 
+def test_hire_workdir_help_says_project_folder(capsys):
+    """wf-224 / pc-1380: --workdir help teaches project folder, not neighborhood."""
+    import pytest
+
+    with pytest.raises(SystemExit) as ei:
+        cli.main(["hire", "-h"])
+    assert ei.value.code == 0
+    captured = capsys.readouterr()
+    help_text = (captured.out + captured.err).lower()
+    assert "project folder" in help_text
+    assert "neighborhood" not in help_text
+    assert "cabinet" not in help_text
+
+
 # --- doctor subcommand ---
 
 import json  # noqa: E402
+
+
+def test_papers_rel_for_section_52():
+    assert cli._papers_rel_for_section_52(
+        "/city/recipes/workers/demo-worker/CONTRACT.md"
+    ) == "recipes/workers/demo-worker/CONTRACT.md"
+    assert cli._papers_rel_for_section_52(
+        "/city/.protocolcity/ops/workers/workspace-efficiency/CONTRACT.md"
+    ) == ".protocolcity/ops/workers/workspace-efficiency/CONTRACT.md"
+    assert cli._papers_rel_for_section_52("") == ""
 
 
 def _write_roster(path, names):
@@ -183,6 +218,9 @@ def test_doctor_flags_unregistered_identity(tmp_path, monkeypatch, capsys):
     assert "ghost-hand" in captured.err
     assert "IDENTITY" in captured.err
     assert "§5.2" in captured.err or "PROCESS" in captured.err
+    # wf-191: paste-ready row so citizen/worklane can register without inventing copy
+    assert "paste-ready" in captured.out
+    assert "`ghost-hand`" in captured.out
 
 
 def test_doctor_section_52_all_registered_ok(tmp_path, monkeypatch, capsys):
@@ -200,8 +238,12 @@ def test_doctor_section_52_all_registered_ok(tmp_path, monkeypatch, capsys):
     assert "IDENTITY" not in captured.err
 
 
-def test_doctor_flags_city_ops_without_staff(tmp_path, monkeypatch, capsys):
-    """City-ops workdir with staff falsy → STAFF fault."""
+def test_doctor_city_ops_staff_false_healed_on_load(tmp_path, monkeypatch, capsys):
+    """City-ops workdir with staff falsy in JSON is coerced True at load.
+
+    Pre-wf-143 rows no longer FAULT:STAFF — Map bay source is the workdir.
+    Doctor stays green when §5.2 covers the identity.
+    """
     data = tmp_path / "engine"
     ops = data / ".protocolcity" / "ops"
     ops.mkdir(parents=True)
@@ -218,7 +260,7 @@ def test_doctor_flags_city_ops_without_staff(tmp_path, monkeypatch, capsys):
                 "prompt": str(ops / "p.md"),
                 "identity": "chief-of-staff",
                 "command": ["true"],
-                # staff omitted / false — the bug under test
+                "staff": False,  # live drift — load heals
             }
         }
     }))
@@ -227,10 +269,9 @@ def test_doctor_flags_city_ops_without_staff(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("WORKFORCE_SUITE_ROSTER", raising=False)
     rc = cli.main(["doctor"])
     captured = capsys.readouterr()
-    assert rc == 1
-    assert "STAFF" in captured.err
-    assert "chief-of-staff" in captured.err
-    assert "city-ops" in captured.err or ".protocolcity/ops" in captured.err
+    assert rc == 0
+    assert "STAFF" not in captured.err
+    assert "doctor: OK" in captured.out
 
 
 def test_doctor_city_ops_with_staff_ok(tmp_path, monkeypatch, capsys):

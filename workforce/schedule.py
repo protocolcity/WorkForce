@@ -18,7 +18,6 @@ Timezone:
   single convert seam — tests may monkeypatch it to pin a fixed offset.
 """
 
-import calendar
 import datetime
 from typing import FrozenSet, List, Optional, Tuple
 

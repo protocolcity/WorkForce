@@ -33,7 +33,13 @@ def _pkg_city_root() -> Path:
 
 
 def resolve_process_md(path: Optional[str] = None) -> Optional[str]:
-    """Locate PROCESS.md without reading it. None if not found."""
+    """Locate PROCESS.md without reading it. None if not found.
+
+    Path order (host-neutral): explicit → env → fixed candidates → walk up
+    from package and cwd looking for ``worklane/PROCESS.md`` (city root).
+    The walk covers shift worktrees under ``workforce/local/worktrees/<hand>``
+    where parents[2] is not the city root.
+    """
     if path:
         p = os.path.abspath(path)
         return p if os.path.isfile(p) else None
@@ -43,14 +49,29 @@ def resolve_process_md(path: Optional[str] = None) -> Optional[str]:
             p = os.path.abspath(env)
             if os.path.isfile(p):
                 return p
-    candidates = (
+    candidates = [
         _pkg_city_root() / "worklane" / "PROCESS.md",
         Path.cwd().parent / "worklane" / "PROCESS.md",
         Path.cwd() / "worklane" / "PROCESS.md",
-    )
+    ]
+    # Walk parents of package + cwd for city-root/worklane/PROCESS.md.
+    seen = set()
+    for start in (_pkg_city_root(), Path.cwd().resolve()):
+        try:
+            for parent in [start, *list(start.parents)]:
+                key = str(parent)
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append(parent / "worklane" / "PROCESS.md")
+        except (OSError, RuntimeError):
+            continue
     for c in candidates:
-        if c.is_file():
-            return str(c)
+        try:
+            if c.is_file():
+                return str(c)
+        except OSError:
+            continue
     return None
 
 

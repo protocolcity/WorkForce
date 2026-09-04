@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -9,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 
 from workforce import hire as hire_mod
+from workforce._utils import desk_base_url
 from workforce.roster import RosterError, load
 
 
@@ -106,6 +108,9 @@ def test_hire_plants_papers_and_arms_roster(tmp_path):
     # Exclusive hand feed — product alone is not enough (starves siblings / dual-claims)
     assert "label=worker:neo" in qurl
     assert "product=gridfinity" in qurl
+    assert qurl.startswith(
+        desk_base_url().rstrip("/") + "/api/admin/tasks/ready"
+    )
     body = contract.read_text()
     assert "worker:neo" in body
     assert "lane:neo" not in body
@@ -149,6 +154,68 @@ def test_hire_dry_run_does_not_write_roster(tmp_path):
     assert "kai" not in raw["workers"]
     # Papers still planted so the citizen can review before arming
     assert (hood / "workers" / "kai" / "CONTRACT.md").is_file()
+
+
+def test_hire_default_queue_url_uses_desk_base_url(tmp_path, monkeypatch):
+    """wf-219: default lane feed follows desk_base_url(), not a loopback literal."""
+    for key in ("WL_DESK_URL", "TP_DESK_URL", "WORKFORCE_DESK", "WORKFORCE_DESK"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("WL_DESK_URL", "http://desk.test:9999/")
+    hood = tmp_path / "hood"
+    hood.mkdir()
+    result = hire_mod.hire(
+        name="neo",
+        workdir=str(hood),
+        role="Analyst",
+        project="gridfinity",
+        base=str(tmp_path),
+        roster_path=str(tmp_path / "local" / "roster.json"),
+        dry_run=True,
+    )
+    qurl = result["worker"]["queue_url"]
+    assert qurl.startswith("http://desk.test:9999/api/admin/tasks/ready?")
+    assert "product=gridfinity" in qurl
+    assert "label=worker:neo" in qurl
+    assert "127.0.0.1:8799" not in qurl
+
+
+def test_hire_default_queue_url_fallback_when_desk_env_unset(tmp_path, monkeypatch):
+    """wf-219: no desk env → loopback :8799, still exclusive label= form."""
+    for key in ("WL_DESK_URL", "TP_DESK_URL", "WORKFORCE_DESK", "WORKFORCE_DESK"):
+        monkeypatch.delenv(key, raising=False)
+    hood = tmp_path / "hood"
+    hood.mkdir()
+    result = hire_mod.hire(
+        name="neo",
+        workdir=str(hood),
+        role="Analyst",
+        project="workforce",
+        base=str(tmp_path),
+        roster_path=str(tmp_path / "local" / "roster.json"),
+        dry_run=True,
+    )
+    qurl = result["worker"]["queue_url"]
+    assert qurl.startswith(
+        "http://127.0.0.1:8799/api/admin/tasks/ready?product=workforce&label=worker:neo"
+    )
+
+
+def test_hire_explicit_queue_url_wins_over_desk_base(tmp_path, monkeypatch):
+    """wf-219: caller-supplied queue_url is not rewritten to desk_base_url()."""
+    monkeypatch.setenv("WL_DESK_URL", "http://desk.test:9999")
+    hood = tmp_path / "hood"
+    hood.mkdir()
+    given = "http://explicit.test:1/api/admin/tasks/ready?product=foo&label=worker:neo"
+    result = hire_mod.hire(
+        name="neo",
+        workdir=str(hood),
+        role="Analyst",
+        queue_url=given,
+        base=str(tmp_path),
+        roster_path=str(tmp_path / "local" / "roster.json"),
+        dry_run=True,
+    )
+    assert result["worker"]["queue_url"] == given
 
 
 def test_hire_rejects_worker_param_queue_url(tmp_path):
@@ -629,6 +696,34 @@ def test_is_city_ops_workdir():
     assert hire_mod.is_city_ops_workdir("") is False
 
 
+def test_load_coerces_city_ops_staff_true(tmp_path):
+    """JSON staff=false on city-ops workdir → Worker.staff True at load."""
+    ops = tmp_path / ".protocolcity" / "ops"
+    ops.mkdir(parents=True)
+    (ops / "c.md").write_text("# c\n")
+    (ops / "p.md").write_text("p\n")
+    roster_path = tmp_path / "local" / "roster.json"
+    roster_path.parent.mkdir()
+    roster_path.write_text(json.dumps({
+        "workers": {
+            "chief-of-staff": {
+                "kind": "job",
+                "workdir": str(ops),
+                "contract": str(ops / "c.md"),
+                "prompt": str(ops / "p.md"),
+                "identity": "chief-of-staff",
+                "command": ["true"],
+                "staff": False,
+            }
+        }
+    }))
+    r = load(path=str(roster_path), base=str(tmp_path))
+    assert r.workers["chief-of-staff"].staff is True
+    # Disk unchanged — hands never rewrite local/; load is the heal.
+    raw = json.loads(roster_path.read_text())
+    assert raw["workers"]["chief-of-staff"]["staff"] is False
+
+
 def test_hire_auto_staff_for_city_ops_workdir(tmp_path):
     """Hire into .protocolcity/ops sets staff=true without --staff."""
     ops = tmp_path / ".protocolcity" / "ops"
@@ -734,6 +829,24 @@ def test_hire_staff_explicit_override(tmp_path):
     assert opted["worker"]["staff"] is False
 
 
+def _git_init(workdir, *, origin=None):
+    """Minimal repo so git_remote_status() resolves deterministically."""
+    subprocess.run(["git", "-C", str(workdir), "init", "-q"], check=True)
+    subprocess.run(
+        ["git", "-C", str(workdir), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(workdir), "config", "user.name", "tester"],
+        check=True,
+    )
+    if origin:
+        subprocess.run(
+            ["git", "-C", str(workdir), "remote", "add", "origin", origin],
+            check=True,
+        )
+
+
 # --- wf-172: Land-it procedure in hire plant (fallback + city-template graft) ---
 
 
@@ -794,6 +907,7 @@ def test_hire_plants_land_it_procedure(tmp_path, monkeypatch):
     monkeypatch.setattr(hire_mod, "_template_dir", lambda: None)
     hood = tmp_path / "hood"
     hood.mkdir()
+    _git_init(hood, origin="https://example.invalid/hood.git")
     roster_path = tmp_path / "local" / "roster.json"
     (tmp_path / "local").mkdir()
     roster_path.write_text(json.dumps({
@@ -848,6 +962,7 @@ def test_hire_city_template_soft_shift_gains_land_it(tmp_path, monkeypatch):
     monkeypatch.setattr(hire_mod, "_template_dir", lambda: tdir)
     hood = tmp_path / "hood"
     hood.mkdir()
+    _git_init(hood, origin="https://example.invalid/hood.git")
     contract, prompt = hire_mod.plant_papers(
         str(hood), "grafted", role="Builder", store="demo", neighborhood="Demo"
     )
@@ -856,3 +971,105 @@ def test_hire_city_template_soft_shift_gains_land_it(tmp_path, monkeypatch):
     _assert_land_it_body(cbody)
     _assert_land_it_body(pbody)
     assert cbody.count("## Land it") == 1
+
+
+def test_hire_plants_local_only_land_it(tmp_path, monkeypatch):
+    """wf-196: no origin remote (e.g. oneseo-pos, recipes) — land locally, not push."""
+    monkeypatch.setattr(hire_mod, "_template_dir", lambda: None)
+    hood = tmp_path / "hood"
+    hood.mkdir()
+    _git_init(hood)  # git repo, no origin — HOST_REGISTRY.md "local-only"
+    contract, prompt = hire_mod.plant_papers(
+        str(hood), "localhand", role="Builder", store="demo", neighborhood="Demo"
+    )
+    cbody = open(contract, encoding="utf-8").read()
+    pbody = open(prompt, encoding="utf-8").read()
+    for body in (cbody, pbody):
+        low = body.lower()
+        assert "no `origin`" in low or "no origin" in low
+        assert "merge --ff-only" in body
+        assert "push origin" not in low
+        assert "landing commit sha" in low or "landing sha" in low or "landing commit" in low
+
+
+def test_hire_plants_no_git_land_it(tmp_path, monkeypatch):
+    """wf-196: workdir isn't a git repo at all — no branch/push language at all."""
+    monkeypatch.setattr(hire_mod, "_template_dir", lambda: None)
+    hood = tmp_path / "hood"
+    hood.mkdir()  # deliberately no git init
+    contract, prompt = hire_mod.plant_papers(
+        str(hood), "nogithand", role="Builder", store="demo", neighborhood="Demo"
+    )
+    cbody = open(contract, encoding="utf-8").read()
+    pbody = open(prompt, encoding="utf-8").read()
+    for body in (cbody, pbody):
+        low = body.lower()
+        assert "not a git repo" in low  # contract: "repository", prompt: "repo"
+        assert "push origin" not in low
+        assert "merge --ff-only" not in low
+
+
+def test_hire_fallback_prompt_teaches_project_not_neighborhood(tmp_path, monkeypatch):
+    """wf-224 / pc-1380: fallback papers use project, not neighborhood-as-L1."""
+    monkeypatch.setattr(hire_mod, "_template_dir", lambda: None)
+    hood = tmp_path / "hood"
+    hood.mkdir()
+    contract, prompt = hire_mod.plant_papers(
+        str(hood), "hand", role="Builder", store="demo", neighborhood="Demo"
+    )
+    pbody = open(prompt, encoding="utf-8").read()
+    cbody = open(contract, encoding="utf-8").read()
+    # Wire id NEIGHBORHOOD_NAME still fills the project display name.
+    assert "Demo" in pbody
+    assert "project instructions" in pbody.lower()
+    assert "in **Demo**" in pbody
+    assert "neighborhood law" not in pbody.lower()
+    assert "in the demo neighborhood" not in pbody.lower()
+    assert "neighborhood" not in pbody.lower()
+    assert "run the project's checks" in cbody.lower()
+    assert "neighborhood" not in cbody.lower()
+    assert "cabinet" not in pbody.lower()
+    assert "cabinet" not in cbody.lower()
+
+
+def test_hire_plant_mapping_uses_project_not_cabinet(tmp_path, monkeypatch):
+    """wf-224: city-template fills still say project, not cabinet."""
+    tdir = tmp_path / "templates"
+    tdir.mkdir()
+    (tdir / "worker-CONTRACT.md").write_text(
+        "criteria: {CLAIM_CRITERIA — e.g. \"single-file, verifiable by the test suite, no schema changes\"}\n"
+        "forbid: {FORBIDDEN_AREA_2}\n"
+        "place: {{NEIGHBORHOOD_NAME}}\n"
+    )
+    (tdir / "worker-prompt.md").write_text(
+        "You are {{WORKER_ID}} in **{{NEIGHBORHOOD_NAME}}**.\n"
+    )
+    monkeypatch.setattr(hire_mod, "_template_dir", lambda: tdir)
+    hood = tmp_path / "hood"
+    hood.mkdir()
+    contract, prompt = hire_mod.plant_papers(
+        str(hood), "hand", role="", store="demo", neighborhood="Demo"
+    )
+    cbody = open(contract, encoding="utf-8").read()
+    pbody = open(prompt, encoding="utf-8").read()
+    assert "work assigned to this project" in cbody
+    assert "other projects' workers/ trees" in cbody
+    assert "cabinet" not in cbody.lower()
+    assert "place: Demo" in cbody
+    assert "in **Demo**" in pbody
+
+
+def test_git_remote_status(tmp_path):
+    origin_dir = tmp_path / "origin_repo"
+    origin_dir.mkdir()
+    _git_init(origin_dir, origin="https://example.invalid/x.git")
+    assert hire_mod.git_remote_status(str(origin_dir)) == "origin"
+
+    local_dir = tmp_path / "local_repo"
+    local_dir.mkdir()
+    _git_init(local_dir)
+    assert hire_mod.git_remote_status(str(local_dir)) == "local-only"
+
+    plain_dir = tmp_path / "plain"
+    plain_dir.mkdir()
+    assert hire_mod.git_remote_status(str(plain_dir)) == "no-git"

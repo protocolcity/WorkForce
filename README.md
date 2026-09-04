@@ -1,8 +1,8 @@
 # WorkForce
 
 > **Pre-release (0.1.x).** Part of the **ProtocolCity** suite with
-> [WorkLane](https://github.com/protocolcity/ProtocolCity-WorkLane) and
-> [BluePrint](https://github.com/protocolcity/ProtocolCity-BluePrint).
+> [WorkLane](https://github.com/protocolcity/WorkLane) and
+> [BluePrint](https://github.com/protocolcity/BluePrint).
 > Expect sharp edges; file issues.
 
 **Employment infrastructure for agents.**
@@ -92,7 +92,7 @@ multi-directory setups, use these variables:
 | `WORKFORCE_DATA_DIR` | `./local` (CWD) | Home directory for WorkForce runtime state (roster, ledger, daemon heartbeat). Set this when running `workforce` commands from outside the repo root so the daemon and board always find their data. |
 | `WORKFORCE_PORT` | `8797` | HTTP port for `workforce board` and `workforce daemon`. |
 | `WORKFORCE_ROSTER` | `$WORKFORCE_DATA_DIR/local/roster.json` | Explicit roster path — overrides the default search under `WORKFORCE_DATA_DIR`. |
-| `WORKFORCE_DESK` | `http://127.0.0.1:8799` | WorkLane / Desk API URL used by the board's activity join. |
+| `WL_DESK_URL` / `TP_DESK_URL` / `WORKFORCE_DESK` / `WORKFORCE_DESK` | `http://127.0.0.1:8799` | WorkLane desk base (`desk_base_url()`). First non-empty wins in that order. `WORKFORCE_DESK` is a retired-name fallback. Board join, daemon event-trigger, desk-drop, and hire's default lane `queue_url` share this reader. |
 | `WORKFORCE_CITYHALL` | _(unset)_ | City-hall API URL for the board's city join (the prior :8796 default is retired). |
 | `WORKFORCE_BRAND` | `city` | Board brand mode: `city` (ProtocolCity suite) or `standalone`. |
 | `PROTOCOLCITY_TEMPLATES` | _(sibling checkout)_ | Path to ProtocolCity templates for `workforce hire --no-plant`. |

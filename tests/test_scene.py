@@ -1,8 +1,7 @@
-"""The dispatch scene — scene_model facts + render_scene skeleton.
+"""The dispatch scene — scene_model facts for the suite Map.
 
-Token-free: scene_model is a pure read model over roster/heartbeat/ledger;
-render_scene is a static string. The per-second animation lives in the
-browser (setInterval) and is out of scope for a server-side test.
+Token-free: scene_model is a pure read model over roster/heartbeat/ledger.
+HTML glass was deleted in wf-210; Map is the Roster.
 """
 
 import json
@@ -13,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from workforce import board  # noqa: E402
 import workforce.api.roster as _api_roster  # noqa: E402
+from workforce._utils import desk_base_url  # noqa: E402
 from workforce.roster import Roster, Worker  # noqa: E402
 
 
@@ -88,22 +88,6 @@ def test_worker_model_exposes_succeeds_for_personnel_drawer(tmp_path, monkeypatc
     assert model is not None
     assert model["display"] == "Otto · Systems Engineer"
     assert model["succeeds"] == "claude-workforce"
-
-
-def test_bay_js_prefers_display_over_name():
-    """SCENE_JS bay() label: display when set, else name."""
-    assert "w.display" in board.SCENE_JS
-    assert "succeeds " in board.SCENE_JS
-
-
-def test_bay_js_exposes_payroll_and_live_claim_and_paused():
-    """Floor-watch slice: model/CLI subtitle, claim teaser, PAUSED chip."""
-    js = board.SCENE_JS
-    assert "function payrollLine" in js
-    assert "bay-pay" in js
-    assert "claimHref" in js
-    assert "function isPaused" in js
-    assert '"PAUSED"' in js or "return \"PAUSED\"" in js
 
 
 def test_scene_model_cli_from_command_path(tmp_path, monkeypatch):
@@ -254,7 +238,7 @@ def test_scene_tape_keeps_only_closed_status_changes(tmp_path, monkeypatch):
 
     assert tape["desk_ok"] is True
     assert tape["generated_at"].endswith("Z")
-    assert tape["desk"] == board.DESK          # the config seam, for links
+    assert tape["desk"] == desk_base_url()    # live desk seam, not import snapshot
     ids = [(c["task_id"], c["status"]) for c in tape["closed"]]
     assert ids == [("oc-11", "done"), ("oc-8", "canceled")]
     assert tape["closed"][0]["title"] == "the floor"
@@ -282,21 +266,8 @@ def test_scene_tape_hits_the_activity_feed(tmp_path, monkeypatch):
 
     monkeypatch.setattr(_api_roster, "_desk_json", _spy)
     board.scene_tape(str(local))
-    # reuses render_board's desk proxy path; host stays in DESK config
+    # host stays in DESK config; tape is a JSON endpoint, not HTML
     assert seen["path"].startswith("/api/dev/activity")
-
-
-def test_render_scene_keeps_desk_traffic_off_d0(tmp_path, monkeypatch):
-    """Suite boundary: closures live on Desk, not Roster home."""
-    local = _local(tmp_path)
-    _patch_roster(monkeypatch, Roster(workers={}, path="t"))
-    html = board.render_scene(str(local))
-    assert "id='tape'" not in html
-    assert "pollTape" not in html
-    assert "TRAFFIC · 24H" not in html
-    assert "/api/scene-tape" not in html
-    # endpoint may remain for benches; D0 must not poll it
-    assert "/api/city" not in html
 
 
 def test_worker_model_feeds_the_personnel_drawer(tmp_path, monkeypatch):
@@ -318,74 +289,6 @@ def test_worker_model_feeds_the_personnel_drawer(tmp_path, monkeypatch):
     assert m["shifts"] == []
     # unknown workers have no file
     assert board.worker_model(str(local), "nobody") is None
-
-
-def test_render_scene_wires_the_personnel_drawer(tmp_path, monkeypatch):
-    local = _local(tmp_path)
-    _patch_roster(monkeypatch, Roster(workers={}, path="t"))
-    html = board.render_scene(str(local))
-    for marker in ("id='pf'", "id='pfscrim'", "openPF", "/api/worker/",
-                   "PERSONNEL FILE"):
-        assert marker in html
-
-
-def test_render_scene_wires_set_count_focus_and_pf_deep_links(tmp_path, monkeypatch):
-    """wf-52: set-counts are hits; ?focus= highlights floor; ?pf= opens PF."""
-    local = _local(tmp_path)
-    _patch_roster(monkeypatch, Roster(workers={}, path="t"))
-    html = board.render_scene(str(local))
-    # Q= / stuck set-counts → Desk filter or floor focus (Click ladder)
-    for marker in ("function deskFilterHref", "function sectorMetaHtml",
-                   "q-hit", 'data-focus="stuck"', "admin/desk"):
-        assert marker in html
-    # Floor focus: query param, apply, and tick() must not wipe marks
-    for marker in ("function focusParams", "function applyFloorFocus",
-                   "function setFloorFocus", "focus-dim", "focus-hit",
-                   "keepDim", "keepHit",
-                   "?focus=stuck|quiet|ready|next"):
-        assert marker in html
-    # Office / external deep-link: ?pf=<name> opens the summary drawer
-    for marker in ("function maybeOpenPfFromQuery", 'q.get("pf")',
-                   "openPF(pf)", 'href^="/worker/"'):
-        assert marker in html
-    # Bay cards expose stuck/ready for focus matching
-    for marker in ('data-stuck="', 'data-ready="', "bayMatchesFocus"):
-        assert marker in html
-
-
-def test_render_scene_is_self_contained_skeleton(tmp_path, monkeypatch):
-    local = _local(tmp_path)
-    _patch_roster(monkeypatch, Roster(workers={}, path="t"))
-    html = board.render_scene(str(local))
-    # the scene polls the board's OWN facts, not the city lens
-    assert "/api/scene" in html and "/api/city" not in html
-    # ratified D0 anatomy + perimeter lock
-    for marker in ("masthead", "CARRIER", "wallTime",
-                   "class='crt'", "id='grid'", "above-floor",
-                   "minmax(0,1fr)", "suite-doors"):
-        assert marker in html
-    # roster read: cabinet-first groups + status / working-on / next / dispatch
-    # + permanent strip / hired columns / hire drawer / cabinet filter rail
-    for marker in ("sectorSlug", 'id="sector-', "sector-bldg", "#e2d9c2",
-                   "workerState", "statusLabel", "workingOn", "sectorEyebrow",
-                   "Dispatch", "ON SHIFT", "permanent-strip", "hired-floor",
-                   "id='permanent'", "renderPermanentStrip",
-                   "hire-btn", "openHire", "/api/hire",
-                   "id='cabinetRail'", "cabinet-rail", "renderCabinetRail",
-                   "applyCabinetFilter", "cab-chip"):
-        assert marker in html
-    assert "Clock in" not in html
-    assert "HIRED" not in html.split("function sectorTitle")[1].split("function ")[0]
-    assert "id='floorStrip'" not in html
-    assert "renderFloorStrip" not in html
-    # cron speech stays for the personnel drawer, not the bay face
-    for marker in ("function cronSpeech", "hourly at :45", "_CRON_SPEECH_PIN"):
-        assert marker in html
-    assert "setInterval" in html and "requestAnimationFrame" not in html
-    assert "href='/board'" in html
-    assert "href='/report'" in html
-    assert "var CAN_DISPATCH=false" in html
-    assert "var CAN_DISPATCH=true" in board.render_scene("local", can_dispatch=True)
 
 
 # ── the report: the floor's strategic view ──────────────────────
@@ -439,33 +342,10 @@ def test_report_model_joins_desk_authors_by_identity(tmp_path, monkeypatch):
     assert m["desk"]["lanes"][0]["lane"] == "claude-hood"
 
 
-def test_render_report_is_a_bay_of_the_floor():
-    html = board.render_report("local", days=14)
-    for marker in ("verdictStrip", "thruRows", "quietStamp", "fireList",
-                   "back to Roster", "href='/board'",
-                   "/api/report?days=14", "var WINDOW_DAYS=14"):
-        assert marker in html
-    # setInterval, never requestAnimationFrame (the proven constraint)
-    assert "setInterval" in html and "requestAnimationFrame" not in html
-
-
-def test_scene_footer_is_room_verbs_only(tmp_path, monkeypatch):
-    local = _local(tmp_path)
-    _patch_roster(monkeypatch, Roster(workers={}, path="t"))
-    html = board.render_scene(str(local))
-    # D0 footer: in-room verbs + census — no poll chrome, no desk traffic
-    assert "foot-verbs" in html
-    assert "href='/report'>Overview</a>" in html
-    assert "href='/board'" in html
-    assert "id='poll'" not in html
-    assert "id='sum'" in html
-    assert "report sheet" not in html
-
-
 def test_days_param_parses_and_survives_junk():
-    assert board._days_param("/report?days=30") == 30
+    assert board._days_param("/api/report?days=30") == 30
     assert board._days_param("/api/report?days=abc") is None
-    assert board._days_param("/report") is None
+    assert board._days_param("/api/report") is None
 
 
 # ── wf-84: light scene schema contract + generation token ─────────────────

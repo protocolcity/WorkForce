@@ -184,11 +184,11 @@ def test_shipped_example_loads_and_encodes_founder_rails():
     assert p.cooldown_hours >= 0
     assert "model" in p.allowed_fields
     assert "command" in p.allowed_fields
-    # Generalist claude ↔ grok
-    assert p.is_allowed_transition("claude-sonnet-4-6", "grok-4.5")
-    assert p.is_allowed_transition("grok-4.5", "claude-sonnet-4-6")
+    # Generalist claude ↔ grok (emergency fallback grok-4.6 since wf-205)
+    assert p.is_allowed_transition("claude-sonnet-4-6", "grok-4.6")
+    assert p.is_allowed_transition("grok-4.6", "claude-sonnet-4-6")
     # Patrol haiku ↔ grok
-    assert p.is_allowed_transition("claude-haiku-4-5-20251001", "grok-4.5")
+    assert p.is_allowed_transition("claude-haiku-4-5-20251001", "grok-4.6")
     assert "heavy_multipass" in p.stay_pinned_tiers
     pair_ids = {pair.id for pair in p.pin_pairs}
     assert "generalist-claude-grok" in pair_ids

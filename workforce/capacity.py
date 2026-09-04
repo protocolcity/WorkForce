@@ -1,8 +1,9 @@
 """Capacity pool alerts — vendor_limit thrash → scarce For You signal.
 
 Read-model over ledgers + optional desk drop. Host-neutral: no hard-coded
-desk/workplace; desk URL comes from env (WL_DESK_URL / TP_DESK_URL) when
-dropping. Never mutates roster/daemon; report write is opt-in via CLI.
+desk/workplace; desk URL comes from ``desk_base_url()`` (both env
+families) when dropping. Never mutates roster/daemon; report write is
+opt-in via CLI.
 """
 
 from __future__ import annotations
@@ -13,8 +14,9 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
+from ._utils import _day_str, _parse_iso_z, _utcnow, desk_base_url
 from .ledger import parse_shifts
 from .runtimes import KNOWN_RUNTIMES
 
@@ -24,18 +26,6 @@ DEFAULT_SEATS_SAME_HOUR = 2
 # How many ledger lines to read per worker (best-effort tail).
 _LEDGER_TAIL_LINES = 200
 _SHIFT_LIMIT = 40
-
-DEFAULT_DESK = os.environ.get("WL_DESK_URL") or os.environ.get(
-    "TP_DESK_URL", "http://127.0.0.1:8799"
-)
-
-
-def _utcnow() -> datetime.datetime:
-    return datetime.datetime.now(datetime.timezone.utc)
-
-
-def _day_str(when: Optional[datetime.datetime] = None) -> str:
-    return (when or _utcnow()).strftime("%Y-%m-%d")
 
 
 def pool_for_command(command: Optional[List[str]]) -> str:
@@ -78,17 +68,6 @@ def consecutive_capacity_streak(shifts_newest_first: List[dict]) -> int:
     return streak
 
 
-def _parse_ts(ts: str) -> Optional[datetime.datetime]:
-    if not ts:
-        return None
-    try:
-        return datetime.datetime.strptime(
-            ts, "%Y-%m-%dT%H:%M:%SZ"
-        ).replace(tzinfo=datetime.timezone.utc)
-    except ValueError:
-        return None
-
-
 def seats_capacity_same_hour(
     worker_shifts: Dict[str, List[dict]],
     when: Optional[datetime.datetime] = None,
@@ -102,7 +81,7 @@ def seats_capacity_same_hour(
         for s in shifts:
             if not is_capacity_outcome(s.get("outcome") or "", s.get("reason") or ""):
                 continue
-            ts = _parse_ts(s.get("ts") or "")
+            ts = _parse_iso_z(s.get("ts") or "")
             if ts is None:
                 continue
             if hour_start <= ts < hour_end:
@@ -345,6 +324,18 @@ def desk_writes_allowed() -> bool:
     return True
 
 
+def hermetic_dry_run(dry_run: bool) -> Tuple[bool, bool]:
+    """Force dry-run when live desk writes are refused.
+
+    Returns ``(effective_dry_run, hermetic_blocked)``. Callers stamp
+    ``receipt["hermetic"]`` themselves — drop bodies stay per-module (RC-06).
+    ``dry_run=True`` is already dry: blocked is False. ``dry_run=False``
+    becomes dry when ``desk_writes_allowed()`` is False.
+    """
+    blocked = (not dry_run) and (not desk_writes_allowed())
+    return (bool(dry_run or blocked), blocked)
+
+
 def drop_capacity_for_you(
     alert: dict,
     report_path: str,
@@ -363,7 +354,7 @@ def drop_capacity_for_you(
     mint real For You cards. Opt in with
     ``WORKFORCE_ALLOW_DESK=1``.
     """
-    desk = (desk or DEFAULT_DESK).rstrip("/")
+    desk = (desk or desk_base_url()).rstrip("/")
     project = alert.get("project") or "workforce"
     key = alert["inbox_key"]
     day = alert.get("day") or _day_str()
@@ -400,11 +391,11 @@ def drop_capacity_for_you(
         "pool": alert["pool"],
         "action": "none",
         "path": rel,
+        "desk": desk,
     }
     # Hermetic: refuse live desk even if caller asked for dry_run=False.
-    hermetic_block = (not dry_run) and (not desk_writes_allowed())
+    dry_run, hermetic_block = hermetic_dry_run(dry_run)
     if hermetic_block:
-        dry_run = True
         receipt["hermetic"] = True
     # dry_run never touches the desk — pure local receipt (token-free verify).
     if dry_run:

@@ -9,11 +9,12 @@ from __future__ import annotations
 import json
 import os
 import re
-import tempfile
+import subprocess
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
+from ._utils import _atomic_write_json, desk_base_url
 from .roster import (
     DEFAULT_ROSTER_PATHS,
     WORKER_TYPES,
@@ -129,6 +130,97 @@ DEFAULT_USAGE_FIELDS = {
     "cost_usd": "total_cost_usd",
 }
 
+
+def git_remote_status(workdir: str) -> str:
+    """'origin' | 'local-only' | 'no-git' — picks the Land-it wording.
+
+    Not every project has a GitHub ``origin`` (e.g. oneseo-pos, recipes are
+    documented "local-only" in HOST_REGISTRY.md) and not every workdir is
+    even a git repo. The Land-it law (PROCESS §5.1.3 / wf-172) previously
+    told every worker in every project to "push origin HEAD:main" — literally
+    impossible where there is no origin, which is how osp-817/osp-825
+    (binx/stock) shipped closed tickets with commits stranded on a shift
+    branch. Papers must match what the worker can actually do.
+    """
+    try:
+        probe = subprocess.run(
+            ["git", "-C", workdir, "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, ValueError):
+        return "no-git"
+    if probe.returncode != 0 or probe.stdout.strip() != "true":
+        return "no-git"
+    try:
+        remote = subprocess.run(
+            ["git", "-C", workdir, "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, ValueError):
+        return "local-only"
+    if remote.returncode == 0 and remote.stdout.strip():
+        return "origin"
+    return "local-only"
+
+
+def _land_it_contract_text(slug: str, remote_status: str) -> str:
+    """Contract-style (multi-sentence) Land-it instructions for *remote_status*."""
+    if remote_status == "origin":
+        return (
+            "Work is not done until it is on `origin/main`. From the shift "
+            "tree: push FF-only (e.g. `git push origin HEAD:main` when "
+            "FF-able). Resolve conflicts as a **union** — never "
+            "wholesale-overwrite a shared file from a stale copy. Before "
+            "editing a shared file, re-read it from main (rebase if your "
+            "copy predates HEAD). Cite the landing commit SHA in close-out "
+            "**Links**."
+        )
+    if remote_status == "local-only":
+        return (
+            "This project has no `origin` remote (local-only — see "
+            "HOST_REGISTRY.md). Work is not done until it is merged into "
+            "the shared local `main`: from the **primary checkout** (not "
+            "your shift tree), `git merge --ff-only "
+            "workforce/shift/%s` (a real merge or rebase first if main has "
+            "moved past your branch point). Resolve conflicts as a "
+            "**union** — never wholesale-overwrite a shared file from a "
+            "stale copy. Cite the landing commit SHA in close-out "
+            "**Links** — not the shift-branch SHA. If you cannot merge "
+            "into the primary checkout yourself, stop and flag Blocked "
+            "with the branch name rather than closing without a landing "
+            "SHA." % slug
+        )
+    # no-git
+    return (
+        "This project is not a git repository — there is no branch to "
+        "land and no remote to push to. Save your work in place and cite "
+        "the changed file paths in close-out **Links** instead of a "
+        "commit SHA."
+    )
+
+
+def _land_it_prompt_text(slug: str, remote_status: str) -> str:
+    """Prompt-style (one-line) Land-it instructions for *remote_status*."""
+    if remote_status == "origin":
+        return (
+            "FF-only push to `origin/main`, resolve conflicts as a "
+            "**union** (never wholesale overwrite), re-read shared files "
+            "from main before edit, cite the landing commit SHA in Links"
+        )
+    if remote_status == "local-only":
+        return (
+            "no `origin` remote here — merge into local `main` from the "
+            "primary checkout (`git merge --ff-only "
+            "workforce/shift/%s`), resolve conflicts as a **union**, cite "
+            "the landing commit SHA in Links (not the shift-branch SHA)"
+            % slug
+        )
+    return (
+        "not a git repo — save in place and cite the changed file paths "
+        "in Links instead of a commit SHA"
+    )
+
+
 _FALLBACK_CONTRACT = """# {slug} — Employment Contract (L2)
 
 ## Identity
@@ -151,13 +243,8 @@ _FALLBACK_CONTRACT = """# {slug} — Employment Contract (L2)
 
 1. Claim — set the ticket in progress under your identity.
 2. Work — smallest slice; stage only files your contract allows.
-3. Verify — run the neighborhood's checks.
-4. **Land it** — work is not done until it is on `origin/main`. From the
-   shift tree: push FF-only (e.g. `git push origin HEAD:main` when FF-able).
-   Resolve conflicts as a **union** — never wholesale-overwrite a shared file
-   from a stale copy. Before editing a shared file, re-read it from main
-   (rebase if your copy predates HEAD). Cite the landing commit SHA in
-   close-out **Links**.
+3. Verify — run the project's checks.
+4. **Land it** — {land_it}
 5. Close out — comment and hand back; include the landing SHA under Links.
 
 ## Shift worktree
@@ -168,70 +255,58 @@ Primary checkout dirty is invisible to your index. Do not assume you are on
 the primary checkout. Land via Procedure **Land it**.
 """
 
-_FALLBACK_PROMPT = """You are `{slug}`, a worker in the {neighborhood} neighborhood.
+_FALLBACK_PROMPT = """You are `{slug}` in **{neighborhood}**. Sign as `{slug}`.
 
 1. Read your contract: `workers/{slug}/CONTRACT.md`.
-2. Read the neighborhood law: `AGENTS.md` at the repo root.
+2. Read the project instructions: `AGENTS.md` at the repo root.
 3. Check the queue: tickets labeled `worker:{slug}` in store `{store}` only.
 4. Do ONE slice of ONE ticket. Sign everything as `{slug}`.
 5. Queue empty or stop rule hit: stop cleanly and say why.
 
 If `$WORKFORCE_SHIFT_WORKDIR` is set, work and commit there (shift isolation).
-**Land it** before close-out: FF-only push to `origin/main`, resolve conflicts
-as a **union** (never wholesale overwrite), re-read shared files from main
-before edit, cite the landing commit SHA in Links (PROCESS §5.1.3 / wf-172).
+**Land it** before close-out: {land_it_prompt} (PROCESS §5.1.3 / wf-172).
 """
 
-# Appended when city templates lack the blurb — host-neutral;
-# never requires editing ProtocolCity templates from this repo.
-_SHIFT_CONTRACT_APPEND = """
-## Shift worktree
 
-When the roster sets `shift_worktree: true`, the engine spawns you with
-`cwd=$WORKFORCE_SHIFT_WORKDIR` (linked worktree on `workforce/shift/{slug}`).
-Primary checkout dirty is invisible to your index. Do not assume you are on
-the primary checkout.
+def _shift_contract_append(slug: str, remote_status: str) -> str:
+    """Appended when city templates lack the blurb.
 
-## Land it
+    Host-neutral; never requires editing ProtocolCity templates from this
+    repo. Land-it wording keys off *remote_status*.
+    """
+    return (
+        "\n## Shift worktree\n\n"
+        "When the roster sets `shift_worktree: true`, the engine spawns you "
+        "with `cwd=$WORKFORCE_SHIFT_WORKDIR` (linked worktree on "
+        "`workforce/shift/%s`). Primary checkout dirty is invisible to your "
+        "index. Do not assume you are on the primary checkout.\n\n"
+        "## Land it\n\n%s\n"
+        % (slug, _land_it_contract_text(slug, remote_status))
+    )
 
-Work is not done until it is on `origin/main`. Before close-out from the
-shift tree:
 
-1. Push FF-only to `origin/main` (e.g. `git push origin HEAD:main` when FF-able).
-2. Resolve conflicts as a **union** — never wholesale-overwrite a shared file
-   from a stale copy.
-3. Before editing a shared file, re-read it from main; rebase if your copy
-   predates HEAD.
-4. Cite the landing commit SHA in close-out **Links**.
-"""
+def _shift_prompt_append(slug: str, remote_status: str) -> str:
+    return (
+        "\nIf `$WORKFORCE_SHIFT_WORKDIR` is set, work and commit there "
+        "(shift isolation). **Land it** before close-out: %s "
+        "(PROCESS §5.1.3 / wf-172).\n"
+        % _land_it_prompt_text(slug, remote_status)
+    )
 
-_SHIFT_PROMPT_APPEND = """
-If `$WORKFORCE_SHIFT_WORKDIR` is set, work and commit there (shift isolation).
-**Land it** before close-out: FF-only push to `origin/main`, resolve conflicts
-as a **union** (never wholesale overwrite), re-read shared files from main
-before edit, cite the landing commit SHA in Links (PROCESS §5.1.3 / wf-172).
-"""
 
-# Soft shift one-liner present (older append / city copy) but no Land-it law.
-_LAND_IT_CONTRACT_APPEND = """
-## Land it
+def _land_it_contract_append(slug: str, remote_status: str) -> str:
+    """Soft shift one-liner present (older append / city copy) but no Land-it law."""
+    return (
+        "\n## Land it\n\n%s\n"
+        % _land_it_contract_text(slug, remote_status)
+    )
 
-Work is not done until it is on `origin/main`. Before close-out from the
-shift tree:
 
-1. Push FF-only to `origin/main` (e.g. `git push origin HEAD:main` when FF-able).
-2. Resolve conflicts as a **union** — never wholesale-overwrite a shared file
-   from a stale copy.
-3. Before editing a shared file, re-read it from main; rebase if your copy
-   predates HEAD.
-4. Cite the landing commit SHA in close-out **Links**.
-"""
-
-_LAND_IT_PROMPT_APPEND = """
-**Land it** before close-out: FF-only push to `origin/main`, resolve conflicts
-as a **union** (never wholesale overwrite), re-read shared files from main
-before edit, cite the landing commit SHA in Links (PROCESS §5.1.3 / wf-172).
-"""
+def _land_it_prompt_append(slug: str, remote_status: str) -> str:
+    return (
+        "\n**Land it** before close-out: %s (PROCESS §5.1.3 / wf-172).\n"
+        % _land_it_prompt_text(slug, remote_status)
+    )
 
 
 def _has_shift_worktree_blurb(body: str) -> bool:
@@ -252,12 +327,16 @@ def _has_land_it_blurb(body: str) -> bool:
     return False
 
 
-def _ensure_shift_worktree_blurb(body: str, *, dest: str, slug: str) -> str:
+def _ensure_shift_worktree_blurb(
+    body: str, *, dest: str, slug: str, remote_status: str = "origin"
+) -> str:
     """Guarantee planted papers mention shift isolation + Land-it.
 
     City templates may already soft-mention landing without the hard procedure;
     append only the missing piece. Never requires editing ProtocolCity templates
-    from this repo.
+    from this repo. *remote_status* ('origin' | 'local-only' | 'no-git', see
+    :func:`git_remote_status`) picks the right Land-it wording —
+    "push origin/main" is meaningless advice for a repo with no origin.
     """
     base = os.path.basename(dest)
     is_contract = base == "CONTRACT.md"
@@ -268,15 +347,15 @@ def _ensure_shift_worktree_blurb(body: str, *, dest: str, slug: str) -> str:
     if not has_shift:
         # Full append already includes Land-it.
         if is_contract:
-            append = _SHIFT_CONTRACT_APPEND.format(slug=slug)
+            append = _shift_contract_append(slug, remote_status)
         else:
-            append = _SHIFT_PROMPT_APPEND
+            append = _shift_prompt_append(slug, remote_status)
     else:
         # Soft shift blurb present; graft Land-it only.
         if is_contract:
-            append = _LAND_IT_CONTRACT_APPEND
+            append = _land_it_contract_append(slug, remote_status)
         else:
-            append = _LAND_IT_PROMPT_APPEND
+            append = _land_it_prompt_append(slug, remote_status)
     return body.rstrip() + "\n" + append + "\n"
 
 
@@ -373,23 +452,6 @@ def _read_raw(path: str) -> Dict[str, Any]:
     return raw
 
 
-def _atomic_write_json(path: str, raw: Dict[str, Any]) -> None:
-    directory = os.path.dirname(os.path.abspath(path)) or "."
-    os.makedirs(directory, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".roster-", suffix=".tmp", dir=directory)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(raw, fh, indent=2, ensure_ascii=False)
-            fh.write("\n")
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
 def worker_to_spec(w: Worker) -> Dict[str, Any]:
     """Serialize a Worker for roster.json (omit empty optionals that match defaults)."""
     spec = asdict(w)
@@ -483,6 +545,10 @@ def plant_papers(
     prompt = os.path.join(workers_dir, "prompt.md")
     store = store or os.path.basename(workdir).lower().replace(" ", "-")
     neighborhood = neighborhood or os.path.basename(workdir)
+    # Not every project has an origin remote (HOST_REGISTRY.md documents
+    # oneseo-pos / recipes as local-only) — Land-it wording must match what
+    # this worker can actually do.
+    remote_status = git_remote_status(workdir)
     mapping = {
         "WORKER_ID": slug,
         "slug": slug,
@@ -493,10 +559,10 @@ def plant_papers(
         "CLI_COMMAND": "claude",
         'MODEL_OR_"vendor default"': "vendor default",
         "CLAIM_CRITERIA — e.g. \"single-file, verifiable by the test suite, no schema changes\"": (
-            role or "work assigned to this cabinet"
+            role or "work assigned to this project"
         ),
         "FORBIDDEN_AREA_1": "local/ employment records (roster, ledger locks)",
-        "FORBIDDEN_AREA_2": "other cabinets' workers/ trees",
+        "FORBIDDEN_AREA_2": "other projects' workers/ trees",
     }
     tdir = _template_dir()
     for dest, src_name, fallback in (
@@ -510,9 +576,15 @@ def plant_papers(
             body = _fill_template(body, mapping)
         else:
             body = fallback.format(
-                slug=slug, store=store, neighborhood=neighborhood
+                slug=slug,
+                store=store,
+                neighborhood=neighborhood,
+                land_it=_land_it_contract_text(slug, remote_status),
+                land_it_prompt=_land_it_prompt_text(slug, remote_status),
             )
-        body = _ensure_shift_worktree_blurb(body, dest=dest, slug=slug)
+        body = _ensure_shift_worktree_blurb(
+            body, dest=dest, slug=slug, remote_status=remote_status
+        )
         with open(dest, "w", encoding="utf-8") as fh:
             fh.write(body)
     return contract, prompt
@@ -601,10 +673,13 @@ def hire(
     store = project or os.path.basename(workdir).lower().replace(" ", "-")
     if not queue_url and kind == "lane":
         # Exclusive hand feed: never bare product ready —
-        # unfiltered queues let one hire drain the whole neighborhood.
+        # unfiltered queues let one hire drain the whole project.
+        # Desk host from desk_base_url() — do not hard-code
+        # loopback :8799; a citizen who only sets WL_DESK_URL would plant a
+        # starved feed on the default desk.
         queue_url = (
-            "http://127.0.0.1:8799/api/admin/tasks/ready"
-            "?product=%s&label=worker:%s" % (store, slug)
+            "%s/api/admin/tasks/ready?product=%s&label=worker:%s"
+            % (desk_base_url().rstrip("/"), store, slug)
         )
     _check_queue_url(queue_url, slug)
 

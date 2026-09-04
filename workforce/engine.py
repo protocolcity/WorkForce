@@ -9,6 +9,8 @@ Every MUST in ProtocolCity's docs/specs/RUNNER_SPEC.md maps to a step here:
                            + revalidate_ready_after_lock (wf-163 foreign-claim
                            guard: second ready look after the single-flight
                            lock so wake-on-route cannot spawn into a takeover)
+                           + standing_chew_owed (retired mill · wf-231 /
+                           pc-1419: always False; empty is SKIP)
   §5 credentials        -> _fetch_secret (dispatch-time keychain read; never
                            persisted, never logged)
   §6 dispatch           -> canonical-path law reads + sha256 pins (the law-
@@ -16,7 +18,8 @@ Every MUST in ProtocolCity's docs/specs/RUNNER_SPEC.md maps to a step here:
                            budget with hard kill; multi-pass drain loop
                            (wf-174: max_passes=0 budget-driven; N soft
                            ceiling; stops on empty / no-progress / budget
-                           floor / fault / hard safety rail)
+                           floor / fault / hard safety rail; wf-176
+                           early-idle WARN when soft ceiling leaves ready)
   §7 workspace safety   -> _predirty_snapshot (pre-dispatch dirty-file list,
                            exposed to guards via env); optional shift
                            worktree isolates hand cwd from primary
@@ -29,7 +32,9 @@ ALWAYS_WORK §4 / wf-111 — empty runs are not failure. After N consecutive
 queue-empty SKIPs (Worker.empty_run_threshold, default 3) the engine emits
 one WARN health signal. Optional Worker.empty_run_backoff (seconds, default
 0 = off) is enforced by the daemon tick path so cron does not thrash the
-ledger; empty still never invents work.
+ledger. Empty still never invents work (the engine does not fabricate
+tickets). ALWAYS_WORK §2k / wf-231 — a lane wake into empty ready SKIPs.
+Do not spawn a standing-chew pass so the hand files a mill child.
 
 Exit codes: 0 = dispatched or cleanly skipped; 1 = infra failure.
 Dry-run performs every step except spawning the vendor CLI.
@@ -48,11 +53,12 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
-from .capacity import desk_writes_allowed
+from .capacity import hermetic_dry_run
 from .ledger import Ledger, parse_shifts
 from .roster import Worker
+from ._utils import _OWNER_MARKER_RE, latest_owner_id, _parse_iso_z, _utcnow
 
 # Desk probe timeouts. Engine dispatch may wait longer than board
 # display probes; both share _http_get_json so sockets always close.
@@ -66,6 +72,7 @@ IDENTITY_ENV = "TP_AGENT_ID"
 PREDIRTY_ENV = "WORKFORCE_PREDIRTY"
 SHIFT_WORKDIR_ENV = "WORKFORCE_SHIFT_WORKDIR"
 PRIMARY_WORKDIR_ENV = "WORKFORCE_PRIMARY_WORKDIR"
+STANDING_CHEW_ENV = "WORKFORCE_STANDING_CHEW"
 LOCK_GRACE_SECS = 600
 _GHOST_AUDIT_TIMEOUT = 60
 # wf-153 — branch namespace for engine-owned shift worktrees (not host paths)
@@ -87,6 +94,34 @@ def effective_pass_ceiling(worker: Worker) -> int:
     if n <= 0:
         return MAX_PASSES_HARD
     return n
+
+
+def _maybe_warn_early_idle(
+    ledger: Ledger,
+    worker: Worker,
+    *,
+    stop_reason: str,
+    on_pass: int,
+) -> None:
+    """Append WARN early-idle when soft ceiling stops with ready still open.
+
+    ALWAYS_WORK §9 / wf-176: soft ceiling (single-pass / max N) is not a
+    lawful exit while ungated ready remains. Probe once; probe failure is
+    silent (do not turn a clean STOP into ERROR). Token-free.
+    """
+    try:
+        leftover = _probe_queue(worker)
+    except InfraError:
+        return
+    if leftover is None or leftover <= 0:
+        return
+    ledger.append(
+        "WARN",
+        reason="early-idle",
+        ready=int(leftover),
+        stop=stop_reason,
+        on_pass=int(on_pass),
+    )
 
 # Vendor-limit exit signatures. Case-insensitive substring match
 # against the last 8 KB of the run output. Extend here as new vendors surface new
@@ -324,6 +359,36 @@ def _is_timeout_exc(exc: BaseException) -> bool:
     return "timed out" in msg or "timeout" in msg
 
 
+def _open_http_conn(
+    url: str, timeout: float
+) -> Optional[Tuple[http.client.HTTPConnection, str]]:
+    """Open an HTTP(S) client for *url*. Caller must close the connection.
+
+    Returns ``(conn, request_path)`` for ``http``/``https``. Returns ``None``
+    for other schemes so callers can fall back to ``urllib.request``
+    (``file://`` in tests). Shared by ``_http_get_json`` and ``_http_json``
+    so scheme-parse + ``HTTP[S]Connection`` stay in one place.
+    """
+    parts = urllib.parse.urlsplit(url)
+    scheme = (parts.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        return None
+    host = parts.hostname
+    if not host:
+        raise ValueError("url has no host: %s" % url)
+    port = parts.port
+    path = parts.path or "/"
+    if parts.query:
+        path = path + "?" + parts.query
+    if scheme == "https":
+        conn = http.client.HTTPSConnection(
+            host, port or 443, timeout=timeout)  # type: ignore[arg-type]
+    else:
+        conn = http.client.HTTPConnection(
+            host, port or 80, timeout=timeout)  # type: ignore[arg-type]
+    return conn, path
+
+
 def _http_get_json(url: str, timeout: float = _PROBE_TIMEOUT_SECS) -> dict:
     """GET *url* and parse JSON. Always closes the underlying socket.
 
@@ -332,27 +397,14 @@ def _http_get_json(url: str, timeout: float = _PROBE_TIMEOUT_SECS) -> dict:
     against a slow desk. Non-http schemes (``file://`` in tests)
     fall back to ``urllib.request.urlopen`` with a context manager.
     """
-    parts = urllib.parse.urlsplit(url)
-    scheme = (parts.scheme or "").lower()
-    if scheme not in ("http", "https"):
+    opened = _open_http_conn(url, timeout)
+    if opened is None:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
             body = resp.read()
         return json.loads(body.decode("utf-8"))
 
-    host = parts.hostname
-    if not host:
-        raise ValueError("url has no host: %s" % url)
-    port = parts.port
-    path = parts.path or "/"
-    if parts.query:
-        path = path + "?" + parts.query
+    conn, path = opened
     headers = {"Accept": "application/json", "Connection": "close"}
-    if scheme == "https":
-        conn = http.client.HTTPSConnection(
-            host, port or 443, timeout=timeout)  # type: ignore[arg-type]
-    else:
-        conn = http.client.HTTPConnection(
-            host, port or 80, timeout=timeout)  # type: ignore[arg-type]
     try:
         conn.request("GET", path, headers=headers)
         resp = conn.getresponse()
@@ -510,7 +562,6 @@ def queue_probe_count(worker: Worker) -> Optional[int]:
 # tickets whose latest Owner: marker is this hand. Host-neutral: desk base
 # + product come from the worker's queue_url. Live locks are never touched.
 
-_OWNER_MARKER_RE = re.compile(r"(?m)^Owner:\s*([^\s:(]+)")
 _RECONCILE_HTTP_TIMEOUT = 8.0
 
 
@@ -595,19 +646,6 @@ def clean_orphan_lock(
     return True
 
 
-def latest_owner_id(comments: List[dict]) -> Optional[str]:
-    """Latest ``Owner: <id>`` marker in comment bodies (PROCESS §5 claim)."""
-    owner: Optional[str] = None
-    for c in comments or []:
-        if not isinstance(c, dict):
-            continue
-        body = c.get("body") or ""
-        matches = _OWNER_MARKER_RE.findall(body)
-        if matches:
-            owner = matches[-1].strip()
-    return owner or None
-
-
 def _http_json(
     method: str,
     url: str,
@@ -619,26 +657,13 @@ def _http_json(
     headers = {"Accept": "application/json", "Connection": "close"}
     if body is not None:
         headers["Content-Type"] = "application/json"
-    parts = urllib.parse.urlsplit(url)
-    scheme = (parts.scheme or "").lower()
-    if scheme not in ("http", "https"):
+    opened = _open_http_conn(url, timeout)
+    if opened is None:
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8")
         return json.loads(raw) if raw else {}
-    host = parts.hostname
-    if not host:
-        raise ValueError("url has no host: %s" % url)
-    port = parts.port
-    path = parts.path or "/"
-    if parts.query:
-        path = path + "?" + parts.query
-    if scheme == "https":
-        conn = http.client.HTTPSConnection(
-            host, port or 443, timeout=timeout)  # type: ignore[arg-type]
-    else:
-        conn = http.client.HTTPConnection(
-            host, port or 80, timeout=timeout)  # type: ignore[arg-type]
+    conn, path = opened
     try:
         conn.request(method, path, body=data, headers=headers)
         resp = conn.getresponse()
@@ -661,22 +686,55 @@ def _http_json(
             pass
 
 
+def _list_tasks(
+    desk: str,
+    product: str,
+    *,
+    status: str = "",
+    label: str = "",
+    gate_type: str = "",
+    limit: int = 100,
+    timeout: float = _RECONCILE_HTTP_TIMEOUT,
+    http: Optional[Callable[..., dict]] = None,
+) -> List[dict]:
+    """GET /api/admin/tasks for *product* with optional filters.
+
+    Shared by routing_hygiene and host_audit. *http* is an injectable
+    transport (tests); default is ``_http_json``. When the desk omits
+    product/project on a row, stamp the query *product*.
+    """
+    http_fn = http or _http_json
+    q: Dict[str, Union[str, int]] = {"product": product, "limit": int(limit)}
+    if status:
+        q["status"] = status
+    if label:
+        q["label"] = label
+    if gate_type:
+        q["gate_type"] = gate_type
+    data = http_fn(
+        "GET",
+        "%s/api/admin/tasks?%s" % (desk.rstrip("/"), urllib.parse.urlencode(q)),
+        timeout=timeout,
+    )
+    if not isinstance(data, dict):
+        return []
+    tasks = data.get("tasks") or data.get("items") or []
+    out: List[dict] = []
+    for t in tasks:
+        if isinstance(t, dict):
+            if product and not t.get("product") and not t.get("project"):
+                t = dict(t)
+                t["product"] = product
+            out.append(t)
+    return out
+
 
 def _list_in_progress_ids(desk: str, product: str, worker_name: str) -> List[str]:
     """Task ids with status=in_progress and label worker:<name> on *product*."""
     label = "worker:%s" % worker_name
-    q = urllib.parse.urlencode({
-        "product": product,
-        "label": label,
-        "status": "in_progress",
-        "limit": 50,
-    })
-    data = _http_json("GET", "%s/api/admin/tasks?%s" % (desk.rstrip("/"), q))
-    tasks = data.get("tasks") or data.get("items") or []
+    tasks = _list_tasks(desk, product, status="in_progress", label=label, limit=50)
     out: List[str] = []
     for t in tasks:
-        if not isinstance(t, dict):
-            continue
         tid = str(t.get("id") or "").strip()
         if not tid:
             continue
@@ -689,12 +747,18 @@ def _list_in_progress_ids(desk: str, product: str, worker_name: str) -> List[str
     return out
 
 
-def _fetch_task(desk: str, product: str, task_id: str) -> Optional[dict]:
+def _fetch_task(
+    desk: str,
+    product: str,
+    task_id: str,
+    timeout: float = _RECONCILE_HTTP_TIMEOUT,
+) -> Optional[dict]:
     q = urllib.parse.urlencode({"product": product})
     data = _http_json(
         "GET",
         "%s/api/admin/tasks/%s?%s"
-        % (desk.rstrip("/"), urllib.parse.quote(task_id, safe=""), q),
+        % (desk.rstrip("/"), urllib.parse.quote(str(task_id), safe=""), q),
+        timeout=timeout,
     )
     task = data.get("task") if isinstance(data, dict) else None
     if isinstance(task, dict):
@@ -737,8 +801,9 @@ def _release_stranded_ticket(
         "action": "would_release",
         "author": author,
     }
-    if dry_run or not desk_writes_allowed():
-        if not dry_run:
+    dry_run, hermetic_block = hermetic_dry_run(dry_run)
+    if dry_run:
+        if hermetic_block:
             receipt["hermetic"] = True
         receipt["body"] = body
         return receipt
@@ -974,10 +1039,19 @@ def _preflight(worker: Worker) -> Tuple[Optional[int], List[dict]]:
     """Pre-dispatch checks. Returns (ready count, ready task dicts)."""
     if _free_mb(worker.workdir) < worker.min_free_mb:
         raise _Skip("low disk (<%dMB free)" % worker.min_free_mb)
-    # a roster env PATH governs both this check and the spawn (subprocess
-    # resolves argv[0] against the env it is given) — keep them in agreement
-    if shutil.which(worker.command[0], path=worker.env.get("PATH")) is None:
-        raise _Skip("CLI %r not installed" % worker.command[0])
+    # Resolution mirrors subprocess argv[0] rules so both this check and the
+    # spawn agree: absolute paths checked directly; path-like commands
+    # (containing os.sep, e.g. ./scripts/run.sh or .venv/bin/python) resolved
+    # against workdir; bare names use the roster env PATH.
+    cmd = worker.command[0]
+    if os.path.isabs(cmd):
+        found = os.path.isfile(cmd)
+    elif os.sep in cmd:
+        found = os.path.isfile(os.path.join(worker.workdir, cmd))
+    else:
+        found = shutil.which(cmd, path=worker.env.get("PATH")) is not None
+    if not found:
+        raise _Skip("CLI %r not installed" % cmd)
     count, tasks = _probe_ready(worker)
     if count is not None and count <= 0:
         raise _Skip("queue empty")
@@ -1015,15 +1089,18 @@ def revalidate_ready_after_lock(
     queue_count: Optional[int],
     ready_tasks: List[dict],
     ledger: Ledger,
+    allow_empty: bool = False,
 ) -> Tuple[Optional[int], List[dict]]:
     """Second ready look after the single-flight lock.
 
     Wake-on-route (and clock fire) both enter ``dispatch``: preflight can see
     a backlog ticket, then another owner claims before spawn. Re-probe the
     same ``queue_url``; if the ready feed drained to zero, raise ``_Skip``
-    ("queue empty") so the hand never starts. When desk origin+product are
-    known and the probe listed task ids, re-fetch each and drop non-backlog
-    / foreign-Owner tickets (belt-and-braces for a misconfigured feed).
+    ("queue empty") so the hand never starts — unless ``allow_empty``
+    (kept for callers; mill spawn retired wf-231). When desk
+    origin+product are known and the probe listed task ids, re-fetch each
+    and drop non-backlog / foreign-Owner tickets (belt-and-braces for a
+    misconfigured feed).
 
     Probe or per-task fetch failures fail open (WARN + keep prior set) so a
     flaky desk does not invent empty-queue SKIPs after a green first probe.
@@ -1042,7 +1119,9 @@ def revalidate_ready_after_lock(
             )
         else:
             if new_count is not None and new_count <= 0:
-                raise _Skip("queue empty")
+                if not allow_empty:
+                    raise _Skip("queue empty")
+                return 0, []
             count = new_count
             if new_tasks:
                 tasks = new_tasks
@@ -1109,7 +1188,7 @@ def fires_on_local_day(
     from .schedule import host_wall
 
     if now is None:
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = _utcnow()
     if now.tzinfo is None:
         now = now.replace(tzinfo=datetime.timezone.utc)
     target_day = host_wall(now).date()
@@ -1124,12 +1203,8 @@ def fires_on_local_day(
         parts = line.strip().split(" ", 2)
         if len(parts) < 2 or parts[1] != "START":
             continue
-        ts = parts[0]
-        try:
-            utc = datetime.datetime.strptime(
-                ts, "%Y-%m-%dT%H:%M:%SZ"
-            ).replace(tzinfo=datetime.timezone.utc)
-        except ValueError:
+        utc = _parse_iso_z(parts[0])
+        if utc is None:
             continue
         if host_wall(utc).date() == target_day:
             count += 1
@@ -1173,6 +1248,18 @@ def empty_run_streak(local_root: str, worker_name: str, limit: int = 50,
             continue
         break
     return streak, last_ts
+
+
+def standing_chew_owed(local_root: str, worker: Worker,
+                       limit: int = 50) -> bool:
+    """Retired mill. Always False.
+
+    wf-215 spawned one hygiene pass into empty so the hand could file a
+    mill child. Founder: empty is SKIP. Historical ledger
+    ``standing_chew=1`` events stay readable. ``local_root`` / ``worker`` /
+    ``limit`` kept so callers do not change.
+    """
+    return False
 
 
 def _note_empty_run(worker: Worker, local_root: str, ledger: Ledger) -> None:
@@ -1432,6 +1519,7 @@ def _build_env(worker: Worker, predirty: Optional[str], secret: Optional[str],
         env.pop(worker.predirty_env, None)
     env.pop(SHIFT_WORKDIR_ENV, None)
     env.pop(PRIMARY_WORKDIR_ENV, None)
+    env.pop(STANDING_CHEW_ENV, None)
     env[IDENTITY_ENV] = worker.identity
     if predirty:
         env[worker.predirty_env or PREDIRTY_ENV] = predirty
@@ -1823,10 +1911,17 @@ def dispatch(worker: Worker, local_root: str, dry_run: bool = False) -> int:
                     return _stop_ok(
                         "drain hard cap (%d passes)" % pass_ceiling,
                     )
-                return _stop_ok(
+                stop_reason = (
                     "single-pass complete" if worker.max_passes == 1
-                    else "max passes (%d)" % worker.max_passes,
+                    else "max passes (%d)" % worker.max_passes
                 )
+                # wf-176 / ALWAYS_WORK §9 — soft ceiling with ready still open
+                # is early-idle process decay. Breadcrumb on the ledger so
+                # doctor / workspace-efficiency can roll up without gold spam.
+                _maybe_warn_early_idle(
+                    ledger, worker, stop_reason=stop_reason, on_pass=passes,
+                )
+                return _stop_ok(stop_reason)
             if deadline - time.monotonic() < worker.min_pass_secs:
                 return _stop_ok("budget floor (<%ds left)" % worker.min_pass_secs)
             try:
@@ -1835,8 +1930,8 @@ def dispatch(worker: Worker, local_root: str, dry_run: bool = False) -> int:
                 # work already done this shift — a dead probe stops, not errors
                 return _stop_ok("queue unprobed between passes: %s" % exc)
             if now_queue is None or now_queue <= 0:
-                # Ready feed empty — remaining backlog may be human/timer/
-                # deferred gated (desk ready probe excludes them).
+                # wf-231 / pc-1419: empty after real closes is STOP. No mill
+                # extra pass so the hand files a hygiene child.
                 return _stop_ok("queue empty")
             if prev_queue is not None and now_queue >= prev_queue:
                 # Multipass still stops — do not burn the budget on a flat or

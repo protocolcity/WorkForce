@@ -14,7 +14,7 @@
         "runtime": "claude"
       },
       "b": {
-        "model": "grok-4.5",
+        "model": "grok-4.6",
         "runtime": "grok"
       },
       "bidirectional": true
@@ -28,7 +28,7 @@
         "runtime": "claude"
       },
       "b": {
-        "model": "grok-4.5",
+        "model": "grok-4.6",
         "runtime": "grok"
       },
       "bidirectional": true

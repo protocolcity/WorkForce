@@ -73,3 +73,20 @@ def test_load_section_52_ids_from_env(tmp_path, monkeypatch):
     ids, path = reg.load_section_52_ids()
     assert path == str(p)
     assert "salem" in ids
+
+
+def test_resolve_process_md_walks_to_city_root(tmp_path, monkeypatch):
+    """Shift worktrees sit deep under city; walk finds worklane/PROCESS.md."""
+    city = tmp_path / "OneSeo"
+    process = city / "worklane" / "PROCESS.md"
+    process.parent.mkdir(parents=True)
+    process.write_text(SAMPLE)
+    deep = city / "workforce" / "local" / "worktrees" / "salem"
+    deep.mkdir(parents=True)
+    monkeypatch.delenv("WORKLANE_PROCESS", raising=False)
+    monkeypatch.delenv("TP_PROCESS", raising=False)
+    monkeypatch.chdir(deep)
+    # Point package-root walk at the deep tree so fixed parents[2] misses city.
+    monkeypatch.setattr(reg, "_pkg_city_root", lambda: deep)
+    resolved = reg.resolve_process_md()
+    assert resolved == str(process)

@@ -1,4 +1,4 @@
-"""wf-168 — stale needs:routing on done/canceled (doctor report + --repair)."""
+"""wf-168 / wf-193 — stale needs:routing on done/canceled (doctor + --repair)."""
 
 from __future__ import annotations
 
@@ -39,6 +39,20 @@ def test_is_stale_routing_candidate_terminal_only():
         "id": "wf-1", "status": "done", "labels": ["worker:salem"],
     })
     assert not rh.is_stale_routing_candidate({"id": "x", "status": "done"})
+
+
+def test_strip_stale_routing_label_pure_and_idempotent():
+    cleaned, did = rh.strip_stale_routing_label(
+        ["needs:routing", "parent:x", "worker:you"]
+    )
+    assert cleaned == ["parent:x", "worker:you"]
+    assert did is True
+    cleaned2, did2 = rh.strip_stale_routing_label(cleaned)
+    assert cleaned2 == cleaned
+    assert did2 is False
+    empty, did3 = rh.strip_stale_routing_label(None)
+    assert empty == []
+    assert did3 is False
 
 
 def test_plan_strip_filters_and_sorts():
@@ -133,8 +147,12 @@ class _FakeDesk:
             if a not in labs:
                 labs.append(a)
         t["labels"] = labs
-        # Safety assert in tests: never invent other removals
-        assert remove <= {rh.STALE_LABEL}
+        # Safety: must always include needs:routing in the remove set.
+        # Extra worker:* removals are allowed on the foreign-seat retry path
+        # — never invent unrelated label drops.
+        assert rh.STALE_LABEL in remove
+        for r in remove:
+            assert r == rh.STALE_LABEL or r.startswith("worker:")
         return {"ok": True, "task": dict(t), "product": product}
 
 
@@ -225,6 +243,108 @@ def test_scan_repair_strips_only_needs_routing(monkeypatch):
         assert body.get("add") == []
 
 
+def test_scan_repair_respects_limit_bound(monkeypatch):
+    """wf-193 — bounded --limit repairs a prefix; open tickets stay stamped."""
+    monkeypatch.setenv("WORKFORCE_ALLOW_DESK", "1")
+    monkeypatch.delenv("WORKFORCE_NO_DESK", raising=False)
+
+    desk = _FakeDesk(["worklane", "demo"], _sample_tasks())
+    summary = rh.scan_stale_routing(
+        desk="http://desk.test",
+        products=["worklane", "demo"],
+        repair=True,
+        limit=1,
+        http=desk,
+    )
+    assert summary["ok"]
+    assert summary["total"] == 3  # full planned count still reported
+    assert summary["limit"] == 1
+    assert len(summary["stripped"]) == 1
+    assert len(summary["repair_set"]) == 1
+    # Scan walks products in caller order (worklane then demo); within a
+    # product plan_strip sorts by id → first strip is wl-281.
+    assert summary["stripped"] == ["wl-281"]
+    assert "needs:routing" not in desk.tasks["wl-281"]["labels"]
+    # Remaining terminal residue still labeled
+    assert "needs:routing" in desk.tasks["wl-290"]["labels"]
+    assert "needs:routing" in desk.tasks["ts-2369"]["labels"]
+    # Open never touched
+    assert "needs:routing" in desk.tasks["wl-open"]["labels"]
+    assert "needs:routing" in desk.tasks["ts-live"]["labels"]
+    text = rh.format_report(summary)
+    assert "remaining: 2" in text
+    assert "limit: 1" in text
+
+
+class _ForeignSeatDesk(_FakeDesk):
+    """Simulates desk foreign-seat guard on NR-only strip."""
+
+    def _patch_labels(self, url, body):
+        from urllib.parse import parse_qs, unquote, urlsplit
+
+        path = urlsplit(url).path
+        parts = path.rstrip("/").split("/")
+        tid = unquote(parts[-2]) if len(parts) >= 2 else ""
+        t = self.tasks.get(tid)
+        if t is None:
+            return {"ok": False, "error": "not found"}
+        remove = [str(x) for x in (body.get("remove") or [])]
+        labs = [str(x) for x in (t.get("labels") or [])]
+        # Refuse NR-only while a foreign worker:* remains.
+        remaining_workers = [
+            x for x in labs
+            if x.startswith("worker:") and x not in remove
+        ]
+        if (
+            remove == [rh.STALE_LABEL]
+            and any(w != "worker:you" for w in remaining_workers)
+        ):
+            return {
+                "ok": False,
+                "error": (
+                    "worker:kc is not a hired seat for this product. "
+                    "Use exactly one hand seat: worker:you."
+                ),
+            }
+        return super()._patch_labels(url, body)
+
+
+def test_scan_repair_foreign_seat_retry_drops_dead_seat(monkeypatch):
+    """wf-193 — NR-only refuse → retry with worker:* seats on terminal only."""
+    monkeypatch.setenv("WORKFORCE_ALLOW_DESK", "1")
+    monkeypatch.delenv("WORKFORCE_NO_DESK", raising=False)
+
+    tasks = [
+        {
+            "id": "ts-2218", "status": "done", "product": "demo",
+            "labels": ["needs:routing", "product:demo", "worker:kc"],
+            "title": "foreign seat residue",
+        },
+        {
+            "id": "ts-open", "status": "backlog", "product": "demo",
+            "labels": ["needs:routing", "worker:kc"],
+            "title": "OPEN — never strip",
+        },
+    ]
+    desk = _ForeignSeatDesk(["demo"], tasks)
+    summary = rh.scan_stale_routing(
+        desk="http://desk.test",
+        products=["demo"],
+        repair=True,
+        http=desk,
+    )
+    assert summary["ok"]
+    assert summary["stripped"] == ["ts-2218"]
+    assert "ts-2218" in (summary.get("foreign_seat_retries") or [])
+    assert "needs:routing" not in desk.tasks["ts-2218"]["labels"]
+    assert "worker:kc" not in desk.tasks["ts-2218"]["labels"]
+    assert "product:demo" in desk.tasks["ts-2218"]["labels"]
+    # Open ticket never planned / never patched
+    assert "needs:routing" in desk.tasks["ts-open"]["labels"]
+    assert "worker:kc" in desk.tasks["ts-open"]["labels"]
+    assert all(tid == "ts-2218" for tid, _ in desk.patches)
+
+
 def test_repair_blocked_under_hermetic_no_desk(monkeypatch):
     monkeypatch.setenv("WORKFORCE_NO_DESK", "1")
     monkeypatch.delenv("WORKFORCE_ALLOW_DESK", raising=False)
@@ -266,6 +386,26 @@ def test_list_stale_routing_client_side_rejects_open():
         "http://desk.test", "worklane", http=bad_http,
     )
     assert [r["id"] for r in rows] == ["done-1"]
+
+
+def test_list_stale_routing_stamps_product_when_desk_omits():
+    """wf-216 — shared _list_tasks still stamps product for hygiene receipts."""
+    def omit_product(method, url, body=None, timeout=0):
+        return {
+            "ok": True,
+            "tasks": [{
+                "id": "wf-9",
+                "status": "done",
+                "labels": ["needs:routing"],
+            }],
+        }
+
+    rows = rh.list_stale_routing(
+        "http://desk.test", "workforce", http=omit_product,
+    )
+    assert len(rows) == 1
+    assert rows[0]["id"] == "wf-9"
+    assert rows[0]["product"] == "workforce"
 
 
 def test_doctor_cli_skips_under_no_desk(tmp_path, monkeypatch, capsys):

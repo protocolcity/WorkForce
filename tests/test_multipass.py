@@ -15,7 +15,8 @@ def drain_command(queue_path):
     """A worker that 'finishes one ticket': decrements the queue file."""
     return ["/bin/sh", "-c",
             "python3 -c \"import json; p=%r; d=json.load(open(p)); "
-            "d['count']-=1; json.dump(d, open(p,'w'))\"" % str(queue_path)]
+            "d['count']=max(0,d['count']-1); json.dump(d, open(p,'w'))\""
+            % str(queue_path)]
 
 
 def test_multipass_drains_until_queue_empty(tmp_path):
@@ -24,8 +25,9 @@ def test_multipass_drains_until_queue_empty(tmp_path):
     q.write_text(json.dumps({"ok": True, "count": 2}))  # after make_worker's default
     assert engine.dispatch(w, local(tmp_path)) == 0
     text = ledger_text(tmp_path)
-    assert text.count("DONE") == 2
-    assert "on_pass=2" in text and "queue empty" in text
+    assert text.count("DONE") == 2  # drain only
+    assert "queue empty" in text
+    assert "standing_chew=1" not in text
 
 
 def test_multipass_stops_at_pass_ceiling(tmp_path):
@@ -92,10 +94,11 @@ def test_max_passes_zero_drains_until_queue_empty(tmp_path):
     q.write_text(json.dumps({"ok": True, "count": 3}))
     assert engine.dispatch(w, local(tmp_path)) == 0
     text = ledger_text(tmp_path)
-    assert text.count("DONE") == 3
+    assert text.count("DONE") == 3  # drain only
     assert "queue empty" in text
     assert "max passes" not in text
     assert "drain hard cap" not in text
+    assert "standing_chew=1" not in text
 
 
 def test_max_passes_zero_hits_hard_cap(tmp_path, monkeypatch):

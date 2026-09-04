@@ -227,6 +227,62 @@ def test_desk_writes_allowed_env_matrix(monkeypatch):
     assert capacity.desk_writes_allowed() is True
 
 
+def test_hermetic_dry_run_refuses_live_under_no_desk(monkeypatch):
+    monkeypatch.delenv("WORKFORCE_ALLOW_DESK", raising=False)
+    monkeypatch.setenv("WORKFORCE_NO_DESK", "1")
+    dry, blocked = capacity.hermetic_dry_run(False)
+    assert dry is True
+    assert blocked is True
+
+
+def test_hermetic_dry_run_passthrough_when_already_dry(monkeypatch):
+    monkeypatch.delenv("WORKFORCE_ALLOW_DESK", raising=False)
+    monkeypatch.setenv("WORKFORCE_NO_DESK", "1")
+    dry, blocked = capacity.hermetic_dry_run(True)
+    assert dry is True
+    assert blocked is False
+
+
+def test_hermetic_dry_run_allows_live_when_opted_in(monkeypatch):
+    monkeypatch.setenv("WORKFORCE_ALLOW_DESK", "1")
+    dry, blocked = capacity.hermetic_dry_run(False)
+    assert dry is False
+    assert blocked is False
+
+
+def test_hermetic_live_formula_only_in_helper():
+    """wf-223 / RC-06: no parallel live-refuse formula outside hermetic_dry_run."""
+    root = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "workforce"
+    )
+    needles = (
+        "(not dry_run) and (not desk_writes_allowed())",
+        "(not dry_run) and (not capacity.desk_writes_allowed())",
+        "bool(repair) and (not desk_writes_allowed())",
+        "if dry_run or not desk_writes_allowed():",
+    )
+    hits = []
+    for dirpath, dirnames, files in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        for name in files:
+            if not name.endswith(".py"):
+                continue
+            path = os.path.join(dirpath, name)
+            rel = os.path.relpath(path, root)
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+            for needle in needles:
+                if needle not in text:
+                    continue
+                for i, line in enumerate(text.splitlines(), 1):
+                    if needle not in line:
+                        continue
+                    if rel == "capacity.py" and needle.startswith("(not dry_run)"):
+                        continue
+                    hits.append("%s:%d: %s" % (rel, i, line.strip()))
+    assert hits == [], hits
+
+
 def test_pool_for_command_basename():
     assert capacity.pool_for_command(["/usr/local/bin/codex", "exec"]) == "codex"
     assert capacity.pool_for_command([]) == ""
