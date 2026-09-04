@@ -304,7 +304,9 @@ def test_audit_product_live_posts_when_allowed(monkeypatch):
             (tid, body, author)
         ) or {"ok": True},
     )
-    monkeypatch.setattr(host_audit, "desk_writes_allowed", lambda: True)
+    monkeypatch.setattr(
+        "workforce.capacity.desk_writes_allowed", lambda: True
+    )
 
     summary = host_audit.audit_product(
         "workforce", dry_run=False, author="workforce",
@@ -333,6 +335,226 @@ def test_format_receipt_includes_ungated():
     assert "host-audit:" in text
     assert "would_block wf-372" in text
     assert "--live" in text
+
+
+# --- run-log surface ------------------------------
+
+
+def test_safe_worker_name_rejects_traversal():
+    assert host_audit.safe_worker_name("salem") == "salem"
+    assert host_audit.safe_worker_name("chief-of-staff") == "chief-of-staff"
+    assert host_audit.safe_worker_name("../etc/passwd") is None
+    assert host_audit.safe_worker_name("a/b") is None
+    assert host_audit.safe_worker_name("") is None
+    assert host_audit.safe_worker_name("..") is None
+    assert host_audit.safe_worker_name("weird name") is None
+
+
+def test_resolve_run_log_path_under_run_dir(tmp_path):
+    local = tmp_path / "local"
+    (local / "run").mkdir(parents=True)
+    path = host_audit.resolve_run_log_path(str(local), "salem")
+    assert path is not None
+    assert path.endswith(os.path.join("run", "salem.out"))
+    assert host_audit.resolve_run_log_path(str(local), "../salem") is None
+    assert host_audit.resolve_run_log_path("", "salem") is None
+
+
+def test_read_run_log_tail_missing_is_none(tmp_path):
+    local = tmp_path / "local"
+    (local / "run").mkdir(parents=True)
+    assert host_audit.read_run_log_tail(str(local), "no-such-seat") is None
+    assert host_audit.read_run_log_tail(str(local), "../escape") is None
+
+
+def test_read_run_log_tail_bounded(tmp_path):
+    local = tmp_path / "local"
+    run = local / "run"
+    run.mkdir(parents=True)
+    # Pad then plant a tier-2 line near the end.
+    body = ("clean progress line\n" * 2000) + (
+        "launchctl kickstart -k gui/501/com.ticketingprotocol.server\n"
+    )
+    (run / "lili.out").write_text(body, encoding="utf-8")
+    text = host_audit.read_run_log_tail(str(local), "lili", max_bytes=512)
+    assert text is not None
+    assert "launchctl kickstart" in text
+    assert len(text.encode("utf-8")) <= 512 + 64  # tail + partial-line drop slack
+
+
+def test_scan_run_log_tier2_hit():
+    hit = host_audit.scan_claim_surfaces(
+        "clean title",
+        "clean description",
+        [{"id": 1, "body": "Progress: desk only — no host verbs"}],
+        run_log_text=(
+            "--- pass 1 ---\n"
+            "ran launchctl kickstart -k gui/501/com.ticketingprotocol.server\n"
+        ),
+        run_worker="lili",
+    )
+    assert hit is not None
+    pattern, surface = hit
+    assert "ticketingprotocol" in pattern or "launchctl" in pattern
+    assert surface == "run:lili"
+
+
+def test_scan_desk_hit_beats_run_log():
+    """Priority: comment hit wins over run trail (design §2 order)."""
+    hit = host_audit.scan_claim_surfaces(
+        "t",
+        "d",
+        [{
+            "id": 2,
+            "body": "launchctl kickstart gui/501/com.ticketingprotocol.server",
+        }],
+        run_log_text="also launchctl bootout gui/501/com.ticketingprotocol.server",
+        run_worker="lili",
+    )
+    assert hit is not None
+    _, surface = hit
+    assert surface.startswith("comment:")
+
+
+def test_evaluate_run_log_would_block():
+    task = {
+        "id": "wf-372",
+        "status": "in_progress",
+        "title": "mid-shift work",
+        "description": "",
+        "labels": ["worker:lili"],
+        "comments": [{"id": 1, "body": "Owner: lili\nPlan: revive"}],
+    }
+    run_text = "launchctl kickstart -k gui/501/com.ticketingprotocol.server"
+    ev = host_audit.evaluate_claim(
+        task, gated=False, run_log_text=run_text, run_worker="lili",
+    )
+    assert ev["action"] == "would_block"
+    assert ev["surface"] == "run:lili"
+    assert "Blocked:" in ev["body"]
+
+
+def test_audit_product_include_run_logs_hit(monkeypatch, tmp_path):
+    """Opt-in run tail: clean desk comments, dirty local/run/<worker>.out."""
+    local = tmp_path / "local"
+    run = local / "run"
+    run.mkdir(parents=True)
+    (run / "lili.out").write_text(
+        "launchctl kickstart -k gui/501/com.ticketingprotocol.server\n",
+        encoding="utf-8",
+    )
+    claim = {
+        "id": "wf-372",
+        "status": "in_progress",
+        "title": "revive desk",
+        "description": "",
+        "labels": ["worker:lili"],
+        "comments": [{"id": 1, "body": "Owner: lili\nPlan: investigate"}],
+    }
+    posts = []
+    monkeypatch.setattr(host_audit, "list_open_founder_host_gates", lambda *a, **k: [])
+    monkeypatch.setattr(host_audit, "list_claim_tasks", lambda *a, **k: [claim])
+    monkeypatch.setattr(host_audit, "_fetch_task", lambda *a, **k: claim)
+    monkeypatch.setattr(
+        host_audit, "_post_blocked",
+        lambda *a, **k: posts.append(a) or {"ok": True},
+    )
+
+    # Default (no flag) stays desk-only — run file present but ignored.
+    summary_off = host_audit.audit_product(
+        "workforce", dry_run=True, local_root=str(local),
+    )
+    assert summary_off["ungated_hits"] == 0
+    assert summary_off.get("run_logs_scanned", 0) == 0
+
+    summary = host_audit.audit_product(
+        "workforce",
+        dry_run=True,
+        include_run_logs=True,
+        local_root=str(local),
+    )
+    assert summary["include_run_logs"] is True
+    assert summary["run_logs_scanned"] == 1
+    assert summary["ungated_hits"] == 1
+    assert summary["would_block"] == 1
+    assert summary["results"][0]["surface"] == "run:lili"
+    assert posts == []
+
+
+def test_audit_product_include_run_logs_missing_file(monkeypatch, tmp_path):
+    """Missing run file degrades cleanly — claim still evaluates desk-only."""
+    local = tmp_path / "local"
+    (local / "run").mkdir(parents=True)
+    claim = {
+        "id": "wf-1",
+        "status": "in_progress",
+        "title": "docs",
+        "description": "no host work",
+        "labels": ["worker:salem"],
+        "comments": [{"id": 1, "body": "Owner: salem\nPlan: design"}],
+    }
+    monkeypatch.setattr(host_audit, "list_open_founder_host_gates", lambda *a, **k: [])
+    monkeypatch.setattr(host_audit, "list_claim_tasks", lambda *a, **k: [claim])
+    monkeypatch.setattr(host_audit, "_fetch_task", lambda *a, **k: claim)
+
+    summary = host_audit.audit_product(
+        "workforce",
+        dry_run=True,
+        include_run_logs=True,
+        local_root=str(local),
+    )
+    assert summary["ok"] is True
+    assert summary["ungated_hits"] == 0
+    assert summary["clear"] == 1
+    assert summary["run_logs_scanned"] == 0
+
+
+def test_list_claim_tasks_uses_shared_list(monkeypatch):
+    """wf-216 — host_audit list still honors the module _http_json seam."""
+    calls = []
+
+    def fake_http(method, url, body=None, timeout=12.0):
+        calls.append(url)
+        return {
+            "ok": True,
+            "tasks": [{
+                "id": "wf-1",
+                "status": "in_progress",
+                "labels": ["worker:salem"],
+            }],
+        }
+
+    monkeypatch.setattr(host_audit, "_http_json", fake_http)
+    rows = host_audit.list_claim_tasks(
+        "http://desk.test", "workforce", worker="salem",
+    )
+    assert [r["id"] for r in rows] == ["wf-1"]
+    assert any("status=in_progress" in u for u in calls)
+    assert any("label=worker" in u for u in calls)
+
+
+def test_list_open_founder_host_gates_passes_gate_type(monkeypatch):
+    """wf-216 — gate_type filter still reaches the shared desk helper."""
+    calls = []
+
+    def fake_http(method, url, body=None, timeout=12.0):
+        calls.append(url)
+        return {
+            "ok": True,
+            "tasks": [{
+                "id": "wf-host",
+                "status": "backlog",
+                "gate_type": "human",
+                "title": "FOUNDER · host: restart daemon",
+            }],
+        }
+
+    monkeypatch.setattr(host_audit, "_http_json", fake_http)
+    rows = host_audit.list_open_founder_host_gates(
+        "http://desk.test", "workforce",
+    )
+    assert [r["id"] for r in rows] == ["wf-host"]
+    assert any("gate_type=human" in u for u in calls)
 
 
 # --- dispatch still first line of defense (regression via shared helper) ---

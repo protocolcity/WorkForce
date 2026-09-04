@@ -9,11 +9,13 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
 
 from workforce import hire as hire_mod
 from workforce import roster as roster_mod
+from workforce._utils import engine_api_url
 from workforce.ledger import Ledger
 
 
@@ -144,7 +146,7 @@ def build_tool_definitions() -> List[Dict[str, Any]]:
                     "name": {"type": "string"},
                     "workdir": {
                         "type": "string",
-                        "description": "absolute project/neighborhood path",
+                        "description": "absolute project folder path",
                     },
                     "role": {"type": "string"},
                     "kind": {
@@ -225,7 +227,8 @@ class WFHandlers:
                     daemon = json.load(fh)
             except Exception:
                 daemon = {"error": "unreadable"}
-        board_up = _http_ok("http://127.0.0.1:8797/")
+        api = engine_api_url().rstrip("/")
+        board_up = _http_ok(api + "/")
         return {
             "ok": True,
             "author": self.author,
@@ -234,7 +237,7 @@ class WFHandlers:
             "kinds": kinds,
             "daemon": daemon,
             "engine_api_http": "up" if board_up else "down",
-            "engine_api_url": "http://127.0.0.1:8797/",
+            "engine_api_url": api + "/",
         }
 
     def roster(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -369,7 +372,10 @@ class WFHandlers:
         via_http = args.get("via_http", True)
         if via_http and not dry:
             # Prefer live daemon (same path as suite Dispatch button)
-            url = "http://127.0.0.1:8797/api/dispatch/%s" % urllib.parse.quote(name)
+            url = "%s/api/dispatch/%s" % (
+                engine_api_url().rstrip("/"),
+                urllib.parse.quote(name),
+            )
             try:
                 req = urllib.request.Request(url, data=b"", method="POST")
                 req.add_header("Content-Type", "application/json")
@@ -432,10 +438,6 @@ def _http_ok(url: str) -> bool:
         return 100 <= int(getattr(e, "code", 0) or 0) < 600
     except Exception:
         return False
-
-
-# late import for quote in dispatch
-import urllib.parse  # noqa: E402
 
 
 def dispatch_tool(handlers: WFHandlers, name: str, arguments: Dict[str, Any]) -> Any:

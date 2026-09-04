@@ -15,11 +15,18 @@ import datetime
 import json
 import os
 import shutil
-import tempfile
 import urllib.parse
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from . import capacity
+from ._utils import (
+    _atomic_write_json,
+    _day_str,
+    _parse_iso_z,
+    _utc_iso_z,
+    _utcnow,
+    desk_base_url,
+)
 from .capacity_policy import (
     CapacityPolicy,
     CapacityPolicyError,
@@ -64,20 +71,8 @@ class RepinError(ValueError):
     """Staging or apply refused (policy, stale from, missing worker, …)."""
 
 
-def _utcnow() -> datetime.datetime:
-    return datetime.datetime.now(datetime.timezone.utc)
-
-
 def _utc_compact(when: Optional[datetime.datetime] = None) -> str:
     return (when or _utcnow()).strftime("%Y%m%dT%H%M%SZ")
-
-
-def _iso_z(when: Optional[datetime.datetime] = None) -> str:
-    return (when or _utcnow()).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _day_str(when: Optional[datetime.datetime] = None) -> str:
-    return (when or _utcnow()).strftime("%Y-%m-%d")
 
 
 def staged_dir(local_root: str) -> str:
@@ -134,23 +129,6 @@ def inbox_key_for_stage(stage_id: str) -> str:
 def inbox_label(project: str, stage_id: str, day: Optional[str] = None) -> str:
     day = day or _day_str()
     return "inbox-report:%s:%s:%s" % (project, inbox_key_for_stage(stage_id), day)
-
-
-def _atomic_write_json(path: str, raw: Dict[str, Any]) -> None:
-    directory = os.path.dirname(os.path.abspath(path)) or "."
-    os.makedirs(directory, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".roster-diff-", suffix=".tmp", dir=directory)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(raw, fh, indent=2, ensure_ascii=False)
-            fh.write("\n")
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
 
 
 def load_diff(path: str) -> Dict[str, Any]:
@@ -309,12 +287,8 @@ def _last_stage_ts_for_worker(local_root: str, worker: str) -> Optional[datetime
         )
         if not hit:
             continue
-        created = str(data.get("created_at") or "")
-        try:
-            ts = datetime.datetime.strptime(
-                created, "%Y-%m-%dT%H:%M:%SZ"
-            ).replace(tzinfo=datetime.timezone.utc)
-        except ValueError:
+        ts = _parse_iso_z(str(data.get("created_at") or ""))
+        if ts is None:
             continue
         if latest is None or ts > latest:
             latest = ts
@@ -388,7 +362,7 @@ def stage_repin(
                 if delta < need:
                     raise RepinError(
                         "worker %r still in cooldown (last staged %s, need %dh)"
-                        % (name, last.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        % (name, _utc_iso_z(last),
                            policy.cooldown_hours)
                     )
 
@@ -399,7 +373,7 @@ def stage_repin(
     diff: Dict[str, Any] = {
         "schema": SCHEMA_ID,
         "mode": MODE_B,
-        "created_at": _iso_z(when),
+        "created_at": _utc_iso_z(when),
         "created_by": (created_by or "chief-of-staff").strip(),
         "reason": (reason or "").strip(),
         "source": (source or "").strip(),
@@ -417,7 +391,7 @@ def stage_repin(
         path = os.path.join(
             out_dir, "roster-diff-%s-%s.json" % (stage_id, ordered[0])
         )
-    _atomic_write_json(path, diff)
+    _atomic_write_json(path, diff, prefix=".roster-diff-")
     seats_today = _count_seats_staged_today(local_root, day)
     return {
         "ok": True,
@@ -517,6 +491,7 @@ def drop_repin_for_you(
         "repin",
         "for-you",
     ]
+    desk = (desk or desk_base_url()).rstrip("/")
     receipt = {
         "ok": True,
         "project": project,
@@ -526,17 +501,16 @@ def drop_repin_for_you(
         "stage_id": stage_id,
         "action": "none",
         "path": rel,
+        "desk": desk,
     }
-    hermetic_block = (not dry_run) and (not capacity.desk_writes_allowed())
+    dry_run, hermetic_block = capacity.hermetic_dry_run(dry_run)
     if hermetic_block:
-        dry_run = True
         receipt["hermetic"] = True
     if dry_run:
         receipt["action"] = "would_create"
         receipt["title"] = title
         return receipt
 
-    desk = (desk or capacity.DEFAULT_DESK).rstrip("/")
     existing = capacity.find_open_by_label(desk, project, label)
     if existing:
         tid = str(existing.get("id") or "")
@@ -685,7 +659,7 @@ def apply_repin(
     except OSError as exc:
         raise RepinError("cannot write backup %s: %s" % (bak_path, exc)) from exc
 
-    _atomic_write_json(roster_file, raw)
+    _atomic_write_json(roster_file, raw, prefix=".roster-diff-")
 
     # Reload to ensure the merged roster still validates.
     try:

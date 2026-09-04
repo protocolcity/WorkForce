@@ -57,6 +57,24 @@ def ledger_text(tmp_path):
     return p.read_text() if p.exists() else ""
 
 
+def ticks_until_empty_streak(d, local_root, n, t0):
+    """Fire until empty_run_streak >= n.
+
+    Returns the next unused minute timestamp after the last fire.
+    """
+    from workforce import engine as engine_mod
+
+    t = t0
+    fired = 0
+    while engine_mod.empty_run_streak(local_root, "tester")[0] < n:
+        assert d.tick(t, wait=True) == 1
+        fired += 1
+        t = t + datetime.timedelta(minutes=1)
+        if fired > n + 5:
+            raise AssertionError("empty streak did not reach %d" % n)
+    return t
+
+
 def test_tick_fires_matching_cron_worker(tmp_path):
     base, local = make_base(tmp_path, schedule="30 9 * * *")
     d = Daemon(base, local)
@@ -185,7 +203,7 @@ def test_plist_names_one_service_only(tmp_path):
     assert "daemon</string>" in xml and str(tmp_path) in xml
 
 
-def test_daemon_serves_board_and_survives_busy_port(tmp_path):
+def test_daemon_serves_board_and_survives_busy_port(tmp_path, monkeypatch):
     """Reboot-survival: the ONE service carries the board; a busy port must
     never take the scheduler down with it."""
     import socket
@@ -202,16 +220,15 @@ def test_daemon_serves_board_and_survives_busy_port(tmp_path):
         with urllib.request.urlopen("http://127.0.0.1:%d/api/health" % port, timeout=5) as r:
             assert json.loads(r.read())["ok"] is True
         # same port now busy: start_board on a daemon pointed at it must
-        # degrade to None (WARN), not raise
+        # degrade to None (WARN), not raise. Bind seam is live WORKFORCE_PORT
+        #, not a patched DEFAULT_PORT snapshot.
         blocker = socket.socket()
         blocker.bind(("127.0.0.1", 0))
-        board_default = board.DEFAULT_PORT
-        board.DEFAULT_PORT = blocker.getsockname()[1]
+        monkeypatch.setenv("WORKFORCE_PORT", str(blocker.getsockname()[1]))
         try:
             blocker.listen(1)
             assert d.start_board() is None
         finally:
-            board.DEFAULT_PORT = board_default
             blocker.close()
     finally:
         httpd.shutdown()
@@ -254,6 +271,37 @@ def test_fire_now_manual_trigger(tmp_path):
     assert not ok2 and "no such worker" in msg2
 
 
+def test_fire_now_preflight_low_disk_refuses_without_thread(tmp_path):
+    """wf-222: fire_now runs preflight; low disk is an honest refuse, no spawn."""
+    base, local = make_base(tmp_path, schedule="manual")
+    roster_path = tmp_path / "local" / "roster.json"
+    data = json.loads(roster_path.read_text())
+    data["workers"]["tester"]["min_free_mb"] = 10 ** 12
+    roster_path.write_text(json.dumps(data))
+    d = Daemon(base, local)
+    ok, msg = d.fire_now("tester")
+    assert not ok
+    assert "low disk" in msg
+    assert "tester" not in d._threads
+    assert ledger_text(tmp_path) == ""
+
+
+def test_wake_now_stays_async_on_low_disk(tmp_path):
+    """wf-222: wake_now does not preflight; low disk still spawns then SKIP."""
+    base, local = make_base(tmp_path, schedule="manual")
+    roster_path = tmp_path / "local" / "roster.json"
+    data = json.loads(roster_path.read_text())
+    data["workers"]["tester"]["min_free_mb"] = 10 ** 12
+    roster_path.write_text(json.dumps(data))
+    d = Daemon(base, local)
+    ok, msg = d.wake_now("tester")
+    assert ok and msg == "dispatched"
+    assert "tester" in d._threads
+    d._threads["tester"].join(timeout=10)
+    text = ledger_text(tmp_path)
+    assert "SKIP" in text and "low disk" in text
+
+
 def test_empty_run_backoff_suppresses_cron_fires(tmp_path):
     """wf-111: after N consecutive empties, backoff>0 withholds scheduled fires."""
     from workforce import engine
@@ -269,12 +317,11 @@ def test_empty_run_backoff_suppresses_cron_fires(tmp_path):
 
     d = Daemon(base, local)
     t0 = datetime.datetime(2026, 7, 14, 10, 0, tzinfo=UTC)
-    assert d.tick(t0, wait=True) == 1  # first empty SKIP
-    t1 = datetime.datetime(2026, 7, 14, 10, 1, tzinfo=UTC)
-    assert d.tick(t1, wait=True) == 1  # 2nd empty → threshold; WARN
+    t_next = ticks_until_empty_streak(d, local, 2, t0)
     text = ledger_text(tmp_path)
     assert text.count(" SKIP ") >= 2
     assert "empty-run threshold" in text
+    assert "standing_chew=1" not in text
     # ledger ts are real UTC; policy age is relative to newest empty line
     streak, last_ts = engine.empty_run_streak(local, "tester")
     assert streak >= 2 and last_ts
@@ -286,8 +333,7 @@ def test_empty_run_backoff_suppresses_cron_fires(tmp_path):
     assert not d._fire_allowed_by_empty_policy(
         w, last + datetime.timedelta(seconds=30)
     )
-    t2 = datetime.datetime(2026, 7, 14, 10, 2, tzinfo=UTC)
-    assert d.tick(t2, wait=True) == 0  # cron path also withholds
+    assert d.tick(t_next, wait=True) == 0  # cron path also withholds
     # past backoff → allowed again
     assert d._fire_allowed_by_empty_policy(
         w, last + datetime.timedelta(seconds=3601)
@@ -309,7 +355,9 @@ def test_empty_run_backoff_zero_never_suppresses(tmp_path):
     assert d.tick(datetime.datetime(2026, 7, 14, 10, 0, tzinfo=UTC), wait=True) == 1
     assert d.tick(datetime.datetime(2026, 7, 14, 10, 1, tzinfo=UTC), wait=True) == 1
     assert d.tick(datetime.datetime(2026, 7, 14, 10, 2, tzinfo=UTC), wait=True) == 1
-    assert ledger_text(tmp_path).count(" SKIP ") == 3
+    text = ledger_text(tmp_path)
+    assert "standing_chew=1" not in text
+    assert text.count(" SKIP ") == 3  # 3 idle SKIPs; none withheld
 
 
 def test_empty_run_pause_suppresses_when_queue_empty(tmp_path):
@@ -325,16 +373,16 @@ def test_empty_run_pause_suppresses_when_queue_empty(tmp_path):
     roster_path.write_text(json.dumps(data))
 
     d = Daemon(base, local)
-    # First two fires build the streak
-    assert d.tick(datetime.datetime(2026, 7, 14, 10, 0, tzinfo=UTC), wait=True) == 1
-    assert d.tick(datetime.datetime(2026, 7, 14, 10, 1, tzinfo=UTC), wait=True) == 1
+    t_next = ticks_until_empty_streak(
+        d, local, 2, datetime.datetime(2026, 7, 14, 10, 0, tzinfo=UTC),
+    )
     assert ledger_text(tmp_path).count(" SKIP ") >= 2
     streak, _ = engine.empty_run_streak(local, "tester")
     assert streak >= 2
-    # Queue still empty → pause gate holds
+    # Queue still empty → pause gate holds (chew already offered)
     assert not d._fire_allowed_by_empty_policy(d._roster().workers["tester"])
     # Daemon tick respects the gate
-    assert d.tick(datetime.datetime(2026, 7, 14, 10, 2, tzinfo=UTC), wait=True) == 0
+    assert d.tick(t_next, wait=True) == 0
 
 
 def test_empty_run_pause_auto_resumes_when_queue_fills(tmp_path):
@@ -349,8 +397,9 @@ def test_empty_run_pause_auto_resumes_when_queue_fills(tmp_path):
     roster_path.write_text(json.dumps(data))
 
     d = Daemon(base, local)
-    assert d.tick(datetime.datetime(2026, 7, 14, 10, 0, tzinfo=UTC), wait=True) == 1
-    assert d.tick(datetime.datetime(2026, 7, 14, 10, 1, tzinfo=UTC), wait=True) == 1
+    ticks_until_empty_streak(
+        d, local, 2, datetime.datetime(2026, 7, 14, 10, 0, tzinfo=UTC),
+    )
     w = d._roster().workers["tester"]
     assert not d._fire_allowed_by_empty_policy(w)   # gate is active
 
@@ -843,7 +892,7 @@ def test_wake_now_unknown_worker(tmp_path):
 
 
 def test_wake_now_empty_queue_clean_skip(tmp_path):
-    """Probe-first: a wake with an empty queue is a clean SKIP, never a spawn."""
+    """wf-231: empty wake SKIPs; no mill chew spawn."""
     base, local = make_base(tmp_path, schedule="manual")
     (tmp_path / "queue.json").write_text(json.dumps({"count": 0}))
     d = Daemon(base, local)
@@ -852,7 +901,14 @@ def test_wake_now_empty_queue_clean_skip(tmp_path):
     d._threads["tester"].join(timeout=10)
     text = ledger_text(tmp_path)
     assert "SKIP" in text and "queue empty" in text
-    assert "START" not in text
+    assert "standing_chew=1" not in text
+    from workforce.daemon import WAKE_DEBOUNCE_SECS
+    d._wake_monotonic["tester"] -= WAKE_DEBOUNCE_SECS + 1
+    ok, _ = d.wake_now("tester")
+    assert ok
+    d._threads["tester"].join(timeout=10)
+    text = ledger_text(tmp_path)
+    assert "SKIP" in text and "queue empty" in text
 
 
 def test_wake_during_inflight_is_clean_noop(tmp_path):
@@ -915,8 +971,9 @@ def test_adaptive_backoff_gates_cron_by_default(tmp_path):
     roster_path.write_text(json.dumps(data))
 
     d = Daemon(base, local)
-    assert d.tick(datetime.datetime(2026, 7, 14, 10, 0, tzinfo=UTC), wait=True) == 1
-    assert d.tick(datetime.datetime(2026, 7, 14, 10, 1, tzinfo=UTC), wait=True) == 1
+    t_next = ticks_until_empty_streak(
+        d, local, 2, datetime.datetime(2026, 7, 14, 10, 0, tzinfo=UTC),
+    )
     streak, last_ts = engine.empty_run_streak(local, "tester")
     assert streak == 2 and last_ts
     last = datetime.datetime.strptime(last_ts, "%Y-%m-%dT%H:%M:%SZ").replace(
@@ -928,7 +985,7 @@ def test_adaptive_backoff_gates_cron_by_default(tmp_path):
     assert d._fire_allowed_by_empty_policy(
         w, last + datetime.timedelta(seconds=3601))
     # cron tick inside the window withholds too
-    assert d.tick(datetime.datetime(2026, 7, 14, 10, 2, tzinfo=UTC), wait=True) == 0
+    assert d.tick(t_next, wait=True) == 0
 
 
 def test_explicit_backoff_pin_beats_adaptive_ladder(tmp_path):
@@ -942,8 +999,9 @@ def test_explicit_backoff_pin_beats_adaptive_ladder(tmp_path):
     roster_path.write_text(json.dumps(data))
 
     d = Daemon(base, local)
-    assert d.tick(datetime.datetime(2026, 7, 14, 10, 0, tzinfo=UTC), wait=True) == 1
-    assert d.tick(datetime.datetime(2026, 7, 14, 10, 1, tzinfo=UTC), wait=True) == 1
+    ticks_until_empty_streak(
+        d, local, 2, datetime.datetime(2026, 7, 14, 10, 0, tzinfo=UTC),
+    )
     from workforce import engine
     streak, last_ts = engine.empty_run_streak(local, "tester")
     assert streak >= 2   # at threshold — the ladder alone would hold for 1h
@@ -967,8 +1025,9 @@ def test_wake_resets_adaptive_backoff_to_base(tmp_path):
     roster_path.write_text(json.dumps(data))
 
     d = Daemon(base, local)
-    assert d.tick(datetime.datetime(2026, 7, 14, 10, 0, tzinfo=UTC), wait=True) == 1
-    assert d.tick(datetime.datetime(2026, 7, 14, 10, 1, tzinfo=UTC), wait=True) == 1
+    ticks_until_empty_streak(
+        d, local, 2, datetime.datetime(2026, 7, 14, 10, 0, tzinfo=UTC),
+    )
     w = d._roster().workers["tester"]
     from workforce import engine
     _, last_ts = engine.empty_run_streak(local, "tester")
@@ -1049,8 +1108,9 @@ def test_api_workers_exposes_resting_state(tmp_path):
     roster_path.write_text(json.dumps(data))
 
     d = Daemon(base, local)
-    assert d.tick(datetime.datetime(2026, 7, 14, 10, 0, tzinfo=UTC), wait=True) == 1
-    assert d.tick(datetime.datetime(2026, 7, 14, 10, 1, tzinfo=UTC), wait=True) == 1
+    ticks_until_empty_streak(
+        d, local, 2, datetime.datetime(2026, 7, 14, 10, 0, tzinfo=UTC),
+    )
 
     httpd = board.make_server(port=0, local_root=local, daemon=d)
     try:
@@ -1153,8 +1213,9 @@ def test_empty_run_pause_tick_runs_heartbeat_reconcile(tmp_path, monkeypatch):
 
     d = Daemon(base, local)
     # Build streak via real empty fires (file:// queue count=0).
-    assert d.tick(datetime.datetime(2026, 8, 4, 10, 0, tzinfo=UTC), wait=True) == 1
-    assert d.tick(datetime.datetime(2026, 8, 4, 10, 1, tzinfo=UTC), wait=True) == 1
+    t_next = ticks_until_empty_streak(
+        d, local, 2, datetime.datetime(2026, 8, 4, 10, 0, tzinfo=UTC),
+    )
     w = d._roster().workers["tester"]
     assert not d._fire_allowed_by_empty_policy(w)
 
@@ -1195,8 +1256,37 @@ def test_empty_run_pause_tick_runs_heartbeat_reconcile(tmp_path, monkeypatch):
     monkeypatch.setattr(engine_mod, "queue_probe_count", lambda _w: 0)
     monkeypatch.setenv("WORKFORCE_ALLOW_DESK", "1")
 
-    fired = d.tick(datetime.datetime(2026, 8, 4, 10, 2, tzinfo=UTC), wait=True)
+    fired = d.tick(t_next, wait=True)
     assert fired == 0  # pause held — no shift thread
     assert posts, "heartbeat reconcile must POST Blocked: release on pause path"
     text = ledger_text(tmp_path)
     assert "heartbeat-reconcile-release" in text
+
+
+# ---------------------------------------------------------------------------
+# wf-203 — heartbeat flush when worker thread exits between ticks
+
+
+def test_inflight_heartbeat_flush_on_thread_exit(tmp_path):
+    """wf-203: the inter-tick detection condition correctly identifies threads
+    that exited during the sleep window and triggers a heartbeat flush."""
+    from workforce.daemon import _utcnow as daemon_utcnow
+
+    base, local = make_base(tmp_path, command=["/bin/sh", "-c", "sleep 0.2; exit 0"])
+    d = Daemon(base, local)
+    now = datetime.datetime(2026, 7, 14, 5, 0, tzinfo=UTC)
+    # Fire without waiting — thread in flight between ticks.
+    assert d.tick(now) == 1
+    hb = json.loads((tmp_path / "local" / "daemon.json").read_text())
+    assert hb["in_flight"] == ["tester"]
+
+    # --- Mirror the Option A detection added to run() ---
+    in_flight_pre = set(d.in_flight())
+    d._threads["tester"].join(timeout=10)          # thread finishes
+    finished = in_flight_pre - set(d.in_flight())
+    assert finished == {"tester"}                  # detection fires
+
+    # Flush as run() now does on detection.
+    d._write_heartbeat(daemon_utcnow(), d._roster())
+    hb2 = json.loads((tmp_path / "local" / "daemon.json").read_text())
+    assert hb2["in_flight"] == []

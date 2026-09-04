@@ -16,13 +16,10 @@ import os
 import re
 from typing import List, Optional, Union
 
+from ._utils import _parse_iso_z, _utc_iso_z, _utcnow
 
 EVENTS = ("START", "DONE", "STOP", "SKIP", "ERROR", "WARN", "GHOST", "SCOPE_DENY",
           "HOST_MUTATION_DENY", "CLAIM")
-
-
-def _utcnow() -> str:
-    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _fmt(value: Union[str, int, float]) -> str:
@@ -40,7 +37,7 @@ class Ledger:
     def append(self, event: str, **kv: Union[str, int, float]) -> str:
         if event not in EVENTS:
             raise ValueError("unknown ledger event %r (want one of %s)" % (event, "/".join(EVENTS)))
-        parts = ["%s %s" % (_utcnow(), event)]
+        parts = ["%s %s" % (_utc_iso_z(), event)]
         parts.extend("%s=%s" % (k, _fmt(v)) for k, v in kv.items())
         line = " ".join(parts)
         with open(self.path, "a", encoding="utf-8") as fh:
@@ -84,7 +81,8 @@ def parse_shifts(text: str, limit: int = 20) -> List[dict]:
                        "queue": ev.get("queue", "?"), "reason": "",
                        "budget_secs": int(ev.get("budget_secs", "0") or 0),
                        "dry_run": ev.get("dry_run") == "1", "end_ts": "",
-                       "usage": {}, "fallback_runtime": ""}
+                       "usage": {}, "fallback_runtime": "",
+                       "standing_chew": ev.get("standing_chew") == "1"}
             shifts.append(current)
         elif kind == "DONE" and current is not None:
             current["passes"] += 1
@@ -115,6 +113,8 @@ def parse_shifts(text: str, limit: int = 20) -> List[dict]:
                 current["outcome"] = "error"
             current["reason"] = reason
             current["end_ts"] = ev["ts"]
+            if ev.get("standing_chew") == "1":
+                current["standing_chew"] = True
             current = None
         elif kind in ("SKIP", "ERROR", "WARN", "SCOPE_DENY"):
             shifts.append({"ts": ev["ts"], "outcome": kind.lower(), "passes": 0,
@@ -125,14 +125,12 @@ def parse_shifts(text: str, limit: int = 20) -> List[dict]:
     # a START with no terminal event past budget+grace is a CRASHED shift,
     # not a running one — the runner died without logging (incident class:
     # a killed runaway shift that rendered as "on shift now" for 20 min)
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = _utcnow()
     for s in shifts:
         if s["outcome"] != "running":
             continue
-        try:
-            started = datetime.datetime.strptime(
-                s["ts"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
-        except ValueError:
+        started = _parse_iso_z(s["ts"])
+        if started is None:
             continue
         if (now - started).total_seconds() > (s["budget_secs"] or 1500) + 600:
             s["outcome"] = "crashed"

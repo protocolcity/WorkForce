@@ -121,8 +121,13 @@ def test_dry_run_records_claim_then_clears(tmp_path):
 
 
 def test_empty_queue_skips_cleanly(tmp_path):
+    """wf-231: empty SKIPs; no mill chew spawn."""
     w = make_worker(tmp_path)
     (tmp_path / "queue.json").write_text(json.dumps({"ok": True, "count": 0}))
+    assert engine.dispatch(w, local(tmp_path)) == 0
+    text = ledger_text(tmp_path)
+    assert "SKIP" in text and "queue empty" in text
+    assert "standing_chew=1" not in text
     assert engine.dispatch(w, local(tmp_path)) == 0
     assert "SKIP" in ledger_text(tmp_path) and "queue empty" in ledger_text(tmp_path)
 
@@ -264,18 +269,21 @@ def test_empty_run_streak_resets_after_real_shift(tmp_path):
     """A successful dispatch breaks the empty streak so WARN can fire again."""
     w = make_worker(tmp_path, empty_run_threshold=2)
     q = tmp_path / "queue.json"
+    empty_warn = "empty-run threshold"
     q.write_text(json.dumps({"ok": True, "count": 0}))
     assert engine.dispatch(w, local(tmp_path)) == 0
     assert engine.dispatch(w, local(tmp_path)) == 0
-    assert ledger_text(tmp_path).count(" WARN ") == 1
+    assert ledger_text(tmp_path).count(empty_warn) == 1
     q.write_text(json.dumps({"ok": True, "count": 1}))
     assert engine.dispatch(w, local(tmp_path)) == 0
     assert "DONE" in ledger_text(tmp_path)
+    # Soft ceiling with ready still open may add early-idle WARN;
+    # empty-run streak counts only empty-run threshold messages.
     q.write_text(json.dumps({"ok": True, "count": 0}))
-    assert engine.dispatch(w, local(tmp_path)) == 0
-    assert ledger_text(tmp_path).count(" WARN ") == 1  # not yet at threshold again
-    assert engine.dispatch(w, local(tmp_path)) == 0
-    assert ledger_text(tmp_path).count(" WARN ") == 2
+    assert engine.dispatch(w, local(tmp_path)) == 0  # skip 1 after real work
+    assert ledger_text(tmp_path).count(empty_warn) == 1  # not yet at threshold again
+    assert engine.dispatch(w, local(tmp_path)) == 0  # skip 2 → warn 2
+    assert ledger_text(tmp_path).count(empty_warn) == 2
 
 
 def test_empty_run_non_empty_skip_does_not_count(tmp_path):
@@ -457,6 +465,96 @@ def test_http_get_json_closes_socket_on_timeout():
     assert est == 0, "timed-out probe left %d ESTABLISHED socket(s)" % est
 
 
+def test_open_http_conn_non_http_returns_none(tmp_path):
+    """wf-228: file:// (and other non-http) skip http.client setup."""
+    p = tmp_path / "q.json"
+    p.write_text("{}")
+    assert engine._open_http_conn(p.as_uri(), timeout=1.0) is None
+
+
+def test_open_http_conn_http_returns_conn_and_path():
+    """wf-228: http URL yields a live HTTPConnection plus request path."""
+    import http.client
+
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    srv.close()
+    opened = engine._open_http_conn(
+        "http://127.0.0.1:%d/ready?product=workforce" % port, timeout=1.0)
+    assert opened is not None
+    conn, path = opened
+    try:
+        assert path == "/ready?product=workforce"
+        assert isinstance(conn, http.client.HTTPConnection)
+    finally:
+        conn.close()
+
+
+def test_http_json_file_scheme(tmp_path):
+    """wf-228: _http_json file:// fallback still parses JSON."""
+    p = tmp_path / "q.json"
+    p.write_text(json.dumps({"ok": True, "count": 2}))
+    assert engine._http_json("GET", p.as_uri()) == {"ok": True, "count": 2}
+
+
+def _serve_one_http(status: int, body: bytes, reason: str = "ERR"):
+    """Accept one request, write a canned HTTP response, return (port, thread)."""
+    import threading
+
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    srv.listen(1)
+    srv.settimeout(2)
+
+    def _run():
+        try:
+            c, _ = srv.accept()
+            try:
+                c.recv(4096)
+                payload = (
+                    "HTTP/1.1 %d %s\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: %d\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                ) % (status, reason, len(body))
+                c.sendall(payload.encode("ascii") + body)
+            finally:
+                c.close()
+        except Exception:
+            pass
+        finally:
+            srv.close()
+
+    th = threading.Thread(target=_run, daemon=True)
+    th.start()
+    return port, th
+
+
+def test_http_get_json_raises_on_4xx():
+    """wf-228: probe helper still raises HTTPError on 4xx (does not swallow)."""
+    port, th = _serve_one_http(404, b'{"error":"missing"}', reason="Not Found")
+    url = "http://127.0.0.1:%d/missing" % port
+    with pytest.raises(urllib.error.HTTPError) as ei:
+        engine._http_get_json(url, timeout=2.0)
+    assert ei.value.code == 404
+    th.join(timeout=2)
+
+
+def test_http_json_returns_error_dict_on_4xx():
+    """wf-228: desk-write helper still returns an error dict on 4xx (does not raise)."""
+    port, th = _serve_one_http(409, b'{"error":"conflict"}', reason="Conflict")
+    url = "http://127.0.0.1:%d/drop" % port
+    out = engine._http_json("POST", url, body={"ticket": "wf-228"}, timeout=2.0)
+    assert out.get("ok") is False
+    assert out.get("error") == "conflict"
+    th.join(timeout=2)
+
+
 def test_missing_cli_skips(tmp_path):
     w = make_worker(tmp_path, command=["definitely-not-a-real-cli-xyz"])
     assert engine.dispatch(w, local(tmp_path)) == 0
@@ -570,6 +668,42 @@ def test_roster_env_path_governs_cli_preflight(tmp_path):
                      env={"PATH": "%s:/usr/bin:/bin" % bindir})
     assert engine.dispatch(w2, local(tmp_path)) == 0
     assert "DONE" in ledger_text(tmp_path)           # found via roster PATH
+
+
+def test_preflight_resolves_relative_and_absolute_script_paths(tmp_path):
+    """Relative and absolute script entrypoints must not raise 'not installed'
+    when the file exists and is executable — pc-1206 regression."""
+    workdir = tmp_path / "hood"
+    workdir.mkdir(exist_ok=True)
+
+    # relative: ./scripts/run-job.sh inside workdir
+    scripts = workdir / "scripts"
+    scripts.mkdir()
+    rel_script = scripts / "run-job.sh"
+    rel_script.write_text("#!/bin/sh\nexit 0\n")
+    rel_script.chmod(rel_script.stat().st_mode | stat.S_IEXEC)
+
+    # absolute: /bin/sh (always present)
+    abs_cmd = "/bin/sh"
+
+    contract = tmp_path / "CONTRACT.md"
+    prompt = tmp_path / "prompt.md"
+    contract.write_text("# c\n")
+    prompt.write_text("p\n")
+    queue = tmp_path / "queue.json"
+    queue.write_text(json.dumps({"ok": True, "count": 1}))
+
+    for cmd in [["./scripts/run-job.sh", "-c", "exit 0"], [abs_cmd, "-c", "exit 0"]]:
+        w = make_worker(
+            tmp_path,
+            workdir=str(workdir),
+            command=cmd,
+            queue_url="file://" + str(queue),
+        )
+        assert engine.dispatch(w, local(tmp_path)) == 0
+        assert "not installed" not in ledger_text(tmp_path), (
+            "preflight skipped valid script %r" % cmd[0]
+        )
 
 
 def test_roster_isolates_duplicate_identity(tmp_path, caplog):
@@ -1805,7 +1939,7 @@ def test_dispatch_empty_skip_runs_heartbeat_reconcile(tmp_path, monkeypatch):
     )
     # Force empty preflight without real http queue probe (wf-158: preflight
     # uses _probe_ready, which returns (count, tasks)).
-    monkeypatch.setattr(engine, "_probe_ready", lambda _w: (0, []))
+    monkeypatch.setattr(engine, "_probe_ready", lambda _w, **_kw: (0, []))
     released = []
 
     def fake_http(method, url, body=None, timeout=8.0):
@@ -1837,7 +1971,71 @@ def test_dispatch_empty_skip_runs_heartbeat_reconcile(tmp_path, monkeypatch):
     rc = engine.dispatch(w, local(tmp_path))
     assert rc == 0
     text = ledger_text(tmp_path)
-    assert "SKIP" in text and "queue empty" in text
-    assert "START" not in text  # never entered shift
-    assert released == ["wf-3"]
     assert "heartbeat-reconcile-release" in text
+    assert released == ["wf-3"]
+    # wf-231: empty SKIPs and still reconciles (no mill chew spawn)
+    assert "SKIP" in text and "queue empty" in text
+    assert "standing_chew=1" not in text
+    released.clear()
+    rc = engine.dispatch(w, local(tmp_path))
+    assert rc == 0
+    text = ledger_text(tmp_path)
+    assert "SKIP" in text and "queue empty" in text
+
+
+def test_list_tasks_filters_stamp_and_http_seam():
+    """wf-216 — one desk list helper: filters, product-stamp, injectable http."""
+    seen = []
+
+    def fake_http(method, url, body=None, timeout=8.0):
+        seen.append((method, url, timeout))
+        return {
+            "ok": True,
+            "tasks": [
+                {"id": "wf-1", "status": "backlog"},
+                {"id": "wf-2", "status": "backlog", "product": "workforce"},
+                "skip-me",
+            ],
+        }
+
+    rows = engine._list_tasks(
+        "http://desk.test/",
+        "workforce",
+        status="backlog",
+        label="worker:salem",
+        gate_type="human",
+        limit=50,
+        timeout=12.0,
+        http=fake_http,
+    )
+    assert [r["id"] for r in rows] == ["wf-1", "wf-2"]
+    assert rows[0]["product"] == "workforce"
+    assert rows[1]["product"] == "workforce"
+    assert len(seen) == 1
+    method, url, timeout = seen[0]
+    assert method == "GET"
+    assert timeout == 12.0
+    assert url.startswith("http://desk.test/api/admin/tasks?")
+    assert "product=workforce" in url
+    assert "status=backlog" in url
+    assert "gate_type=human" in url
+    assert "limit=50" in url
+    assert "label=worker" in url
+
+
+def test_list_tasks_non_dict_and_items_key():
+    def not_dict(*a, **k):
+        return ["not", "a", "dict"]
+
+    assert engine._list_tasks(
+        "http://desk.test", "workforce", http=not_dict,
+    ) == []
+
+    def items_payload(*a, **k):
+        return {"items": [{"id": "a"}]}
+
+    rows = engine._list_tasks(
+        "http://desk.test", "workforce", http=items_payload,
+    )
+    assert rows[0]["id"] == "a"
+    assert rows[0]["product"] == "workforce"

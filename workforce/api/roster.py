@@ -1,7 +1,7 @@
 """Data models and API helpers.
 
 Pure-Python side: constants, helpers, JSON data models. No HTML.
-HTML surfaces live in workforce.surfaces.roster.
+Glass is the suite Map; this module is the JSON roster.
 """
 
 import concurrent.futures
@@ -19,13 +19,24 @@ from typing import Dict, List, Optional, Tuple
 
 from ..daemon import heartbeat_status, read_heartbeat
 from ..engine import _dig, _http_get_json, _is_timeout_exc, empty_run_streak
+from .._utils import (
+    _DEFAULT_ENGINE_PORT,
+    _ago,
+    _fmt_fire,
+    _parse_iso_z,
+    _utc_iso_z,
+    _utcnow,
+    desk_base_url,
+)
 from ..ledger import Ledger, open_claims, parse_shifts
 from ..roster import Roster, RosterError, Worker
 from ..schedule import calendar_intervals_to_cron, maybe_cron, next_fire_utc
 from .. import roster as roster_mod
 from .. import runtimes as runtimes_mod
 
-DEFAULT_PORT = int(os.environ.get("WORKFORCE_PORT") or "8797")
+# Numeric fallback only. Bind path uses live ``engine_port()``;
+# do not snapshot WORKFORCE_PORT at import.
+DEFAULT_PORT = _DEFAULT_ENGINE_PORT
 
 # pc-23: "lane" is retired vocabulary on rendered surfaces; roster data still
 # says kind=lane until the schema migration lands.
@@ -80,8 +91,7 @@ def generation_token(local_root: str) -> Dict[str, object]:
     token = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
     return {
         "token": token,
-        "ts": datetime.datetime.now(datetime.timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"),
+        "ts": _utc_iso_z(),
         "in_flight": list(inflight),
         "daemon": daemon_state,
         "recent_failures": recent_failures(local_root),
@@ -104,8 +114,7 @@ def recent_failures(local_root: str,
     sub-second callers on the pulse bus.
     """
     ledger_dir = os.path.join(local_root, "ledger")
-    cutoff = (datetime.datetime.now(datetime.timezone.utc)
-              - datetime.timedelta(seconds=window_secs)).timestamp()
+    cutoff = (_utcnow() - datetime.timedelta(seconds=window_secs)).timestamp()
     out: List[Dict[str, str]] = []
     try:
         entries = os.listdir(ledger_dir)
@@ -149,7 +158,13 @@ def _kind_label(kind: str) -> str:
 
 
 LAUNCH_AGENTS = os.path.expanduser("~/Library/LaunchAgents")
-DESK = os.environ.get("WORKFORCE_DESK", os.environ.get("WORKFORCE_DESK", "http://127.0.0.1:8799"))
+
+
+def _desk() -> str:
+    """Live desk base URL. Do not snapshot at import."""
+    return desk_base_url()
+
+
 CITYHALL = os.environ.get("WORKFORCE_CITYHALL", os.environ.get("WORKFORCE_CITYHALL", ""))
 
 # ── Dashboard branding ──────
@@ -199,37 +214,6 @@ def _service_config(local_root: str) -> Dict[str, tuple]:
                 "services": tuple(raw.get("service_labels", []))}
     except (OSError, ValueError):
         return {"prefixes": (), "services": ()}
-
-
-# ── Time helpers ──────────────────────────────────────────────────────────
-
-def _ago(ts: str) -> str:
-    try:
-        dt = datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=datetime.timezone.utc)
-    except ValueError:
-        return ts
-    secs = int((_utcnow() - dt).total_seconds())
-    if secs < 90:
-        return "%ds ago" % secs
-    if secs < 5400:
-        return "%dm ago" % (secs // 60)
-    if secs < 172800:
-        return "%dh ago" % (secs // 3600)
-    return "%dd ago" % (secs // 86400)
-
-
-def _utcnow() -> datetime.datetime:
-    return datetime.datetime.now(datetime.timezone.utc)
-
-
-def _fmt_fire(dt: Optional[datetime.datetime]) -> str:
-    if not dt:
-        return ""
-    mins = int((dt - _utcnow()).total_seconds() // 60)
-    if mins >= 2880:
-        return "%s (in %dd)" % (dt.strftime("%b %d %H:%M"), mins // 1440)
-    return "%s (in %dm)" % (dt.strftime("%H:%M"), max(mins, 0))
 
 
 # ── Legacy plist / launchd ────────────────────────────────────────────────
@@ -292,21 +276,19 @@ def _launchctl_rota(local_root: str) -> List[Dict[str, str]]:
 # ── Desk JSON proxy ───────────────────────────────────────────────────────
 
 def _desk_json(path: str, timeout: float = 5.0) -> Optional[dict]:
-    """GET DESK+path as JSON. *timeout* is host-neutral; board/scene paths
-    pass a shorter bound so a hung desk cannot freeze Map."""
+    """GET DESK+path as JSON via ``_http_get_json``.
+
+    *timeout* is host-neutral; board/scene paths pass a shorter bound so a
+    hung desk cannot freeze Map. Any transport/parse/4xx failure
+    still returns ``None`` — Map degrades, it does not raise.
+    """
     try:
-        with urllib.request.urlopen(DESK + path, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        return _http_get_json(_desk() + path, timeout=timeout)
     except Exception:
         return None
 
 
 # ── Roster / worker helpers ───────────────────────────────────────────────
-
-def _last_ledger_line(local_root: str, worker: str) -> str:
-    tail = Ledger(os.path.join(local_root, "ledger"), worker).tail(1).strip()
-    return tail
-
 
 def _queue_human_link(w: Worker) -> str:
     """The way back: the queue probe is an API URL; the same desk serves the
@@ -400,7 +382,7 @@ def _ledger_holdings(
         href = ""
         if tid:
             href = "%s/admin/desk?open=%s" % (
-                DESK.rstrip("/"), urllib.parse.quote(tid))
+                _desk().rstrip("/"), urllib.parse.quote(tid))
         pri: object = c.get("priority")
         if pri is not None and str(pri) != "":
             try:
@@ -688,7 +670,7 @@ def scene_model(local_root: str, light: bool = False) -> Dict[str, object]:
                 "owned": bool(cron),
                 "owner": w.owner or "",
                 "skill": w.skill or "",
-                "next_fire": nf.strftime("%Y-%m-%dT%H:%M:%SZ") if nf else "",
+                "next_fire": _utc_iso_z(nf) if nf else "",
                 "queue": q, "health": health["cls"], "why": health["why"],
                 "holding": holding,
                 "last_shift": ({"ts": last["ts"], "outcome": last["outcome"],
@@ -739,7 +721,7 @@ def scene_model(local_root: str, light: bool = False) -> Dict[str, object]:
         except Exception:
             _pool = []
     return {
-        "generated_at": _utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "generated_at": _utc_iso_z(),
         "daemon": daemon,
         "in_flight": list(in_flight_raw),
         "last_tick": hb.get("last_tick", ""),
@@ -762,15 +744,15 @@ def scene_tape(local_root: str) -> Dict[str, object]:
     blocks on the desk and the tape degrades on its own when the desk is down.
 
     The desk stays a config seam (DESK env, host-neutral): we reuse the same
-    ``_desk_json("/api/dev/activity")`` proxy render_board already uses. The
+    ``_desk_json("/api/dev/activity")`` proxy the JSON tape already uses. The
     feed mixes comments and status changes; a CLOSED item is a status_change
     to a terminal state (done | canceled). The desk already bounds status
     changes to the last 24h server-side, so no window filter is needed here.
     """
-    generated = _utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    generated = _utc_iso_z()
     feed = _desk_json("/api/dev/activity?limit=50")
     if feed is None:
-        return {"generated_at": generated, "desk": DESK,
+        return {"generated_at": generated, "desk": _desk(),
                 "desk_ok": False, "closed": []}
     closed: List[Dict[str, str]] = []
     for e in feed.get("entries", []):
@@ -785,7 +767,7 @@ def scene_tape(local_root: str) -> Dict[str, object]:
             "status": status,
             "ts": e.get("created_at") or "",
         })
-    return {"generated_at": generated, "desk": DESK,
+    return {"generated_at": generated, "desk": _desk(),
             "desk_ok": True, "closed": closed[:12]}
 
 
@@ -821,20 +803,13 @@ def report_model(local_root: str, days: Optional[int] = None) -> Dict[str, objec
     hb = read_heartbeat(local_root) or {}
     names = _display_names(local_root)
 
-    def _ts(iso: str) -> Optional[datetime.datetime]:
-        try:
-            return datetime.datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(
-                tzinfo=datetime.timezone.utc)
-        except (ValueError, TypeError):
-            return None
-
     def _shift_secs(s: Dict[str, object]) -> int:
         """Busy seconds for one shift: telemetry when present,
         start→end wall clock as the pre-telemetry fallback."""
         usage = s.get("usage") or {}
         if usage.get("secs"):
             return int(usage["secs"])  # type: ignore[index]
-        a, b = _ts(str(s.get("ts", ""))), _ts(str(s.get("end_ts", "")))
+        a, b = _parse_iso_z(str(s.get("ts", ""))), _parse_iso_z(str(s.get("end_ts", "")))
         return int((b - a).total_seconds()) if a and b else 0
 
     workers: List[Dict[str, object]] = []
@@ -856,7 +831,7 @@ def report_model(local_root: str, days: Optional[int] = None) -> Dict[str, objec
                 limit=400) if not s["dry_run"]]
             last = shifts[0] if shifts else None
             in_window = [s for s in shifts
-                         if (_ts(s["ts"]) or since) >= since]
+                         if (_parse_iso_z(s["ts"]) or since) >= since]
             n_ok = sum(1 for s in in_window if s["outcome"] == "ok")
             n_fault = sum(1 for s in in_window if s["outcome"] in _FAULT_OUTCOMES)
             n_total = len(in_window)
@@ -901,7 +876,7 @@ def report_model(local_root: str, days: Optional[int] = None) -> Dict[str, objec
                 "identity": w.identity, "model": w.model or "default",
                 "vendor": vendor,
                 "owned": bool(cron), "schedule": w.schedule or "",
-                "next_fire": nf.strftime("%Y-%m-%dT%H:%M:%SZ") if nf else "",
+                "next_fire": _utc_iso_z(nf) if nf else "",
                 "queue": q, "health": health["cls"], "why": health["why"],
                 "verdict": verdict, "ok": n_ok, "fault": n_fault,
                 "total": n_total,
@@ -909,21 +884,21 @@ def report_model(local_root: str, days: Optional[int] = None) -> Dict[str, objec
                 "last_ts": last["ts"] if last else "",
                 "last_outcome": last["outcome"] if last else "",
             })
-            last_dt = _ts(last["ts"]) if last else None
+            last_dt = _parse_iso_z(last["ts"]) if last else None
             if not running and (last_dt is None or last_dt < quiet_cut):
                 quiet.append({"name": name, "owned": bool(cron),
                               "hours": (int((now - last_dt).total_seconds() // 3600)
                                         if last_dt else None)})
             if nf:
                 fires.append({"name": name,
-                              "at": nf.strftime("%Y-%m-%dT%H:%M:%SZ")})
+                              "at": _utc_iso_z(nf)})
     fires.sort(key=lambda f: f["at"])
     quiet.sort(key=lambda e: (e["hours"] is not None, -(e["hours"] or 0)))
 
     alloc = _desk_json("/api/dev/allocation?window_days=%d" % days)
     if alloc and alloc.get("ok"):
         desk: Dict[str, object] = {
-            "ok": True, "url": DESK,
+            "ok": True, "url": _desk(),
             "authors": [{"author": a.get("author", ""),
                          "filed": a.get("filed", 0), "closed": a.get("closed", 0),
                          "worker": ident_by.get(a.get("author", ""), "")}
@@ -931,12 +906,12 @@ def report_model(local_root: str, days: Optional[int] = None) -> Dict[str, objec
             "lanes": alloc.get("lanes", []),
         }
     else:
-        desk = {"ok": False, "url": DESK, "authors": [], "lanes": []}
+        desk = {"ok": False, "url": _desk(), "authors": [], "lanes": []}
 
     daemon = ("draining" if (hb.get("state") == "draining" and status != "stopped")
               else status)
     return {
-        "generated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "generated_at": _utc_iso_z(now),
         "window_days": days, "quiet_hours": _REPORT_QUIET_HOURS,
         "daemon": {"status": daemon, "last_tick": hb.get("last_tick", ""),
                    "in_flight": hb.get("in_flight", [])},
@@ -1053,7 +1028,7 @@ def _worker_holdings(
                 "owner": owner,
                 "updated_at": str(t.get("updated_at") or ""),
                 "href": "%s/admin/desk?open=%s" % (
-                    DESK.rstrip("/"), urllib.parse.quote(tid)),
+                    _desk().rstrip("/"), urllib.parse.quote(tid)),
             })
     return held
 
@@ -1094,7 +1069,7 @@ def _worker_ready_teaser(w: Worker, *, limit: int = 10) -> List[Dict[str, object
             "priority": t.get("priority"),
             "product": product,
             "href": "%s/admin/desk?open=%s" % (
-                DESK.rstrip("/"), urllib.parse.quote(tid)),
+                _desk().rstrip("/"), urllib.parse.quote(tid)),
         })
     return out
 
@@ -1142,7 +1117,7 @@ def _worker_flags(w: Worker) -> List[Dict[str, object]]:
                 "labels": task_labels,
                 "founder_gated": founder_gated,
                 "href": "%s/admin/desk?open=%s" % (
-                    DESK.rstrip("/"), urllib.parse.quote(tid)),
+                    _desk().rstrip("/"), urllib.parse.quote(tid)),
             })
     return flags
 
@@ -1183,7 +1158,7 @@ def worker_model(local_root: str, name: str) -> Optional[Dict[str, object]]:
         "model": w.model or "default", "identity": w.identity,
         "workdir": os.path.abspath(w.workdir),
         "schedule": w.schedule or "", "owned": bool(cron),
-        "next_fire": nf.strftime("%Y-%m-%dT%H:%M:%SZ") if nf else "",
+        "next_fire": _utc_iso_z(nf) if nf else "",
         "budget_secs": w.budget_secs, "max_passes": w.max_passes,
         "queue": q, "queue_url": w.queue_url or "",
         "health": health["cls"], "why": health["why"],

@@ -12,9 +12,9 @@ from .ledger import Ledger
 def _board_url(port=None) -> str:
     """The board's own door — localhost by construction (the daemon binds
     127.0.0.1). Not a host seam: this is WorkForce's own surface, not a
-    worker's desk or workplace."""
-    from . import board
-    return "http://127.0.0.1:%d" % (port or board.DEFAULT_PORT)
+    worker's desk or workplace. Port from ``engine_api_url``."""
+    from ._utils import engine_api_url
+    return engine_api_url(port)
 
 
 def _command_present(cmd0: str) -> bool:
@@ -33,6 +33,29 @@ def _command_present(cmd0: str) -> bool:
     return shutil.which(cmd0) is not None
 
 
+def _papers_rel_for_section_52(contract: str) -> str:
+    """City-relative papers path for PROCESS §5.2 paste rows.
+
+    Host-neutral: no hard-coded city root — peel from ``…/workers/…`` or
+    ``…/.protocolcity/…`` markers so paste rows stay readable across hosts.
+    """
+    contract = (contract or "").strip()
+    if not contract:
+        return ""
+    parts = contract.replace("\\", "/").split("/")
+    # City-ops papers live under .protocolcity/… — prefer that marker so
+    # paste rows match ops law paths (not a bare ops/workers/… peel).
+    if ".protocolcity" in parts:
+        i = parts.index(".protocolcity")
+        return "/".join(parts[i:])
+    if "workers" in parts:
+        i = parts.index("workers")
+        if i > 0:
+            return "/".join(parts[i - 1 :])
+        return "/".join(parts[i:])
+    return parts[-1] if parts else ""
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="workforce",
                                      description="Employment infrastructure for agents.")
@@ -49,7 +72,7 @@ def main(argv=None) -> int:
     p_hire = sub.add_parser("hire", help="employ a worker (papers + roster row)")
     p_hire.add_argument("name", help="persona name (becomes the identity slug)")
     p_hire.add_argument("--workdir", required=True,
-                        help="cabinet / neighborhood absolute path")
+                        help="project folder (absolute path)")
     p_hire.add_argument("--role", default="", help="role title (e.g. Market Analyst)")
     p_hire.add_argument("--display", default="", help="Persona · Role (optional)")
     p_hire.add_argument("--kind", choices=("lane", "job"), default="lane")
@@ -142,7 +165,7 @@ def main(argv=None) -> int:
     )
     p_capacity.add_argument(
         "--desk", default="",
-        help="desk base URL (default: $WL_DESK_URL / $TP_DESK_URL)",
+        help="desk base URL (default: $WL_DESK_URL / $TP_DESK_URL / $WORKFORCE_DESK)",
     )
     p_capacity.add_argument(
         "--workspace", default="",
@@ -177,7 +200,7 @@ def main(argv=None) -> int:
     )
     p_host_audit.add_argument(
         "--desk", default="",
-        help="desk base URL (default: $WL_DESK_URL / $TP_DESK_URL)",
+        help="desk base URL (default: $WL_DESK_URL / $TP_DESK_URL / $WORKFORCE_DESK)",
     )
     p_host_audit.add_argument(
         "--author", default="workforce",
@@ -185,7 +208,8 @@ def main(argv=None) -> int:
     )
     p_host_audit.add_argument(
         "--include-run-logs", action="store_true",
-        help="reserved (slice 3) — ignored in v1; run tails not scanned yet",
+        help="also scan bounded tails of local/run/<worker>.out "
+             "(opt-in; default remains desk-only)",
     )
 
     p_digest = sub.add_parser(
@@ -211,7 +235,7 @@ def main(argv=None) -> int:
     )
     p_digest.add_argument(
         "--desk", default="",
-        help="desk base URL (default: $WL_DESK_URL / $TP_DESK_URL)",
+        help="desk base URL (default: $WL_DESK_URL / $TP_DESK_URL / $WORKFORCE_DESK)",
     )
     p_digest.add_argument(
         "--author", default="chief-of-staff",
@@ -225,7 +249,8 @@ def main(argv=None) -> int:
     p_doctor = sub.add_parser(
         "doctor",
         help="check roster health — dual-home drift, queue URLs, stale "
-             "needs:routing, unlanded shift commits",
+             "needs:routing, unlanded shift commits, "
+             "early-idle process decay",
     )
     p_doctor.add_argument(
         "--suite-roster", default="",
@@ -234,7 +259,7 @@ def main(argv=None) -> int:
     p_doctor.add_argument(
         "--desk", default="",
         help="desk base URL for stale-routing scan "
-             "(default: $WL_DESK_URL / $TP_DESK_URL)",
+             "(default: $WL_DESK_URL / $TP_DESK_URL / $WORKFORCE_DESK)",
     )
     p_doctor.add_argument(
         "--product", action="append", default=[],
@@ -249,6 +274,11 @@ def main(argv=None) -> int:
         "--repair", action="store_true",
         help="remove needs:routing from done/canceled only (default is "
              "report/dry-run; never touches open tickets or other labels)",
+    )
+    p_doctor.add_argument(
+        "--limit", type=int, default=0,
+        help="when repairing stale needs:routing, strip at most N terminal "
+             "tickets this pass (0 = no bound; wf-193 bounded cadence)",
     )
 
     p_report = sub.add_parser("report", help="cost-rollup reports")
@@ -323,12 +353,34 @@ def main(argv=None) -> int:
     p_repin.add_argument(
         "--desk",
         default="",
-        help="desk base URL for For You drop (default: $WL_DESK_URL / $TP_DESK_URL)",
+        help="desk base URL for For You drop (default: $WL_DESK_URL / $TP_DESK_URL / $WORKFORCE_DESK)",
     )
     p_repin.add_argument(
         "--no-cap",
         action="store_true",
         help="skip seats_per_day / cooldown enforcement (tests / citizen override)",
+    )
+
+    p_skill_draft = sub.add_parser(
+        "skill-draft",
+        help="extract a draft SKILL.md from a close-out comment (no auto-L0 — wf-204)",
+    )
+    p_skill_draft.add_argument("worker", help="signing worker slug")
+    p_skill_draft.add_argument("ticket_id", help="work-order id (e.g. wf-204)")
+    p_skill_draft.add_argument("--title", required=True, help="WO title (skill heading + slug base)")
+    p_skill_draft.add_argument("--text", default="", help="close-out comment body")
+    p_skill_draft.add_argument(
+        "--text-file", default="",
+        help="read close-out text from file (- = stdin)",
+    )
+    p_skill_draft.add_argument("--sha", default="", help="landing commit SHA")
+    p_skill_draft.add_argument(
+        "--outdir", default="",
+        help="base output dir for draft (default: workers/<worker>/skills-drafts/)",
+    )
+    p_skill_draft.add_argument(
+        "--live", action="store_true",
+        help="write the draft file (default is dry-run print only)",
     )
 
     args = parser.parse_args(argv)
@@ -341,7 +393,7 @@ def main(argv=None) -> int:
 
     if args.cmd == "board":
         from . import board
-        board.serve(args.port or board.DEFAULT_PORT, local_root)
+        board.serve(args.port, local_root)  # None → live engine_port()
         return 0
 
     if args.cmd == "open":
@@ -522,6 +574,13 @@ def main(argv=None) -> int:
                 )
             else:
                 print("Drain loop: no single-pass lane notes")
+            # wf-176 / ALWAYS_WORK §9 — early-idle process decay: soft-ceiling
+            # STOP (or WARN breadcrumb) while ready remained open. Note only
+            # (one rollup line — never per-hand Map gold).
+            from . import early_idle as early_idle_mod
+
+            ei_findings = early_idle_mod.scan_early_idle(local_root, er.workers)
+            print(early_idle_mod.format_early_idle_report(ei_findings))
             # wf-171 — unlanded shift commits (note only; never auto-push).
             # Detects board-green vs code-on-main drift when hands close
             # without PROCESS §5.1.3 land-on-origin/main.
@@ -543,9 +602,11 @@ def main(argv=None) -> int:
                 )
             else:
                 print("Daily fire ceiling: no seats pinned (max_fires_per_day=0)")
-            # §5.2 registry coverage: roster identity must appear in
-            # PROCESS.md so board writes stay attributable.
-            from .identity_registry import load_section_52_ids
+            # §5.2 registry coverage: roster identity must
+            # appear in PROCESS.md so board writes stay attributable. Missing
+            # rows are faults; doctor also prints paste-ready table lines so
+            # the citizen/worklane hand can register without inventing copy.
+            from .identity_registry import format_section_52_row, load_section_52_ids
 
             reg_ids, process_path = load_section_52_ids()
             if process_path is None:
@@ -556,20 +617,45 @@ def main(argv=None) -> int:
             elif not reg_ids:
                 print("§5.2 registry: %s — no agent-id rows parsed" % process_path)
             else:
-                missing = []
+                missing_workers = []  # (ident, Worker)
                 for w_name, w in er.workers.items():
                     ident = (w.identity or w_name or "").strip()
                     if ident and ident not in reg_ids:
-                        missing.append(ident)
-                if missing:
+                        missing_workers.append((ident, w))
+                if missing_workers:
+                    # Dedupe by identity, stable sort.
+                    by_id = {}
+                    for ident, w in missing_workers:
+                        by_id.setdefault(ident, w)
                     print(
                         "§5.2 registry: %s (%d ids) — %d missing"
-                        % (process_path, len(reg_ids), len(missing))
+                        % (process_path, len(reg_ids), len(by_id))
                     )
-                    for ident in sorted(set(missing)):
+                    for ident in sorted(by_id):
                         faults.append(
                             "IDENTITY: roster id %r missing from PROCESS §5.2"
                             % ident
+                        )
+                    print(
+                        "§5.2 paste-ready (citizen / worklane PROCESS.md; "
+                        "engine never writes across the boundary):"
+                    )
+                    for ident in sorted(by_id):
+                        w = by_id[ident]
+                        display = (getattr(w, "display", "") or "").strip()
+                        if " · " in display:
+                            display = display.split(" · ", 1)[0].strip()
+                        papers = _papers_rel_for_section_52(
+                            getattr(w, "contract", "") or ""
+                        )
+                        print(
+                            "  "
+                            + format_section_52_row(
+                                ident,
+                                display=display or ident,
+                                papers_rel=papers,
+                                feed=True,
+                            )
                         )
                 else:
                     print(
@@ -651,10 +737,12 @@ def main(argv=None) -> int:
             products = list(getattr(args, "product", None) or [])
             products = [p.strip() for p in products if p and str(p).strip()]
             try:
+                limit_n = int(getattr(args, "limit", 0) or 0)
                 stale = routing_mod.scan_stale_routing(
                     desk=desk,
                     products=products or None,
                     repair=bool(getattr(args, "repair", False)),
+                    limit=limit_n if limit_n > 0 else None,
                 )
                 print(routing_mod.format_report(stale))
                 # Live repair failures are faults; dry-run residue is a note.
@@ -797,12 +885,7 @@ def main(argv=None) -> int:
         desk = (getattr(args, "desk", None) or "").strip()
         worker = (getattr(args, "worker", None) or "").strip()
         author = (getattr(args, "author", None) or "workforce").strip() or "workforce"
-        if getattr(args, "include_run_logs", False):
-            print(
-                "host-audit: --include-run-logs reserved for slice 3 "
-                "(ignored this release)",
-                file=sys.stderr,
-            )
+        include_run_logs = bool(getattr(args, "include_run_logs", False))
         any_ungated = False
         any_error = False
         for product in products:
@@ -812,6 +895,8 @@ def main(argv=None) -> int:
                 worker=worker,
                 author=author,
                 dry_run=dry,
+                include_run_logs=include_run_logs,
+                local_root=local_root if include_run_logs else "",
             )
             print(host_audit_mod.format_receipt(summary))
             if (summary.get("ungated_hits") or 0) > 0:
@@ -961,6 +1046,45 @@ def main(argv=None) -> int:
             if dry:
                 print("  drop: dry-run only (pass --live to POST inbox card)")
         print("  apply: python3 -m workforce repin --apply %s" % stage.get("path"))
+        return 0
+
+    if args.cmd == "skill-draft":
+        from . import skill_draft as sd_mod
+
+        text = (getattr(args, "text", None) or "").strip()
+        text_file = (getattr(args, "text_file", None) or "").strip()
+        if text_file:
+            if text_file == "-":
+                text = sys.stdin.read()
+            else:
+                try:
+                    with open(text_file, "r", encoding="utf-8") as fh:
+                        text = fh.read()
+                except OSError as exc:
+                    print("skill-draft: text-file: %s" % exc, file=sys.stderr)
+                    return 1
+        dry = not bool(getattr(args, "live", False))
+        outdir = (getattr(args, "outdir", None) or "").strip()
+        if not outdir and not dry:
+            outdir = os.path.join("workers", args.worker, "skills-drafts")
+        result = sd_mod.draft_from_closeout(
+            close_out_text=text,
+            worker=args.worker,
+            ticket_id=args.ticket_id,
+            title=args.title,
+            sha=(getattr(args, "sha", None) or "").strip(),
+            outdir=outdir,
+            dry_run=dry,
+        )
+        if not result.get("allowed"):
+            print("skill-draft: %s" % result.get("reason", "not allowed"), file=sys.stderr)
+            return 1
+        if dry:
+            print("skill-draft: dry-run · slug=%s · path=%s" % (result["slug"], result["path"]))
+            print(result["content"])
+            print("skill-draft: dry-run only (pass --live to write)")
+        else:
+            print("skill-draft: wrote %s" % result["path"])
         return 0
 
     try:

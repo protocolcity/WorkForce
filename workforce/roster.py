@@ -274,6 +274,15 @@ def load(path: Optional[str] = None, base: Optional[str] = None) -> Roster:
                     spec["max_passes"] = 0
                 else:
                     spec["max_passes"] = 1
+            # wf-191 / wf-143 — city-ops workdir is the Map Office-staff bay
+            # source. Pre-wf-143 rows (and accidental staff=false) still bay
+            # correctly at load without rewriting local/roster.json. Hire
+            # already persists staff=true for new city-ops seats; this is the
+            # read-side heal. Lazy import: hire imports load from this module.
+            from .hire import is_city_ops_workdir
+
+            if is_city_ops_workdir(spec.get("workdir") or ""):
+                spec["staff"] = True
             w = Worker(name=name, **spec)
             w.validate()
             if w.identity in identities:

@@ -24,6 +24,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from ._utils import _OWNER_MARKER_RE, latest_owner_id
+
 # Labels that are seats (routing), not area tags.
 _WORKER_LABEL_RE = re.compile(r"^worker:(.+)$")
 
@@ -42,9 +44,6 @@ _NON_HAND_OWNERS = frozenset({
     "citizen",
     "host",
 })
-
-# Ownership marker (PROCESS §5).
-_OWNER_MARKER_RE = re.compile(r"(?m)^Owner:\s*([^\s:(]+)")
 
 # Completion / close-out shapes. Lifecycle keys on literal Completed: and
 # Verification:; informal trailers also used "Completed —".
@@ -86,12 +85,11 @@ ACTIONS = (
 
 
 def worker_seat_labels(labels: Optional[List[Any]]) -> List[str]:
-    """Return all worker:<id> labels present (stable order, first = primary)."""
+    """Return all worker:<id> labels present (stable order, first = primary, deduped)."""
     out: List[str] = []
     for raw in labels or []:
         s = str(raw or "").strip()
-        m = _WORKER_LABEL_RE.match(s)
-        if m:
+        if _WORKER_LABEL_RE.match(s) and s not in out:
             out.append(s)
     return out
 
@@ -99,19 +97,6 @@ def worker_seat_labels(labels: Optional[List[Any]]) -> List[str]:
 def primary_worker_seat(labels: Optional[List[Any]]) -> Optional[str]:
     seats = worker_seat_labels(labels)
     return seats[0] if seats else None
-
-
-def latest_owner_id(comments: Optional[List[dict]]) -> Optional[str]:
-    """Latest ``Owner: <id>`` marker in comment bodies (PROCESS §5 claim)."""
-    owner: Optional[str] = None
-    for c in comments or []:
-        if not isinstance(c, dict):
-            continue
-        body = str(c.get("body") or "")
-        matches = _OWNER_MARKER_RE.findall(body)
-        if matches:
-            owner = matches[-1].strip()
-    return owner or None
 
 
 def is_hand_like_owner(owner_id: Optional[str]) -> bool:
@@ -271,7 +256,7 @@ def blocked_release_body(
     else:
         next_step = (
             "Stamped needs:routing and released to backlog — route a hand "
-            "(tk label <id> --add worker:<hand>) before reclaiming; do not "
+            "(wl label <id> --add worker:<hand>) before reclaiming; do not "
             "leave Map No-hand silent."
         )
     reason = (

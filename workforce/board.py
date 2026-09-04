@@ -1,7 +1,7 @@
 """The board — the workforce office, served on its own port.
 
-Renders the JOIN the desk can't see alone: roster + shift ledgers on one
-side, desk activity on the other. Three data sources, all seams:
+JSON API for the suite Map (roster + shift ledgers + desk join). Three
+data sources, all seams:
 
   1. The roster + ledgers (this product's own state).
   2. ``launchctl list`` — TRANSITIONAL adapter for the legacy hand-rolled
@@ -9,8 +9,8 @@ side, desk activity on the other. Three data sources, all seams:
   3. The desk's published dev feed (activity + summary) — the desk half of
      the join, consumed over HTTP, never imported.
 
-Own port (default 8797), own theme. Law lens: /law/<worker>/<contract|prompt>
-renders the exact file the next shift will read — a lens, never a copy.
+Own port (default 8797). Glass is the suite Map at :8801/roster — this
+process serves ``/api/*`` only.
 """
 
 import concurrent.futures
@@ -19,10 +19,12 @@ import html
 import json
 import os
 import re
+import sys
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, Optional
 
+from ._utils import _ago, _fmt_fire, _parse_iso_z, _utc_iso_z, _utcnow, engine_port
 from .daemon import adaptive_backoff_secs, heartbeat_status, read_heartbeat
 from .engine import empty_run_streak
 from .ledger import Ledger, parse_shifts
@@ -30,31 +32,42 @@ from .roster import RosterError
 from .schedule import maybe_cron, next_fire_utc
 
 from .api.roster import (
-    DEFAULT_PORT, DESK, CITYHALL, _BRAND_TITLE,
+    DEFAULT_PORT, CITYHALL, _BRAND_TITLE,
     generation_token, scene_model, scene_tape, report_model, worker_model,
-    _load_roster, _worker_queue, _worker_health, _utcnow, _launchctl_rota,
+    _load_roster, _worker_queue, _worker_health, _launchctl_rota,
     _cli_label, _kind_label, _worker_identity_aliases, _worker_holdings,
     _worker_ready_teaser, _worker_flags, _desk_json, _law_stack,
-    _contract_rules, _git_law_log, _workplaces, _ago, _fmt_fire,
+    _contract_rules, _git_law_log, _workplaces,
     _platforms, _display_names, _sector_for_worker, _city_folder_name,
-    _legacy_plist, _service_config, _last_ledger_line, _queue_human_link,
+    _legacy_plist, _service_config, _queue_human_link,
     _desk_owner_of, OUTCOME_CLS, _IN_CITY, _KIND_LABELS, LAUNCH_AGENTS,
     _REPORT_WINDOW_DAYS, _REPORT_QUIET_HOURS, _REPORT_WINDOWS,
     _FAULT_OUTCOMES, RULE_HEADINGS, _WEDGE_SHIFTS,
 )
-from .surfaces.roster import (
-    CSS, FIRE_JS, SCENE_CSS, SCENE_JS, REPORT_CSS, REPORT_JS,
-    render_board, render_scene, render_settings, render_report,
-    render_shifts, render_worker, render_out, render_legacy_log, render_law,
-    _tail_page,
-)
-
 # ONE DOOR: this process is the WorkForce API (roster/scene/dispatch).
-# Citizen UI lives on suite :8801/roster. Opt out for host debug:
-# WORKFORCE_API_ONLY=0.
-_API_ONLY_RAW = (os.environ.get("WORKFORCE_API_ONLY") or "1").strip().lower()
-API_ONLY = _API_ONLY_RAW not in ("0", "false", "no", "off")
+# Citizen UI is the suite Map. WORKFORCE_API_ONLY=0 is not a supported
+# mode — refuse it; never serve HTML glass from this port.
+API_ONLY = True
 SUITE_URL = (os.environ.get("SUITE_URL") or "http://127.0.0.1:8801").rstrip("/")
+
+
+def _map_roster_url() -> str:
+    return SUITE_URL + "/roster"
+
+
+def _html_escape_requested() -> bool:
+    raw = (os.environ.get("WORKFORCE_API_ONLY") or "1").strip().lower()
+    return raw in ("0", "false", "no", "off")
+
+
+def _refuse_html_escape() -> None:
+    """Fail closed: a host still exporting API_ONLY=0 gets one line, no HTML."""
+    if _html_escape_requested():
+        print(
+            "WORKFORCE_API_ONLY=0 is not supported — open the suite Map at %s"
+            % _map_roster_url(),
+            file=sys.stderr,
+        )
 
 
 def _out_path(local_root: str, name: str) -> str:
@@ -219,55 +232,42 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._json_response({"ok": False, "msg": "not found"}, 404)
 
+    def _reply_html_retired(self) -> None:
+        """Non-/api/* is gone — one line pointing at Map."""
+        suite = _map_roster_url()
+        msg = "WorkForce HTML is retired — open the suite Map at %s" % suite
+        accept = (self.headers.get("Accept") or "").lower()
+        if "application/json" in accept and "text/html" not in accept:
+            self._json_response({
+                "ok": False,
+                "error": msg,
+                "api": "/api/scene",
+                "suite": suite,
+            }, 410)
+            return
+        body = (
+            "<!doctype html><meta charset='utf-8'>"
+            "<title>WorkForce API</title>"
+            "<p>%s — <a href='%s'>%s</a></p>"
+        ) % (html.escape(msg), html.escape(suite), html.escape(suite))
+        data = body.encode("utf-8")
+        try:
+            self.send_response(410)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self._client_gone_write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def do_GET(self) -> None:  # noqa: N802
         path_only = (self.path or "").split("?", 1)[0]
-        # API-only: keep /api/*; retire HTML product pages → suite :8801.
-        if API_ONLY and not path_only.startswith("/api/"):
-            suite = SUITE_URL + "/roster"
-            accept = (self.headers.get("Accept") or "").lower()
-            if "text/html" in accept or "*/*" in accept or not accept:
-                body = (
-                    "<!doctype html><meta charset='utf-8'>"
-                    "<title>WorkForce API</title>"
-                    "<p>WorkForce HTML is retired — open the suite: "
-                    "<a href='%s'>%s</a></p>"
-                    "<p class='dim'>This port serves <code>/api/*</code> only "
-                    "(API_ONLY). Set <code>WORKFORCE_API_ONLY=0</code> for "
-                    "legacy board HTML.</p>"
-                ) % (html.escape(suite), html.escape(suite))
-                data = body.encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-            else:
-                payload = {
-                    "ok": False,
-                    "error": "workforce HTML retired (WORKFORCE_API_ONLY); "
-                             "open suite at %s" % suite,
-                    "api": "/api/scene",
-                    "suite": suite,
-                }
-                self._json_response(payload, 404)
+        if not path_only.startswith("/api/"):
+            self._reply_html_retired()
             return
-        if self.path == "/" or self.path.startswith("/?"):
-            # oc-20 root-merge: the living scene IS the room.
-            body, code = render_scene(self.local_root,
-                                      can_dispatch=self.daemon is not None), 200
-        elif self.path == "/board" or self.path.startswith("/board?"):
-            body, code = render_board(self.local_root, can_dispatch=self.daemon is not None), 200
-        elif self.path == "/report" or self.path.startswith("/report?"):
-            # oc-22: the floor's strategic view — the footer's Overview slot
-            body, code = render_report(self.local_root,
-                                       days=_days_param(self.path)), 200
-        elif self.path == "/settings" or self.path.startswith("/settings?"):
-            # D1 Settings bay — daemon / root / record doors (suite perimeter)
-            body, code = render_settings(
-                self.local_root, can_dispatch=self.daemon is not None), 200
-        elif self.path == "/api/report" or self.path.startswith("/api/report?"):
-            # one seam, three consumers: the /report page, the oc-15 daily
-            # brief (future), and anything above this board
+        if self.path == "/api/report" or self.path.startswith("/api/report?"):
+            # one seam: suite Map, the oc-15 daily brief (future), and
+            # anything above this board
             data = json.dumps(report_model(
                 self.local_root, days=_days_param(self.path))).encode("utf-8")
             try:
@@ -278,12 +278,6 @@ class _Handler(BaseHTTPRequestHandler):
                 self._client_gone_write(data)
             except (BrokenPipeError, ConnectionResetError):
                 pass
-            return
-        elif self.path == "/dispatch" or self.path.startswith("/dispatch?"):
-            # legacy address from the pre-merge layout — the room moved to /
-            self.send_response(302)
-            self.send_header("Location", "/")
-            self.end_headers()
             return
         elif self.path.split("?")[0] == "/api/scene":
             # pc-346: ?light=1 skips ledger tails / launchctl / runtime detect
@@ -431,32 +425,6 @@ class _Handler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
             return
-        elif self.path.startswith("/law/"):
-            parts = self.path.strip("/").split("/")
-            body = render_law(self.local_root, parts[1], parts[2]) if len(parts) == 3 else None
-            code = 200 if body else 404
-            body = body or "<p>no such law</p>"
-        elif self.path.startswith("/worker/"):
-            parts = self.path.strip("/").split("/")
-            body = render_worker(self.local_root, parts[1]) if len(parts) == 2 else None
-            code = 200 if body else 404
-            body = body or "<p>no such worker</p>"
-        elif self.path.startswith("/shifts/"):
-            parts = self.path.strip("/").split("/")
-            body = render_shifts(self.local_root, parts[1]) if len(parts) == 2 else None
-            code = 200 if body else 404
-            body = body or "<p>no such worker</p>"
-        elif self.path.startswith("/out/"):
-            parts = self.path.strip("/").split("/")
-            body = render_out(self.local_root, parts[1]) if len(parts) == 2 else None
-            code = 200 if body else 404
-            body = body or "<p>no such worker</p>"
-        elif self.path.startswith("/legacylog/"):
-            parts = self.path.strip("/").split("/")
-            body = (render_legacy_log(_launchctl_rota(self.local_root), parts[1])
-                    if len(parts) == 2 else None)
-            code = 200 if body else 404
-            body = body or "<p>no such legacy log</p>"
         elif self.path.split("?")[0] == "/api/workers":
             # the §8 machine-readable seam: roster × health × next fire,
             # for anything above this board (e.g. a city lens).
@@ -504,13 +472,8 @@ class _Handler(BaseHTTPRequestHandler):
                         if w.empty_run_pause and w.queue_url and e_streak >= threshold:
                             resting = True  # wf-125 probe gate holds while empty
                         elif backoff_secs > 0 and e_last:
-                            try:
-                                _lastdt = datetime.datetime.strptime(
-                                    e_last, "%Y-%m-%dT%H:%M:%SZ"
-                                ).replace(tzinfo=datetime.timezone.utc)
-                                resting = (_utcnow() - _lastdt).total_seconds() < backoff_secs
-                            except ValueError:
-                                resting = False
+                            _lastdt = _parse_iso_z(e_last)
+                            resting = bool(_lastdt) and (_utcnow() - _lastdt).total_seconds() < backoff_secs
                         else:
                             resting = False
                     workers.append({
@@ -523,7 +486,7 @@ class _Handler(BaseHTTPRequestHandler):
                         "schedule": w.schedule, "owned": bool(cron),
                         "owner": w.owner or "",
                         "skill": w.skill or "",
-                        "next_fire": nf.strftime("%Y-%m-%dT%H:%M:%SZ") if nf else "",
+                        "next_fire": _utc_iso_z(nf) if nf else "",
                         "queue": q, "queue_url": w.queue_url or "",
                         "health": health_cls,
                         "empty_streak": e_streak,
@@ -543,7 +506,7 @@ class _Handler(BaseHTTPRequestHandler):
                 pass
             return
         elif self.path == "/api/health":
-            payload = {"ok": True, "port": DEFAULT_PORT}
+            payload = {"ok": True, "port": int(self.server.server_address[1])}
             data = json.dumps(payload).encode("utf-8")
             try:
                 self.send_response(200)
@@ -553,16 +516,7 @@ class _Handler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
             return
-        else:
-            body, code = "<p>not found</p>", 404
-        data = body.encode("utf-8")
-        try:
-            self.send_response(code)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self._client_gone_write(data)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+        self._json_response({"ok": False, "msg": "not found"}, 404)
 
     def log_message(self, fmt: str, *args: object) -> None:
         pass  # quiet; the ledger is the record that matters
@@ -581,7 +535,8 @@ class _Handler(BaseHTTPRequestHandler):
 def make_server(port: Optional[int] = None, local_root: str = "local",
                 daemon: Optional[object] = None) -> ThreadingHTTPServer:
     if port is None:
-        port = DEFAULT_PORT  # resolved at call time so tests/config can repoint
+        port = engine_port()  # live WORKFORCE_PORT; not import snapshot
+    _refuse_html_escape()
     _Handler.local_root = local_root
     _Handler.daemon = daemon  # None = read-only board (standalone)
     # ThreadingHTTPServer so LIVE-C SSE tails do not block /api/scene.

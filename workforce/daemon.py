@@ -27,7 +27,6 @@ Mechanics:
 import datetime
 import json
 import os
-import re
 import signal
 import sys
 import threading
@@ -38,15 +37,21 @@ import urllib.request
 from typing import Dict, List, Optional, Set, Tuple
 
 from . import capacity as capacity_mod, engine, roster as roster_mod
+from ._utils import (
+    _atomic_write_json,
+    _day_str,
+    _parse_iso_z,
+    _utc_iso_z,
+    _utcnow,
+    desk_base_url,
+)
 from .schedule import fire_minute_key, matches_at, maybe_cron, next_fire_utc
 
 HEARTBEAT = "daemon.json"
 EVENT_CURSOR = "event_cursors.json"
 STALE_TICK_SECS = 180  # heartbeat older than this = daemon presumed dead
-# Desk base for event-trigger. Same default as board.
-DESK_URL = os.environ.get(
-    "WORKFORCE_DESK", os.environ.get("WORKFORCE_DESK", "http://127.0.0.1:8799")
-)
+# Event-trigger desk URL is live ``desk_base_url()`` at poll time (wf-74 /
+# wf-218) so WL_DESK_URL and WORKFORCE_DESK cannot split-brain.
 # Debounce: do not re-fire the same worker more often than this (seconds).
 EVENT_FIRE_COOLDOWN_SECS = 90
 
@@ -71,12 +76,8 @@ def adaptive_backoff_secs(worker: "roster_mod.Worker", streak: int) -> int:
     return ADAPTIVE_BACKOFF_LADDER[step]
 
 
-def _utcnow() -> datetime.datetime:
-    return datetime.datetime.now(datetime.timezone.utc)
-
-
 def _iso(dt: Optional[datetime.datetime]) -> str:
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ") if dt else ""
+    return _utc_iso_z(dt) if dt is not None else ""
 
 
 def pid_alive(pid: int) -> bool:
@@ -100,10 +101,8 @@ def heartbeat_status(local_root: str) -> str:
     hb = read_heartbeat(local_root)
     if not hb or not pid_alive(hb.get("pid", 0)):
         return "stopped"
-    try:
-        last = datetime.datetime.strptime(
-            hb["last_tick"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
-    except (KeyError, ValueError):
+    last = _parse_iso_z(hb.get("last_tick") or "")
+    if last is None:
         return "stale"
     return "running" if (_utcnow() - last).total_seconds() < STALE_TICK_SECS else "stale"
 
@@ -142,7 +141,7 @@ class Daemon:
         return dict(fired) if isinstance(fired, dict) else {}
 
     def _log(self, msg: str) -> None:
-        print("%s daemon %s" % (_iso(_utcnow()), msg), flush=True)
+        print("%s daemon %s" % (_utc_iso_z(), msg), flush=True)
 
     def _roster(self) -> Optional[roster_mod.Roster]:
         try:
@@ -186,11 +185,7 @@ class Daemon:
             "wakes": dict(self._wakes),   # wf-149 last wake stamp per worker (streak floor)
             "workers": workers,
         }
-        path = os.path.join(self.local_root, HEARTBEAT)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2)
-        os.replace(tmp, path)
+        _atomic_write_json(os.path.join(self.local_root, HEARTBEAT), payload, prefix=".daemon-")
 
     def _fire(self, worker: roster_mod.Worker) -> None:
         rc = engine.dispatch(worker, self.local_root)
@@ -234,6 +229,9 @@ class Daemon:
 
         The streak is floored at the last wake stamp, so a wake returns the lane
         to base cadence in every mode. Manual fire_now bypasses this gate.
+
+        wf-231 / pc-1419: empty-run backoff may hide a seat whose feed is
+        empty — that is correct. Mill chew spawn is retired.
         """
         threshold = max(1, int(getattr(worker, "empty_run_threshold", 3) or 3))
         streak, last_ts = engine.empty_run_streak(
@@ -255,11 +253,8 @@ class Daemon:
             backoff = adaptive_backoff_secs(worker, streak)
         if backoff <= 0 or not last_ts:
             return True
-        try:
-            last = datetime.datetime.strptime(
-                last_ts, "%Y-%m-%dT%H:%M:%SZ"
-            ).replace(tzinfo=datetime.timezone.utc)
-        except ValueError:
+        last = _parse_iso_z(last_ts)
+        if last is None:
             return True
         age = ((now or _utcnow()) - last).total_seconds()
         return age >= backoff
@@ -311,11 +306,8 @@ class Daemon:
                 break
         if not newest_ts:
             return False, streak, backoff
-        try:
-            last = datetime.datetime.strptime(
-                newest_ts, "%Y-%m-%dT%H:%M:%SZ"
-            ).replace(tzinfo=datetime.timezone.utc)
-        except ValueError:
+        last = _parse_iso_z(newest_ts)
+        if last is None:
             return False, streak, backoff
         age = ((now or _utcnow()) - last).total_seconds()
         if age < backoff:
@@ -407,7 +399,7 @@ class Daemon:
         Idempotent: write_daily_cost_report skips if the file already exists.
         Only called when roster is available; exceptions are logged, not raised.
         """
-        day = now.strftime("%Y-%m-%d")
+        day = _day_str(now)
         if self._cost_day == day:
             return
         self._cost_day = day
@@ -427,7 +419,7 @@ class Daemon:
         a For You gold card without a host session. Idempotent via inbox_label.
         Only called when roster is available; exceptions are logged, not raised.
         """
-        day = now.strftime("%Y-%m-%d")
+        day = _day_str(now)
         if self._cap_day == day:
             return
         self._cap_day = day
@@ -473,6 +465,11 @@ class Daemon:
 
         Same engine path as a scheduled fire; the §3 lock still guarantees
         single-flight, so a manual fire during a shift is a clean SKIP.
+
+        wf-222: run §4 preflight on this thread before spawn so
+        POST /api/dispatch returns the skip (low disk, CLI missing, queue
+        empty) instead of 200 "dispatched" followed by a thread that dies
+        as SKIP. Clock tick and wake_now stay async.
         """
         roster = self._roster()
         if not roster:
@@ -482,7 +479,14 @@ class Daemon:
         prev = self._threads.get(name)
         if prev and prev.is_alive():
             return False, "shift already in flight"
-        t = threading.Thread(target=self._fire, args=(roster.workers[name],),
+        worker = roster.workers[name]
+        try:
+            engine._preflight(worker)
+        except engine._Skip as skip:
+            return False, str(skip)
+        except engine.InfraError as exc:
+            return False, str(exc)
+        t = threading.Thread(target=self._fire, args=(worker,),
                              daemon=False, name="manual-%s" % name)
         self._threads[name] = t
         t.start()
@@ -509,7 +513,7 @@ class Daemon:
         if last is not None and (mono - last) < WAKE_DEBOUNCE_SECS:
             return True, "debounced (woken <%ds ago)" % int(WAKE_DEBOUNCE_SECS)
         self._wake_monotonic[name] = mono
-        self._wakes[name] = _iso(_utcnow())  # reset adaptive backoff to base
+        self._wakes[name] = _utc_iso_z()  # reset adaptive backoff to base
         if self._draining:
             return False, "draining — no new fires"
         prev = self._threads.get(name)
@@ -636,7 +640,7 @@ class Daemon:
             "since": str(max(0, int(since))),
             "limit": "100",
         })
-        url = "%s/api/events?%s" % (DESK_URL.rstrip("/"), q)
+        url = "%s/api/events?%s" % (desk_base_url().rstrip("/"), q)
         try:
             req = urllib.request.Request(url, headers={"Accept": "application/json"})
             with urllib.request.urlopen(req, timeout=4) as r:
@@ -805,7 +809,11 @@ class Daemon:
             # Event poll cadence ~15s; clock still fires on minute boundary
             # via tick() when the wait ends near :00.
             wait = min(15.0, max(1.0, 60.0 - (now % 60.0)))
+            _in_flight_pre = set(self.in_flight())
             self._wake.wait(timeout=wait)
+            # wf-203: flush immediately if any worker thread exited during the wait
+            if _in_flight_pre - set(self.in_flight()):
+                self._write_heartbeat(_utcnow(), self._roster())
 
 
 def default_service_path() -> str:

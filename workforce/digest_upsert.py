@@ -7,7 +7,7 @@ day** when a shift does run.
 
 Host-neutral: desk base URL from env / arg (never hard-coded product path
 in the engine core). Pure planning is free of I/O; HTTP goes through
-injectable ``_req`` + ``desk_writes_allowed`` (capacity hermetic guard).
+injectable ``_req`` + ``hermetic_dry_run`` (capacity hermetic guard).
 
 Default is dry-run receipt — never mint a live digest without explicit
 ``dry_run=False`` and desk writes allowed.
@@ -16,16 +16,11 @@ Default is dry-run receipt — never mint a live digest without explicit
 from __future__ import annotations
 
 import datetime
-import json
-import os
 import urllib.parse
 from typing import Any, Dict, List, Optional, Tuple
 
-from .capacity import _req, desk_writes_allowed
-
-DEFAULT_DESK = os.environ.get("WL_DESK_URL") or os.environ.get(
-    "TP_DESK_URL", "http://127.0.0.1:8799"
-)
+from ._utils import desk_base_url
+from .capacity import _req, hermetic_dry_run
 
 # Canonical title form (historical digests wf-140/144/148 used this shape).
 TITLE_PREFIX = "Chief-of-staff daily digest"
@@ -265,13 +260,12 @@ def upsert_cos_digest(
     - monkeypatch ``_req`` for full HTTP path tests
     """
     day = day or local_day_str()
-    desk = (desk or DEFAULT_DESK).rstrip("/")
+    desk = (desk or desk_base_url()).rstrip("/")
     project = (project or "workforce").strip() or "workforce"
     body = body if body is not None else ""
 
     # Hermetic: refuse live desk even if caller asked for dry_run=False.
-    hermetic_block = (not dry_run) and (not desk_writes_allowed())
-    effective_dry = bool(dry_run or hermetic_block)
+    effective_dry, hermetic_block = hermetic_dry_run(dry_run)
 
     if existing is None:
         if candidates is not None:

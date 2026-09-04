@@ -10,20 +10,24 @@ Default is **report-only** (planned strip set). Live label removes require
 ``repair=True`` **and** ``desk_writes_allowed()`` (pytest / WORKFORCE_NO_DESK
 stay hermetic). Never strips labels other than ``needs:routing``. Never
 touches backlog / in_progress / in_review.
+
+**Cadence:** ``python -m workforce doctor --repair`` is the
+idempotent cleanup path for existing terminal residue. Optional
+``--limit N`` bounds one pass when ops want partial batches. Ongoing
+prevention of *new* retention on status→terminal is a WorkLane transition
+concern (desk ``update_status`` / close); this module only sweeps after
+the fact.
 """
 
 from __future__ import annotations
 
-import os
 import urllib.parse
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from .capacity import desk_writes_allowed
-from .engine import _http_json
-
-DEFAULT_DESK = os.environ.get("WL_DESK_URL") or os.environ.get(
-    "TP_DESK_URL", "http://127.0.0.1:8799"
-)
+from ._utils import desk_base_url
+from .capacity import hermetic_dry_run
+from .engine import _http_json, _list_tasks
+from .marshal_release import worker_seat_labels
 
 STALE_LABEL = "needs:routing"
 TERMINAL_STATUSES = frozenset({"done", "canceled", "cancelled"})
@@ -48,6 +52,28 @@ def has_needs_routing(labels: Optional[Sequence[Any]]) -> bool:
     return False
 
 
+def strip_stale_routing_label(
+    labels: Optional[Sequence[Any]],
+) -> Tuple[List[str], bool]:
+    """Return ``(labels_without_needs_routing, did_strip)`` (pure).
+
+    Only removes ``needs:routing``. Other labels pass through unchanged.
+    Idempotent: a second call leaves the list unchanged and returns
+    ``did_strip=False``.
+    """
+    out: List[str] = []
+    stripped = False
+    for raw in labels or []:
+        s = str(raw).strip()
+        if not s:
+            continue
+        if s == STALE_LABEL:
+            stripped = True
+            continue
+        out.append(s)
+    return out, stripped
+
+
 def is_stale_routing_candidate(task: dict) -> bool:
     """True when a task is done/canceled and still carries needs:routing.
 
@@ -64,7 +90,9 @@ def is_stale_routing_candidate(task: dict) -> bool:
 def plan_strip(tasks: Sequence[dict]) -> List[dict]:
     """Return lightweight planned-strip rows (pure, stable order).
 
-    Each row: task_id, product (if known), status, title (truncated).
+    Each row: task_id, product (if known), status, title (truncated),
+    labels (copy — used when desk refuses NR-only strip due to a foreign
+    worker:* seat still on a terminal ticket, wf-193).
     """
     out: List[dict] = []
     seen = set()
@@ -79,47 +107,15 @@ def plan_strip(tasks: Sequence[dict]) -> List[dict]:
         product = (
             str(t.get("product") or t.get("project") or "").strip() or None
         )
+        labs = [str(x).strip() for x in (t.get("labels") or []) if str(x).strip()]
         out.append({
             "task_id": tid,
             "product": product,
             "status": str(t.get("status") or "").lower(),
             "title": title[:100],
+            "labels": labs,
         })
     out.sort(key=lambda r: (r.get("product") or "", r["task_id"]))
-    return out
-
-
-def _list_tasks(
-    desk: str,
-    product: str,
-    *,
-    status: str = "",
-    label: str = "",
-    limit: int = _LIST_LIMIT,
-    http: Optional[HttpFn] = None,
-) -> List[dict]:
-    http = http or _http_json
-    q: Dict[str, Any] = {"product": product, "limit": int(limit)}
-    if status:
-        q["status"] = status
-    if label:
-        q["label"] = label
-    data = http(
-        "GET",
-        "%s/api/admin/tasks?%s" % (desk.rstrip("/"), urllib.parse.urlencode(q)),
-        timeout=_HTTP_TIMEOUT,
-    )
-    if not isinstance(data, dict):
-        return []
-    tasks = data.get("tasks") or data.get("items") or []
-    out: List[dict] = []
-    for t in tasks:
-        if isinstance(t, dict):
-            # Stamp product for multi-store receipts when the desk omits it.
-            if product and not t.get("product") and not t.get("project"):
-                t = dict(t)
-                t["product"] = product
-            out.append(t)
     return out
 
 
@@ -171,7 +167,8 @@ def list_stale_routing(
     seen: Dict[str, dict] = {}
     for st in _LIST_STATUSES:
         for t in _list_tasks(
-            desk, product, status=st, label=STALE_LABEL, limit=limit, http=http,
+            desk, product, status=st, label=STALE_LABEL, limit=limit,
+            timeout=_HTTP_TIMEOUT, http=http,
         ):
             if not is_stale_routing_candidate(t):
                 continue
@@ -186,10 +183,22 @@ def remove_needs_routing(
     product: str,
     task_id: str,
     *,
+    extra_remove: Optional[Sequence[str]] = None,
     http: Optional[HttpFn] = None,
 ) -> dict:
-    """PATCH remove needs:routing only. Returns desk JSON (or error dict)."""
+    """PATCH remove needs:routing (+ optional extras). Returns desk JSON.
+
+    *extra_remove* is for the wf-193 terminal foreign-seat fallback: desk
+    guards refuse NR-only mutations while a retired worker:* remains, so
+    the repair pass may also drop those seats on done/canceled only.
+    Never used on open tickets (scan never plans them).
+    """
     http = http or _http_json
+    remove: List[str] = [STALE_LABEL]
+    for raw in extra_remove or []:
+        s = str(raw).strip()
+        if s and s not in remove:
+            remove.append(s)
     q = urllib.parse.urlencode({"product": product})
     url = "%s/api/admin/tasks/%s/labels?%s" % (
         desk.rstrip("/"),
@@ -199,9 +208,17 @@ def remove_needs_routing(
     return http(
         "PATCH",
         url,
-        {"remove": [STALE_LABEL], "add": []},
+        {"remove": remove, "add": []},
         timeout=_HTTP_TIMEOUT,
     )
+
+
+def _is_foreign_seat_refusal(resp: Any) -> bool:
+    """True when desk refused a label mutation for a foreign worker:* seat."""
+    if not isinstance(resp, dict):
+        return False
+    err = str(resp.get("error") or "")
+    return "not a hired seat" in err.lower()
 
 
 def scan_stale_routing(
@@ -209,6 +226,7 @@ def scan_stale_routing(
     desk: str = "",
     products: Optional[Sequence[str]] = None,
     repair: bool = False,
+    limit: Optional[int] = None,
     http: Optional[HttpFn] = None,
 ) -> Dict[str, Any]:
     """Scan one or many products; report or strip stale needs:routing.
@@ -216,11 +234,22 @@ def scan_stale_routing(
     *products* None → discover via desk. Empty list after discovery → note.
     *repair* False → dry-run planned strip only. Live repair also requires
     desk_writes_allowed(); otherwise forced dry-run (hermetic).
+    *limit* when a positive int → only the first N planned rows (stable
+    product+id order) are repaired; dry-run still reports the full total
+    so ops see remaining residue after a bounded pass.
     """
-    desk = (desk or DEFAULT_DESK).rstrip("/")
+    desk = (desk or desk_base_url()).rstrip("/")
     http = http or _http_json
-    hermetic_block = bool(repair) and (not desk_writes_allowed())
-    effective_repair = bool(repair) and (not hermetic_block)
+    effective_dry, hermetic_block = hermetic_dry_run(not repair)
+    effective_repair = not effective_dry
+    bound: Optional[int] = None
+    if limit is not None:
+        try:
+            n = int(limit)
+        except (TypeError, ValueError):
+            n = 0
+        if n > 0:
+            bound = n
 
     summary: Dict[str, Any] = {
         "ok": True,
@@ -229,10 +258,12 @@ def scan_stale_routing(
         "effective_repair": effective_repair,
         "dry_run": not effective_repair,
         "hermetic": hermetic_block,
+        "limit": bound,
         "label": STALE_LABEL,
         "products": [],
         "by_product": {},
         "planned": [],
+        "repair_set": [],
         "stripped": [],
         "errors": [],
         "total": 0,
@@ -282,11 +313,16 @@ def scan_stale_routing(
 
     summary["planned"] = all_planned
     summary["total"] = len(all_planned)
+    if bound is None:
+        repair_set = list(all_planned)
+    else:
+        repair_set = list(all_planned[:bound])
+    summary["repair_set"] = repair_set
 
     if not effective_repair:
         return summary
 
-    for row in all_planned:
+    for row in repair_set:
         tid = row["task_id"]
         product = str(row.get("product") or "")
         try:
@@ -296,6 +332,36 @@ def scan_stale_routing(
             summary["ok"] = False
             continue
         if isinstance(resp, dict) and resp.get("ok") is False:
+            # Terminal ticket may still carry a retired worker:* (e.g. worker:kc
+            # on done ts-2218). Desk foreign-seat guard blocks NR-only remove
+            # while that seat remains — drop worker:* with NR on retry.
+            if _is_foreign_seat_refusal(resp):
+                seats = worker_seat_labels(row.get("labels") or [])
+                if seats:
+                    try:
+                        resp2 = remove_needs_routing(
+                            desk, product, tid,
+                            extra_remove=seats,
+                            http=http,
+                        )
+                    except Exception as exc:
+                        summary["errors"].append(
+                            "%s: strip failed (foreign-seat retry): %.200s"
+                            % (tid, exc)
+                        )
+                        summary["ok"] = False
+                        continue
+                    if isinstance(resp2, dict) and resp2.get("ok") is False:
+                        err2 = resp2.get("error") or resp2
+                        summary["errors"].append(
+                            "%s: strip refused (foreign-seat retry): %s"
+                            % (tid, err2)
+                        )
+                        summary["ok"] = False
+                        continue
+                    summary["stripped"].append(tid)
+                    summary.setdefault("foreign_seat_retries", []).append(tid)
+                    continue
             err = resp.get("error") or resp
             summary["errors"].append("%s: strip refused: %s" % (tid, err))
             summary["ok"] = False
@@ -337,6 +403,9 @@ def format_report(summary: Dict[str, Any]) -> str:
         lines.append("  %s: %d" % (product, n))
 
     lines.append("  total: %d" % total)
+    bound = summary.get("limit")
+    if bound is not None:
+        lines.append("  limit: %d (bounded repair batch)" % int(bound))
 
     planned = summary.get("planned") or []
     if planned and dry:
@@ -349,13 +418,27 @@ def format_report(summary: Dict[str, Any]) -> str:
         if len(planned) > len(show):
             more = " … +%d more" % (len(planned) - len(show))
         lines.append("  would_strip: %s%s" % (ids, more))
-        lines.append("  (pass --repair to remove %s only on terminal)" % STALE_LABEL)
+        if bound is not None and int(bound) < total:
+            lines.append(
+                "  (pass --repair --limit %d for a bounded batch; "
+                "omit --limit to clear all terminal residue)" % int(bound)
+            )
+        else:
+            lines.append(
+                "  (pass --repair to remove %s only on terminal; "
+                "optional --limit N for a bounded batch)" % STALE_LABEL
+            )
     elif summary.get("stripped"):
         lines.append(
             "  stripped: %s" % ", ".join(summary["stripped"][:40])
         )
         if len(summary["stripped"]) > 40:
             lines.append("  … +%d more" % (len(summary["stripped"]) - 40))
+        remaining = total - len(summary.get("stripped") or [])
+        if remaining > 0 and bound is not None:
+            lines.append(
+                "  remaining: %d (re-run doctor --repair to continue)" % remaining
+            )
 
     for e in summary.get("errors") or []:
         lines.append("  error: %s" % e)

@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import workforce.api.roster as _api_roster  # noqa: E402
 from workforce.board import (  # noqa: E402
-    _contract_rules, _law_stack, _worker_flags, _worker_queue, render_law, worker_model,
+    _contract_rules, _law_stack, _worker_flags, _worker_queue, worker_model,
 )
 from workforce.ledger import open_claims, parse_shifts  # noqa: E402
 from workforce.roster import Roster, Worker  # noqa: E402
@@ -236,47 +236,6 @@ def test_contract_rules_picks_rule_headings(tmp_path):
     titles = [r["title"] for r in rules]
     assert "Lane" in titles and "Never touch" in titles
     assert "Notes" not in titles
-
-
-def test_render_law_level_badge(tmp_path):
-    """Law lens page for contract/prompt shows the L-level badge, not the opaque stackN index.
-    Back link is person-scoped (/worker/<name>), not the generic Roster root."""
-    import json
-
-    w = make_worker(tmp_path)
-    # Roster.json lives at <base>/local/roster.json; base = parent of local_root.
-    local = tmp_path / "city" / "local"
-    local.mkdir(exist_ok=True)
-    (local / "ledger").mkdir(exist_ok=True)
-    (local / "roster.json").write_text(json.dumps({"workers": {"x": {
-        "workdir": w.workdir, "contract": w.contract, "prompt": w.prompt,
-        "identity": "x", "command": ["true"],
-    }}}))
-
-    stack = _law_stack(w)
-    c_idx = next(i for i, e in enumerate(stack) if e["label"] == "contract")
-    p_idx = next(i for i, e in enumerate(stack) if e["label"] == "prompt")
-
-    # Contract paper (L2 in the standard 4-entry stack)
-    page = render_law(str(local), "x", "stack%d" % c_idx)
-    assert page is not None
-    c_badge = "%s · contract" % stack[c_idx]["level"]
-    assert c_badge in page          # "L2 · contract" appears in the rendered page
-    assert "CONTRACT.md" in page
-    assert "/worker/x" in page      # back link is person-scoped
-
-    # Prompt paper (L3)
-    page_p = render_law(str(local), "x", "stack%d" % p_idx)
-    assert page_p is not None
-    p_badge = "%s · prompt" % stack[p_idx]["level"]
-    assert p_badge in page_p        # "L3 · prompt" appears
-    assert "prompt.md" in page_p
-    assert "/worker/x" in page_p
-
-    # Named routes still resolve
-    page_named = render_law(str(local), "x", "contract")
-    assert page_named is not None
-    assert c_badge in page_named
 
 
 def test_vendor_limit_error_parses_as_distinct_outcome():
@@ -614,3 +573,130 @@ def test_client_gone_write_swallows_broken_pipe(tmp_path):
     h.path = "/api/scene?light=0"
     # must not raise
     h._client_gone_write(b'{"ok":true}')
+
+
+# ── wf-210: HTML roster deleted; API_ONLY=0 is not a supported escape ─────
+
+
+def _html_retired_setup(tmp_path):
+    local = tmp_path / "local"
+    local.mkdir()
+    (local / "ledger").mkdir()
+    return local
+
+
+def _one_shot_board(local_root):
+    import threading
+    import workforce.board as board_mod
+    httpd = board_mod.make_server(port=0, local_root=str(local_root))
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.handle_request, daemon=True)
+    t.start()
+    return httpd, port, t
+
+
+def test_non_api_get_points_at_map_not_api_only_escape(tmp_path):
+    """GET / is gone — one line at Map; no WORKFORCE_API_ONLY=0 hint."""
+    import urllib.error
+    import urllib.request
+
+    local = _html_retired_setup(tmp_path)
+    httpd, port, t = _one_shot_board(local)
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/" % port,
+            headers={"Accept": "text/html"},
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=5)
+            body = resp.read().decode("utf-8")
+            code = resp.getcode()
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8")
+            code = exc.code
+    finally:
+        httpd.server_close()
+        t.join(timeout=3)
+
+    assert code == 410
+    assert "8801/roster" in body
+    assert "WORKFORCE_API_ONLY=0" not in body
+    assert "legacy board" not in body.lower()
+
+
+def test_non_api_json_refuses_html(tmp_path):
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    local = _html_retired_setup(tmp_path)
+    httpd, port, t = _one_shot_board(local)
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/board" % port,
+            headers={"Accept": "application/json"},
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5)
+            raise AssertionError("expected 410")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 410
+            data = _json.loads(exc.read().decode("utf-8"))
+    finally:
+        httpd.server_close()
+        t.join(timeout=3)
+
+    assert data["ok"] is False
+    assert "Map" in data["error"]
+    assert data["api"] == "/api/scene"
+    assert data["suite"].endswith("/roster")
+
+
+def test_api_only_zero_does_not_serve_html(tmp_path, monkeypatch, capsys):
+    """A host still exporting WORKFORCE_API_ONLY=0 gets a refuse line, no HTML."""
+    import urllib.error
+    import urllib.request
+
+    monkeypatch.setenv("WORKFORCE_API_ONLY", "0")
+    local = _html_retired_setup(tmp_path)
+    httpd, port, t = _one_shot_board(local)
+    err = capsys.readouterr().err
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/" % port,
+            headers={"Accept": "text/html"},
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=5)
+            body = resp.read().decode("utf-8")
+            code = resp.getcode()
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8")
+            code = exc.code
+    finally:
+        httpd.server_close()
+        t.join(timeout=3)
+
+    assert "WORKFORCE_API_ONLY=0 is not supported" in err
+    assert "/roster" in err
+    assert code == 410
+    assert "8801/roster" in body
+    assert "legacy board" not in body.lower()
+
+
+def test_api_health_still_serves_json(tmp_path):
+    import json as _json
+    import urllib.request
+
+    local = _html_retired_setup(tmp_path)
+    httpd, port, t = _one_shot_board(local)
+    try:
+        resp = urllib.request.urlopen(
+            "http://127.0.0.1:%d/api/health" % port, timeout=5)
+        data = _json.loads(resp.read().decode("utf-8"))
+    finally:
+        httpd.server_close()
+        t.join(timeout=3)
+
+    assert data["ok"] is True
+    assert data["port"] == port

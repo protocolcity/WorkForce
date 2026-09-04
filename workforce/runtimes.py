@@ -9,6 +9,8 @@ dispatch-time concern, not a discovery signal.
 import datetime
 import os
 import shutil
+
+from ._utils import _utc_iso_z, _utcnow
 from typing import Dict, List, Optional
 
 from .ledger import parse_shifts
@@ -41,10 +43,7 @@ def _count_limit_hits(local_root: str, worker_name: str) -> int:
             return 0
         with open(ledger_path, "r", encoding="utf-8") as fh:
             text = "".join(fh.readlines()[-200:])
-        cutoff = (
-            datetime.datetime.now(datetime.timezone.utc)
-            - datetime.timedelta(days=_LIMIT_HIT_WINDOW_DAYS)
-        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        cutoff = _utc_iso_z(_utcnow() - datetime.timedelta(days=_LIMIT_HIT_WINDOW_DAYS))
         shifts = parse_shifts(text, limit=200)
         return sum(
             1 for s in shifts

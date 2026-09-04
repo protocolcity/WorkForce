@@ -215,6 +215,9 @@ def test_blocked_body_stamp_path_mentions_needs_routing():
     assert body.startswith("Blocked:")
     assert "needs:routing" in body
     assert "Next step:" in body
+    # wf-220 — tk is retired; teach the live CLI, never `tk label`.
+    assert "wl label <id> --add worker:<hand>" in body
+    assert "tk label" not in body
 
 
 def test_apply_label_plan_idempotent_stamp():
