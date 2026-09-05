@@ -133,7 +133,10 @@ def test_no_import_time_desk_snapshot():
     """DEFAULT_DESK / DESK must not freeze desk_base_url() at import."""
     root = Path(__file__).resolve().parents[1] / "workforce"
     cap = (root / "capacity.py").read_text(encoding="utf-8")
-    roster = (root / "api" / "roster.py").read_text(encoding="utf-8")
+    roster_dir = root / "api" / "roster"
+    roster = "\n".join(
+        p.read_text(encoding="utf-8") for p in sorted(roster_dir.glob("*.py"))
+    )
     assert "DEFAULT_DESK = desk_base_url()" not in cap
     assert "DESK = desk_base_url()" not in roster
     assert "def _desk()" in roster
