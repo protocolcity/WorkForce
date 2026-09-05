@@ -1,8 +1,15 @@
 """wf-225 — live worker papers teach project, not neighborhood-as-L1."""
 import os
 
+import pytest
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKERS = os.path.join(ROOT, "workers")
+
+pytestmark = pytest.mark.skipif(
+    not os.path.isdir(WORKERS),
+    reason="live worker papers are not shipped on the public export tree",
+)
 
 # Teaching phrases that re-introduce neighborhood as the L1 unit.
 # Wire ids (NEIGHBORHOOD_NAME, --neighborhood) live in engine/CLI, not papers.
