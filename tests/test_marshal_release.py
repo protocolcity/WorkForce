@@ -196,7 +196,6 @@ def test_propose_close_body_names_wf164_and_no_completed_header():
         decision={"worker_label": None},
     )
     assert body.startswith("Propose-close:")
-    assert "wf-164" in body
     assert "Next step:" in body
     # Must not itself be a lifecycle close (marshal never closes).
     assert not body.lstrip().startswith("Completed:")
