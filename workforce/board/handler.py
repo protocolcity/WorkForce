@@ -1,92 +1,36 @@
-"""The board — the workforce office, served on its own port.
-
-JSON API for the suite Map (roster + shift ledgers + desk join). Three
-data sources, all seams:
-
-  1. The roster + ledgers (this product's own state).
-  2. ``launchctl list`` — TRANSITIONAL adapter for the legacy hand-rolled
-     lanes; each row disappears as its lane migrates onto the daemon.
-  3. The desk's published dev feed (activity + summary) — the desk half of
-     the join, consumed over HTTP, never imported.
-
-Own port (default 8797). Glass is the suite Map at :8801/roster — this
-process serves ``/api/*`` only.
-"""
+"""HTTP handler for the WorkForce JSON API (roster/scene/dispatch)."""
 
 import concurrent.futures
-import datetime
 import html
 import json
 import os
-import re
-import sys
 import urllib.parse
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Dict, Optional
+from http.server import BaseHTTPRequestHandler
+from typing import Dict
 
-from ._utils import _ago, _fmt_fire, _parse_iso_z, _utc_iso_z, _utcnow, engine_port
-from .daemon import adaptive_backoff_secs, heartbeat_status, read_heartbeat
-from .engine import empty_run_streak
-from .ledger import Ledger, parse_shifts
-from .roster import RosterError
-from .schedule import maybe_cron, next_fire_utc
-
-from .api.roster import (
-    DEFAULT_PORT, CITYHALL, _BRAND_TITLE,
-    generation_token, scene_model, scene_tape, report_model, worker_model,
-    _load_roster, _worker_queue, _worker_health, _launchctl_rota,
-    _cli_label, _kind_label, _worker_identity_aliases, _worker_holdings,
-    _worker_ready_teaser, _worker_flags, _desk_json, _law_stack,
-    _contract_rules, _git_law_log, _workplaces,
-    _platforms, _display_names, _sector_for_worker, _city_folder_name,
-    _legacy_plist, _service_config, _queue_human_link,
-    _desk_owner_of, OUTCOME_CLS, _IN_CITY, _KIND_LABELS, LAUNCH_AGENTS,
-    _REPORT_WINDOW_DAYS, _REPORT_QUIET_HOURS, _REPORT_WINDOWS,
-    _FAULT_OUTCOMES, RULE_HEADINGS, _WEDGE_SHIFTS,
+from ..daemon import adaptive_backoff_secs, heartbeat_status, read_heartbeat
+from ..engine import empty_run_streak
+from ..ledger import Ledger, parse_shifts
+from ..roster import RosterError
+from ..schedule import maybe_cron, next_fire_utc
+from .._utils import _parse_iso_z, _utc_iso_z, _utcnow
+from ..api.roster import (
+    _cli_label,
+    _load_roster,
+    _worker_health,
+    _worker_queue,
+    generation_token,
+    report_model,
+    scene_model,
+    scene_tape,
+    worker_model,
 )
-# ONE DOOR: this process is the WorkForce API (roster/scene/dispatch).
-# Citizen UI is the suite Map. WORKFORCE_API_ONLY=0 is not a supported
-# mode — refuse it; never serve HTML glass from this port.
-API_ONLY = True
-SUITE_URL = (os.environ.get("SUITE_URL") or "http://127.0.0.1:8801").rstrip("/")
-
-
-def _map_roster_url() -> str:
-    return SUITE_URL + "/roster"
-
-
-def _html_escape_requested() -> bool:
-    raw = (os.environ.get("WORKFORCE_API_ONLY") or "1").strip().lower()
-    return raw in ("0", "false", "no", "off")
-
-
-def _refuse_html_escape() -> None:
-    """Fail closed: a host still exporting API_ONLY=0 gets one line, no HTML."""
-    if _html_escape_requested():
-        print(
-            "WORKFORCE_API_ONLY=0 is not supported — open the suite Map at %s"
-            % _map_roster_url(),
-            file=sys.stderr,
-        )
-
-
-def _out_path(local_root: str, name: str) -> str:
-    return os.path.join(local_root, "run", "%s.out" % name)
-
-
-
-def _safe_worker_name(name: str) -> bool:
-    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name or ""))
-
-
-def _days_param(path: str) -> Optional[int]:
-    """?days= from a request path; None on absence or junk (model defaults)."""
-    query = urllib.parse.urlsplit(path).query
-    raw = urllib.parse.parse_qs(query).get("days", [""])[0]
-    try:
-        return int(raw)
-    except ValueError:
-        return None
+from .paths import (
+    _days_param,
+    _map_roster_url,
+    _out_path,
+    _safe_worker_name,
+)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -191,7 +135,7 @@ class _Handler(BaseHTTPRequestHandler):
             # bind is the gate; daemon not required (roster reload is next tick).
             body = self._read_json_body()
             try:
-                from . import hire as hire_mod
+                from .. import hire as hire_mod
                 # Board local_root is …/local; hire base is the package cwd parent.
                 base = os.path.dirname(os.path.abspath(self.local_root)) or os.getcwd()
                 # staff: omit → auto (city-ops workdir); explicit bool overrides
@@ -284,7 +228,7 @@ class _Handler(BaseHTTPRequestHandler):
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             light = (q.get("light") or ["0"])[0].lower() in ("1", "true", "yes")
             try:
-                from .api.roster import scene_model as _sm
+                from ..api.roster import scene_model as _sm
                 payload = _sm(self.local_root, light=light)
             except Exception:
                 payload = scene_model(self.local_root)
@@ -531,19 +475,3 @@ class _Handler(BaseHTTPRequestHandler):
         # fall through for real faults (keep default shape, no super spam)
         print("board error: " + msg.splitlines()[0][:200], flush=True)
 
-
-def make_server(port: Optional[int] = None, local_root: str = "local",
-                daemon: Optional[object] = None) -> ThreadingHTTPServer:
-    if port is None:
-        port = engine_port()  # live WORKFORCE_PORT; not import snapshot
-    _refuse_html_escape()
-    _Handler.local_root = local_root
-    _Handler.daemon = daemon  # None = read-only board (standalone)
-    # ThreadingHTTPServer so LIVE-C SSE tails do not block /api/scene.
-    return ThreadingHTTPServer(("127.0.0.1", port), _Handler)
-
-
-def serve(port: Optional[int] = None, local_root: str = "local") -> None:
-    httpd = make_server(port, local_root)
-    print("%s: engine API at http://127.0.0.1:%d (API only)" % (_BRAND_TITLE, httpd.server_address[1]))
-    httpd.serve_forever()
