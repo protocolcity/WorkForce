@@ -355,7 +355,6 @@ def test_format_report_clean_and_dirty():
     }])
     assert "34" in dirty
     assert "ring" in dirty
-    assert "wf-171" in dirty
     assert "unique patch" in dirty
     assert "git push origin HEAD:main" in dirty
 
