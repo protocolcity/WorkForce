@@ -151,7 +151,8 @@ class McpHandlersTests(unittest.TestCase):
     def test_handlers_source_has_no_hardcoded_engine_port(self) -> None:
         import workforce.mcp.handlers as handlers_mod
 
-        src = Path(handlers_mod.__file__).read_text(encoding="utf-8")
+        pkg = Path(handlers_mod.__file__).resolve().parent
+        src = "\n".join(p.read_text(encoding="utf-8") for p in sorted(pkg.glob("*.py")))
         self.assertNotIn("127.0.0.1:8797", src)
 
     def test_initialize_roundtrip(self) -> None:
