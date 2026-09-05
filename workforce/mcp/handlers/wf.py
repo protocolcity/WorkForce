@@ -1,9 +1,4 @@
-"""Tool handlers for WorkForce MCP.
-
-Minimal surface: roster · show · hire · dispatch · status.
-No silent destructive hires — hire requires explicit workdir + name.
-"""
-
+"""WFHandlers — roster · show · hire · dispatch · status."""
 from __future__ import annotations
 
 import json
@@ -11,190 +6,16 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 from workforce import hire as hire_mod
 from workforce import roster as roster_mod
 from workforce._utils import engine_api_url
 from workforce.ledger import Ledger
 
-
-class ToolError(Exception):
-    def __init__(self, message: str, code: int = -32000):
-        super().__init__(message)
-        self.code = code
-
-
-def resolve_paths(
-    roster_path: Optional[str] = None,
-    data_dir: Optional[str] = None,
-) -> Dict[str, str]:
-    """Resolve WORKFORCE_ROSTER / WORKFORCE_DATA_DIR / cwd defaults."""
-    env_roster = (os.environ.get("WORKFORCE_ROSTER") or "").strip()
-    env_data = (os.environ.get("WORKFORCE_DATA_DIR") or "").strip()
-    data = (data_dir or env_data or "").strip()
-    roster = (roster_path or env_roster or "").strip()
-
-    if roster and not data:
-        # roster.json lives in …/local/roster.json
-        parent = os.path.dirname(os.path.realpath(roster))
-        data = os.path.dirname(parent) if os.path.basename(parent) == "local" else parent
-    if data and not roster:
-        roster = os.path.join(data, "local", "roster.json")
-    if not data:
-        data = os.getcwd()
-    if not roster:
-        for cand in (
-            os.path.join(data, "local", "roster.json"),
-            os.path.join(data, "roster.json"),
-            os.path.join(os.getcwd(), "local", "roster.json"),
-        ):
-            if os.path.isfile(cand):
-                roster = cand
-                break
-        if not roster:
-            roster = os.path.join(data, "local", "roster.json")
-    local_root = os.path.dirname(os.path.realpath(roster))
-    if os.path.basename(local_root) != "local":
-        local_root = os.path.join(os.path.realpath(data), "local")
-    return {
-        "data_dir": os.path.realpath(data),
-        "roster_path": os.path.realpath(roster),
-        "local_root": os.path.realpath(local_root),
-    }
-
-
-def _load_roster_lenient(paths: Dict[str, str]):
-    """Load roster; empty workers dict → empty Roster-like object."""
-    path = paths["roster_path"]
-    if not os.path.isfile(path):
-        return None
-    try:
-        return roster_mod.load(path, base=paths["data_dir"])
-    except roster_mod.RosterError as e:
-        msg = str(e).lower()
-        if "no workers" in msg:
-            # Empty employment file is a valid first-user state
-            class _Empty:
-                workers: Dict[str, Any] = {}
-
-            return _Empty()
-        raise
-
-
-def build_tool_definitions() -> List[Dict[str, Any]]:
-    return [
-        {
-            "name": "wf_status",
-            "description": (
-                "WorkForce health: roster path, worker count, daemon.json if present, "
-                "board URL reachability."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "roster": {"type": "string", "description": "path to roster.json"},
-                    "data_dir": {
-                        "type": "string",
-                        "description": "WorkForce data dir (contains local/)",
-                    },
-                },
-            },
-        },
-        {
-            "name": "wf_roster",
-            "description": (
-                "List employed agents/jobs on the WorkForce roster "
-                "(name, kind, workdir, schedule, model)."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "roster": {"type": "string"},
-                    "data_dir": {"type": "string"},
-                    "kind": {
-                        "type": "string",
-                        "description": "optional filter: lane or job",
-                    },
-                },
-            },
-        },
-        {
-            "name": "wf_show",
-            "description": "Show one roster worker + recent ledger tail.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "worker slug"},
-                    "roster": {"type": "string"},
-                    "data_dir": {"type": "string"},
-                    "ledger_n": {"type": "integer", "default": 8},
-                },
-                "required": ["name"],
-            },
-        },
-        {
-            "name": "wf_hire",
-            "description": (
-                "Employ an agent: plant CONTRACT/prompt papers + roster row. "
-                "Requires name + workdir. Use dry_run to preview. "
-                "kind=lane claims work orders; kind=job is scheduled duty."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "workdir": {
-                        "type": "string",
-                        "description": "absolute project folder path",
-                    },
-                    "role": {"type": "string"},
-                    "kind": {
-                        "type": "string",
-                        "enum": ["lane", "job"],
-                        "default": "lane",
-                    },
-                    "schedule": {"type": "string", "default": "*/30 * * * *"},
-                    "model": {"type": "string"},
-                    "project": {
-                        "type": "string",
-                        "description": "WorkLane store slug for ready queue",
-                    },
-                    "roster": {"type": "string"},
-                    "data_dir": {"type": "string"},
-                    "dry_run": {"type": "boolean", "default": False},
-                    "force_papers": {"type": "boolean", "default": False},
-                },
-                "required": ["name", "workdir"],
-            },
-        },
-        {
-            "name": "wf_dispatch",
-            "description": (
-                "Run one shift now (manual fire). Prefer dry_run=true first. "
-                "Real dispatch spawns the agent CLI — confirm with human when unsure."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "worker slug"},
-                    "dry_run": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": "engine dry-run (no vendor CLI spawn)",
-                    },
-                    "roster": {"type": "string"},
-                    "data_dir": {"type": "string"},
-                    "via_http": {
-                        "type": "boolean",
-                        "default": True,
-                        "description": "POST daemon board /api/dispatch when up",
-                    },
-                },
-                "required": ["name"],
-            },
-        },
-    ]
+from .errors import ToolError
+from .http import _http_ok
+from .paths import _load_roster_lenient, resolve_paths
 
 
 class WFHandlers:
@@ -429,27 +250,3 @@ class WFHandlers:
             "paths": paths,
         }
 
-
-def _http_ok(url: str) -> bool:
-    try:
-        with urllib.request.urlopen(url, timeout=1.5) as r:
-            return 200 <= int(r.status) < 500
-    except urllib.error.HTTPError as e:
-        return 100 <= int(getattr(e, "code", 0) or 0) < 600
-    except Exception:
-        return False
-
-
-def dispatch_tool(handlers: WFHandlers, name: str, arguments: Dict[str, Any]) -> Any:
-    args = arguments or {}
-    if name == "wf_status":
-        return handlers.status(args)
-    if name == "wf_roster":
-        return handlers.roster(args)
-    if name == "wf_show":
-        return handlers.show(args)
-    if name == "wf_hire":
-        return handlers.hire(args)
-    if name == "wf_dispatch":
-        return handlers.dispatch(args)
-    raise ToolError("unknown tool: %s" % name)
