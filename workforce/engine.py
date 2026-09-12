@@ -222,15 +222,7 @@ class _Skip(Exception):
     """Clean, recoverable non-dispatch (exit 0)."""
 
 
-def _pid_alive(pid: int) -> bool:
-    """Return True if pid is currently running on this host."""
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # process exists, different owner
+from ._utils import pid_alive as _pid_alive
 
 
 class _Lock:
