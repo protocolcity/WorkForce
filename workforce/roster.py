@@ -224,7 +224,7 @@ def _resolve_path(explicit: Optional[str], base: str) -> str:
 def load(path: Optional[str] = None, base: Optional[str] = None) -> Roster:
     base = base or os.getcwd()
     path = _resolve_path(
-        path or os.environ.get("WORKFORCE_ROSTER") or os.environ.get("WORKFORCE_ROSTER"),
+        path or os.environ.get("WORKFORCE_ROSTER") or os.environ.get("ORCHESTRATOR_ROSTER"),
         base,
     )
     try:

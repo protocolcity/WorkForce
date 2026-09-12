@@ -500,15 +500,17 @@ def test_generation_token_moves_on_in_flight_change(tmp_path):
 def test_generation_token_in_flight_field_mirrors_heartbeat(tmp_path):
     """The token response carries the current in_flight list for suite Map."""
     import json as _json
+    import os
+    from datetime import datetime, timezone, timedelta
     local = tmp_path / "local"
     (local / "ledger").mkdir(parents=True)
     hb_file = local / "daemon.json"
-    hb_file.write_text(_json.dumps({"pid": 1, "last_tick": "2026-07-26T00:00:00Z",
+    hb_file.write_text(_json.dumps({"pid": os.getpid(), "last_tick": (datetime.now(timezone.utc)-timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
                                     "state": "scheduling", "in_flight": ["kai", "morgan"]}))
 
     result = _api_roster.generation_token(str(local))
     assert sorted(result["in_flight"]) == ["kai", "morgan"]
-    assert result["daemon"] in ("running", "stopped", "draining")
+    assert result["daemon"] == "stale"
 
 
 # ── wf-106: scene_model parallel fan-out ─────────────────────────────────────
