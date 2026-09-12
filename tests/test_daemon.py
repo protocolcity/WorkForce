@@ -288,7 +288,7 @@ def test_fire_now_preflight_low_disk_refuses_without_thread(tmp_path):
 
 def test_wake_now_stays_async_on_low_disk(tmp_path):
     """wf-222: wake_now does not preflight; low disk still spawns then SKIP."""
-    base, local = make_base(tmp_path, schedule="manual")
+    base, local = make_base(tmp_path, schedule="* * * * *")
     roster_path = tmp_path / "local" / "roster.json"
     data = json.loads(roster_path.read_text())
     data["workers"]["tester"]["min_free_mb"] = 10 ** 12
@@ -876,7 +876,7 @@ def test_capacity_hook_skips_when_no_alerts(tmp_path, monkeypatch):
 
 def test_wake_now_dispatches_idle(tmp_path):
     """A wake on an idle lane runs the same engine path as a clock fire."""
-    base, local = make_base(tmp_path, schedule="manual")
+    base, local = make_base(tmp_path, schedule="* * * * *")
     d = Daemon(base, local)
     ok, msg = d.wake_now("tester")
     assert ok and msg == "dispatched"
@@ -893,7 +893,7 @@ def test_wake_now_unknown_worker(tmp_path):
 
 def test_wake_now_empty_queue_clean_skip(tmp_path):
     """wf-231: empty wake SKIPs; no mill chew spawn."""
-    base, local = make_base(tmp_path, schedule="manual")
+    base, local = make_base(tmp_path, schedule="* * * * *")
     (tmp_path / "queue.json").write_text(json.dumps({"count": 0}))
     d = Daemon(base, local)
     ok, _ = d.wake_now("tester")
@@ -915,7 +915,7 @@ def test_wake_during_inflight_is_clean_noop(tmp_path):
     """A wake mid-shift notes the wake and returns ok — no double spawn."""
     from workforce.daemon import WAKE_DEBOUNCE_SECS
 
-    base, local = make_base(tmp_path, schedule="manual",
+    base, local = make_base(tmp_path, schedule="* * * * *",
                             command=["/bin/sh", "-c", "sleep 1; exit 0"])
     d = Daemon(base, local)
     ok, _ = d.wake_now("tester")
@@ -932,7 +932,7 @@ def test_wake_during_inflight_is_clean_noop(tmp_path):
 
 def test_wake_debounce_coalesces_bulk_nudges(tmp_path):
     """Bulk filing nudges the same hand repeatedly; only the first spawns."""
-    base, local = make_base(tmp_path, schedule="manual",
+    base, local = make_base(tmp_path, schedule="* * * * *",
                             command=["/bin/sh", "-c", "sleep 1; exit 0"])
     d = Daemon(base, local)
     ok, msg = d.wake_now("tester")
@@ -1052,7 +1052,7 @@ def test_api_wake_endpoint(tmp_path):
 
     from workforce import board
 
-    base, local = make_base(tmp_path, schedule="manual")
+    base, local = make_base(tmp_path, schedule="* * * * *")
     d = Daemon(base, local)
     httpd = board.make_server(port=0, local_root=local, daemon=d)
     try:
@@ -1290,3 +1290,23 @@ def test_inflight_heartbeat_flush_on_thread_exit(tmp_path):
     d._write_heartbeat(daemon_utcnow(), d._roster())
     hb2 = json.loads((tmp_path / "local" / "daemon.json").read_text())
     assert hb2["in_flight"] == []
+
+
+@pytest.mark.parametrize("schedule", ["manual", "", "launchd legacy"])
+def test_informational_worker_ignores_automatic_events(tmp_path, schedule):
+    base, local = make_base(tmp_path, schedule=schedule)
+    daemon = Daemon(base, local)
+    roster = daemon._roster()
+    roster.workers["tester"].queue_url = "http://localhost/api/ready?project=demo&label=worker:tester"
+    event = {"labels": ["worker:tester"], "event_type": "created"}
+    assert daemon._workers_for_event(roster, event, "demo") == []
+    ok, message = daemon.wake_now("tester")
+    assert ok and "explicit dispatch required" in message
+    assert not daemon._threads
+    assert not ledger_text(tmp_path)
+
+
+def test_scheduled_worker_remains_event_dispatchable(tmp_path):
+    base, local = make_base(tmp_path)
+    daemon = Daemon(base, local)
+    assert daemon._workers_for_event(daemon._roster(), {"labels": ["worker:tester"]}, "demo") == ["tester"]
