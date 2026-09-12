@@ -440,7 +440,9 @@ class _Handler(BaseHTTPRequestHandler):
                                         "passes": last["passes"], "reason": last["reason"]}
                                        if last else None),
                     })
-            data = json.dumps({"daemon": status, "workers": workers}).encode("utf-8")
+            data = json.dumps({"daemon": status, "workers": workers,
+                               "engine": {"pid": os.getpid(),
+                                          "local_root": os.path.realpath(self.local_root)}}).encode("utf-8")
             try:
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -474,4 +476,3 @@ class _Handler(BaseHTTPRequestHandler):
             return
         # fall through for real faults (keep default shape, no super spam)
         print("board error: " + msg.splitlines()[0][:200], flush=True)
-
