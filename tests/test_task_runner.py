@@ -126,3 +126,24 @@ def test_failed_preparation_leaves_receipt_and_never_resets_branch(setup):
     assert json.loads(receipt.read_text())["state"] == "preparation_failed"
     with pytest.raises(PreparationError, match="already prepared"):
         prepare(config, feed(task))
+
+
+def test_http_product_envelope_without_per_row_product(setup):
+    config, task = setup
+    del task["product"]
+    result = prepare(config, lambda url: {"ok": True, "product": "product", "count": 1, "tasks": [task]})
+    assert result["task_id"] == "p-1"
+
+
+@pytest.mark.parametrize("envelope", ["foreign", None])
+def test_missing_or_foreign_product_envelope_fails(setup, envelope):
+    config, task = setup
+    del task["product"]
+    with pytest.raises(PreparationError):
+        prepare(config, lambda url: {"product": envelope, "count": 1, "tasks": [task]})
+
+
+def test_conflicting_envelope_and_row_fail(setup):
+    config, task = setup
+    with pytest.raises(PreparationError):
+        prepare(config, lambda url: {"product": "foreign", "count": 1, "tasks": [task]})
