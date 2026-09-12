@@ -423,7 +423,7 @@ def resolve_type_alias(
 def _resolve_roster_path(path: Optional[str], base: str) -> str:
     if path:
         return path
-    env = os.environ.get("WORKFORCE_ROSTER") or os.environ.get("WORKFORCE_ROSTER")
+    env = os.environ.get("WORKFORCE_ROSTER") or os.environ.get("ORCHESTRATOR_ROSTER")
     if env:
         return env
     for candidate in DEFAULT_ROSTER_PATHS:

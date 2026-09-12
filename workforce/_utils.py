@@ -161,3 +161,18 @@ def _atomic_write_json(
         except OSError:
             pass
         raise
+
+
+def pid_alive(pid: int) -> bool:
+    """Check an individual process, treating permission denial as alive."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, TypeError):
+        return False

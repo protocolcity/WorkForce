@@ -80,12 +80,8 @@ def _iso(dt: Optional[datetime.datetime]) -> str:
     return _utc_iso_z(dt) if dt is not None else ""
 
 
-def pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except (OSError, TypeError):
-        return False
-    return True
+from ._utils import pid_alive
+
 
 
 def read_heartbeat(local_root: str) -> Optional[dict]:

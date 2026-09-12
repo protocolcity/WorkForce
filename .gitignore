@@ -5,3 +5,11 @@ __pycache__/
 .venv/
 local/
 dist/
+
+.protocolcity/
+.claude/
+.local-logs/
+build/
+.env
+.env.*
+!.env.example
