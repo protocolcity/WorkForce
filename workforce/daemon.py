@@ -504,6 +504,8 @@ class Daemon:
             return False, "roster unreadable"
         if name not in roster.workers:
             return False, "no such worker"
+        if maybe_cron(roster.workers[name].schedule) is None:
+            return True, "manual worker — explicit dispatch required"
         mono = time.monotonic()
         last = self._wake_monotonic.get(name)
         if last is not None and (mono - last) < WAKE_DEBOUNCE_SECS:
@@ -611,6 +613,10 @@ class Daemon:
         label_set = {str(x).lower() for x in labels}
         names: List[str] = []
         for name, w in roster.workers.items():
+            # Manual/informational schedules require explicit fire_now.
+            # A queue event must not silently turn them into automation.
+            if maybe_cron(w.schedule) is None:
+                continue
             # Explicit assignment label worker:<name>
             if ("worker:%s" % name.lower()) in label_set:
                 names.append(name)
