@@ -84,8 +84,14 @@ def prepare(config, fetch=_fetch):
         raise PreparationError("Unavailable, malformed, or incomplete ready feed")
     eligible = []
     for task in tasks:
+        if not isinstance(task, dict):
+            raise PreparationError("Ready feed returned an invalid task")
         labels = task.get("labels", [])
-        if (task.get("product") != project or task.get("status") != "backlog"
+        # HTTP scopes the envelope; MCP also supplies product on each row.
+        # When both are present neither may contradict the selected store.
+        if (task.get("product", data.get("product")) != project
+                or data.get("product", project) != project
+                or task.get("status") != "backlog"
                 or not isinstance(labels, list)
                 or [x for x in labels if isinstance(x, str) and x.startswith("worker:")] != ["worker:" + worker]
                 or task.get("gate_type") in ("human", "deferred", "tracking")):
