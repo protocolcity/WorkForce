@@ -162,7 +162,9 @@ def load_config(path: str) -> Dict[str, Any]:
         )
     screenshot_cmd = raw.get("screenshot_cmd")
     if screenshot_cmd is not None:
-        screenshot_cmd = _str_list(screenshot_cmd, "screenshot_cmd")
+        # An empty list means "no screenshots" (the shipped example uses it);
+        # only a non-list or non-string entry is a configuration error.
+        screenshot_cmd = _str_list(screenshot_cmd, "screenshot_cmd") if screenshot_cmd else None
     verify_cmd = raw.get("verify_cmd")
     if verify_cmd is not None:
         verify_cmd = _str_list(verify_cmd, "verify_cmd")
@@ -222,6 +224,7 @@ def load_config(path: str) -> Dict[str, Any]:
         ),
         "checkout_template": raw.get("checkout_template", _DEFAULT_CHECKOUT_TEMPLATE),
         "branch_template": raw.get("branch_template", _DEFAULT_BRANCH_TEMPLATE),
+        "active_implementation_cap": raw.get("active_implementation_cap"),
         "workspace_root": raw.get("workspace_root") or str(Path(local_root).parent),
     }
 

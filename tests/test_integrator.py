@@ -1988,3 +1988,19 @@ def test_discover_candidates_falls_back_to_template_and_records_stale_workdir_mi
     with open(ledger_path, "r", encoding="utf-8") as fh:
         ledger_text = fh.read()
     assert "workdir_mismatch=/some/tree/wf-264/checkout" in ledger_text
+
+def test_load_config_carries_active_implementation_cap(tmp_path):
+    """wf-265 rehearsal: the documented active_implementation_cap key was dropped by
+    load_config, so the capacity snapshot fell back to the product default of 1 and
+    discovery returned nothing while one seat was in flight."""
+    cfg = make_config(tmp_path, str(tmp_path / "roster.json"), active_implementation_cap=2)
+    assert cfg["active_implementation_cap"] == 2
+    cfg = make_config(tmp_path, str(tmp_path / "roster.json"))
+    assert cfg["active_implementation_cap"] is None
+
+
+def test_load_config_accepts_an_empty_screenshot_list(tmp_path):
+    """The shipped integration_config.example.json carries screenshot_cmd: [] and
+    must load; an empty list means no screenshots."""
+    cfg = make_config(tmp_path, str(tmp_path / "roster.json"), screenshot_cmd=[])
+    assert cfg.get("screenshot_cmd") is None
