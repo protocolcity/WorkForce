@@ -422,7 +422,11 @@ def test_worker_model_includes_flags(tmp_path, monkeypatch):
         "queue_url": "http://127.0.0.1:9999/api?product=workforce&label=worker:x",
     }}}))
 
-    monkeypatch.setattr(_api_roster, "_worker_holdings", lambda _w: [])
+    monkeypatch.setattr(
+        _api_roster, "_worker_holdings",
+        lambda _w: {"state": "empty", "source": "desk", "items": [],
+                    "error": "", "partial": False},
+    )
     monkeypatch.setattr(_api_roster, "_worker_ready_teaser", lambda _w, **_kw: [])
     monkeypatch.setattr(_api_roster, "_worker_flags",
                         lambda _w: [{"id": "wf-60", "title": "flags row",
@@ -529,8 +533,34 @@ def test_api_workers_no_light_parallel_queue_values(tmp_path, monkeypatch):
 # ── wf-147: scene latency bounds + client-gone write ──────────────────────
 
 
-def test_worker_holdings_uses_label_filter_skips_owner_walk(tmp_path, monkeypatch):
-    """Labeled queue_url → one list GET per status; no Owner: detail walks."""
+def test_worker_holdings_unavailable_vs_verified_empty(tmp_path, monkeypatch):
+    """wf-250: desk failure → unavailable; empty tasks list → empty state."""
+    from workforce.api import roster as roster_mod
+
+    w = make_worker(tmp_path)
+    w.queue_url = "http://127.0.0.1:8799/api/admin/tasks/ready?product=workforce"
+
+    def desk_down(_path, timeout=5.0):
+        return None
+
+    monkeypatch.setattr(roster_mod, "_desk_json", desk_down)
+    down = roster_mod._worker_holdings(w, ("in_progress",))
+    assert down["state"] == "unavailable"
+    assert down["items"] == []
+    assert down["error"]
+
+    def desk_empty(_path, timeout=5.0):
+        return {"tasks": []}
+
+    monkeypatch.setattr(roster_mod, "_desk_json", desk_empty)
+    empty = roster_mod._worker_holdings(w, ("in_progress",))
+    assert empty["state"] == "empty"
+    assert empty["items"] == []
+    assert empty["error"] == ""
+
+
+def test_worker_holdings_requires_owner_not_label(tmp_path, monkeypatch):
+    """wf-250: routing label match without signed Owner is not a hold."""
     from workforce.api import roster as roster_mod
 
     w = make_worker(tmp_path)
@@ -540,28 +570,50 @@ def test_worker_holdings_uses_label_filter_skips_owner_walk(tmp_path, monkeypatc
         "http://127.0.0.1:8799/api/admin/tasks/ready"
         "?product=workforce&label=worker:salem"
     )
-    calls = []
+    owner_calls = []
 
     def fake_desk(path, timeout=5.0):
-        calls.append(path)
         if "status=in_progress" in path and "label=" in path:
             return {"tasks": [
-                {"id": "wf-147", "title": "scene latency", "status": "in_progress",
-                 "priority": 2, "updated_at": "2026-08-03T16:00:00Z"},
+                {"id": "wf-147", "title": "label only", "status": "in_progress"},
+                {"id": "wf-148", "title": "signed hold", "status": "in_progress"},
             ]}
         return {"tasks": []}
 
+    def fake_owner(tid):
+        owner_calls.append(tid)
+        return "salem" if tid == "wf-148" else "you"
+
     monkeypatch.setattr(roster_mod, "_desk_json", fake_desk)
+    monkeypatch.setattr(roster_mod, "_desk_owner_of", fake_owner)
+    held = roster_mod._worker_holdings(w, ("in_progress",))
+    assert held["state"] == "available"
+    assert [h["id"] for h in held["items"]] == ["wf-148"]
+    assert held["items"][0]["owner"] == "salem"
+    assert held["items"][0]["owner_verified"] is True
+    assert set(owner_calls) == {"wf-147", "wf-148"}
 
-    def boom_owner(_tid):
-        raise AssertionError("Owner walk must not run for labeled lanes")
 
-    monkeypatch.setattr(roster_mod, "_desk_owner_of", boom_owner)
-    held = roster_mod._worker_holdings(w)
-    assert [h["id"] for h in held] == ["wf-147"]
-    assert all("label=worker%3Asalem" in c or "label=worker:salem" in c
-               for c in calls if "status=" in c)
-    assert not any("/api/admin/tasks/wf-" in c for c in calls)
+def test_worker_holdings_partial_when_owner_cap_hit(tmp_path, monkeypatch):
+    """wf-250: bounded Owner lookups report partial when capped."""
+    from workforce.api import roster as roster_mod
+
+    w = make_worker(tmp_path)
+    w.name = "salem"
+    w.identity = "salem"
+    w.queue_url = "http://127.0.0.1:8799/api/admin/tasks/ready?product=workforce"
+    tasks = [{"id": "wf-%d" % i, "title": "t", "status": "in_progress"}
+             for i in range(6)]
+
+    monkeypatch.setattr(
+        roster_mod, "_desk_json",
+        lambda _path, timeout=5.0: {"tasks": tasks},
+    )
+    monkeypatch.setattr(roster_mod, "_desk_owner_of", lambda tid: "salem")
+    held = roster_mod._worker_holdings(w, ("in_progress",))
+    assert held["state"] == "partial"
+    assert held["partial"] is True
+    assert len(held["items"]) == 5
 
 
 def test_client_gone_write_swallows_broken_pipe(tmp_path):

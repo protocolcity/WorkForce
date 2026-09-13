@@ -1,5 +1,6 @@
 """Desk JSON proxy, queue probe, and ticket holdings/ready/flags."""
 
+import os
 import time
 import urllib.parse
 import urllib.request
@@ -117,16 +118,37 @@ def _desk_owner_of(task_id: str) -> str:
     return ""
 
 
+def _holding_evidence(
+    items: List[Dict[str, object]],
+    *,
+    state: str,
+    error: str = "",
+    partial: bool = False,
+) -> Dict[str, object]:
+    """Desk holding read model with explicit availability state."""
+    return {
+        "state": state,
+        "source": "desk",
+        "items": items,
+        "error": error,
+        "partial": partial,
+    }
+
+
+def _holding_not_queried() -> Dict[str, object]:
+    return _holding_evidence([], state="not_queried")
+
+
 def _worker_holdings(
     w: Worker,
     statuses: Tuple[str, ...] = ("in_progress", "in_review"),
-) -> List[Dict[str, object]]:
+) -> Dict[str, object]:
     """Tickets this worker currently holds (in_progress / in_review + Owner:).
 
-    When the lane queue_url carries ``label=worker:<id>`` (steady-state routing),
-    filter the desk list by that label and skip per-ticket Owner: walks — one
-    GET per status, not N+1 owner probes. Owner fallback
-    remains for unlabeled legacy rows, with a hard cap on detail fetches.
+    Label filters are routing hints only — each row still needs a bounded
+    Owner: detail lookup before it counts as a signed hold. Returns a wrapper
+    with ``state`` (available | empty | partial | unavailable | not_queried)
+    so consumers can tell verified empty from unreachable desk.
 
     *statuses* defaults to both live and parked holds (personnel drawer). The
     scene bay teaser passes ``("in_progress",)`` only so one desk round-trip
@@ -145,12 +167,15 @@ def _worker_holdings(
     if not product or product == "all":
         product = os.path.basename(os.path.abspath(w.workdir or "")).lower()
     if not product:
-        return []
+        return _holding_evidence([], state="empty", error="no product lane")
     aliases = set(_worker_identity_aliases(w))
     held: List[Dict[str, object]] = []
     seen: set = set()
     owner_lookups = 0
-    _owner_cap = 5  # hard bound on N+1 Owner: detail GETs (legacy path)
+    owner_cap_hit = False
+    _owner_cap = 5  # hard bound on Owner: detail GETs per holdings probe
+    fetch_errors: List[str] = []
+    any_ok = False
     for status in statuses:
         if label:
             path = (
@@ -162,24 +187,32 @@ def _worker_holdings(
                 "/api/admin/tasks?product=%s&status=%s&limit=40"
                 % (urllib.parse.quote(product), status))
         d = _desk_json(path, timeout=_BOARD_DESK_TIMEOUT_SECS)
-        for t in (d or {}).get("tasks") or []:
+        if d is None:
+            fetch_errors.append("%s: desk unreachable" % status)
+            continue
+        if not isinstance(d, dict):
+            fetch_errors.append("%s: malformed response" % status)
+            continue
+        tasks = d.get("tasks")
+        if not isinstance(tasks, list):
+            fetch_errors.append("%s: missing tasks list" % status)
+            continue
+        any_ok = True
+        for t in tasks:
             if not isinstance(t, dict):
                 continue
             tid = str(t.get("id") or "")
             if not tid or tid in seen:
                 continue
-            if label:
-                # Lane label is the routing seat — trust it over Owner: walk.
-                owner = (w.identity or w.name or "").split()[0]
-            else:
-                if owner_lookups >= _owner_cap:
-                    continue
-                owner = _desk_owner_of(tid)
-                owner_lookups += 1
-                tok = (owner.strip().split()[0].rstrip(".,;:").lower()
-                       if owner else "")
-                if tok not in aliases:
-                    continue
+            if owner_lookups >= _owner_cap:
+                owner_cap_hit = True
+                break
+            owner = _desk_owner_of(tid)
+            owner_lookups += 1
+            tok = (owner.strip().split()[0].rstrip(".,;:").lower()
+                   if owner else "")
+            if tok not in aliases:
+                continue
             seen.add(tid)
             held.append({
                 "id": tid,
@@ -188,11 +221,23 @@ def _worker_holdings(
                 "priority": t.get("priority"),
                 "product": product,
                 "owner": owner,
+                "owner_verified": bool(owner),
                 "updated_at": str(t.get("updated_at") or ""),
                 "href": "%s/admin/desk?open=%s" % (
                     _desk().rstrip("/"), urllib.parse.quote(tid)),
             })
-    return held
+        if owner_cap_hit:
+            break
+    err = "; ".join(fetch_errors)
+    if not any_ok:
+        return _holding_evidence(
+            [], state="unavailable", error=err or "desk unreachable")
+    if owner_cap_hit or fetch_errors:
+        return _holding_evidence(
+            held, state="partial", error=err, partial=True)
+    if not held:
+        return _holding_evidence([], state="empty")
+    return _holding_evidence(held, state="available")
 
 
 def _worker_ready_teaser(w: Worker, *, limit: int = 10) -> List[Dict[str, object]]:
