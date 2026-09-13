@@ -49,4 +49,5 @@ ADAPTER = ProviderAdapter(
         "a permission bypass. --force/--yolo (Run Everything) are never "
         "emitted."
     ),
+    default_model="composer-2.5",
 )
