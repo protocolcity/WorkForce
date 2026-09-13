@@ -212,6 +212,36 @@ def test_recover_preserves_dirty_checkout_and_writes_unique_attempt(setup):
     assert receipt["claimed"] is False
 
 
+def test_prepared_prompt_has_no_recovery_reason(setup):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    prompt = Path(prepared["receipt"]).parent / "prompt.md"
+    assert "Recovery" not in prompt.read_text()
+    assert "recovery_reason" not in prompt.read_text()
+
+
+def test_recovered_prompt_carries_the_reason_even_without_a_template_slot(setup):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    # Fixture template has no {recovery_reason} slot.
+    result = recover(config, prepared["receipt"], "three review findings unaddressed", feed(task))
+    prompt = Path(result["receipt"]).parent / "prompt.md"
+    text = prompt.read_text()
+    assert "three review findings unaddressed" in text
+    assert "recovery attempt 1" in text
+
+
+def test_recovered_prompt_fills_template_slot_when_present(setup, tmp_path):
+    config, task = setup
+    prompt_path = Path(config["prompt_template"])
+    prompt_path.write_text(prompt_path.read_text() + " Recovery reason: {recovery_reason} (attempt {recovery_attempt}, of {recovery_of}).")
+    prepared = prepare(config, feed(task))
+    result = recover(config, prepared["receipt"], "provider crashed mid-run", feed(task))
+    text = Path(result["receipt"]).parent / "prompt.md"
+    rendered = text.read_text()
+    assert "Recovery reason: provider crashed mid-run (attempt 1, of %s)" % prepared["receipt"] in rendered
+
+
 def test_recover_twice_never_overwrites_prior_attempt(setup):
     config, task = setup
     prepared = prepare(config, feed(task))
