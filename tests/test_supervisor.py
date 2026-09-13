@@ -5,12 +5,14 @@ import os
 import sys
 import textwrap
 import time
+from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from workforce import engine, supervisor  # noqa: E402
+from workforce import roster as roster_mod  # noqa: E402
 from workforce._utils import pid_alive  # noqa: E402
 from workforce.roster import Worker  # noqa: E402
 
@@ -288,10 +290,8 @@ def test_dispatch_immediately_before_recheck_rejects_worker_gone_busy(tmp_path, 
     )
     # Simulate a lock appearing between post-provider validation and the
     # per-worker dispatch call by monkeypatching the recheck to see it busy.
-    real_recheck = supervisor._recheck_immediately_before_dispatch
-
     def busy_at_dispatch_time(cfg, worker_name, project):
-        return None, "worker is currently busy"
+        return None, None, "worker is currently busy"
 
     monkeypatch.setattr(supervisor, "_recheck_immediately_before_dispatch", busy_at_dispatch_time)
     result = supervisor.run(config, mode="execute")
@@ -300,6 +300,160 @@ def test_dispatch_immediately_before_recheck_rejects_worker_gone_busy(tmp_path, 
     assert d["attempted"] is False
     assert d["outcome"] == "rejected_at_dispatch_time"
     assert "busy" in d["reason"]
+
+
+def test_dispatch_one_never_reloads_roster_after_its_own_recheck(tmp_path, monkeypatch):
+    """_dispatch_one must fire the exact Worker object its own
+    _recheck_immediately_before_dispatch call validated -- never a second,
+    independent roster.load(). A roster mutated (here: the worker deleted
+    entirely) right after that recheck must not be able to affect this
+    dispatch: a second load would hit the mutated roster and blow up with a
+    RosterError, surfacing as an "exception" outcome instead of the normal
+    completed shift the validated object actually earns.
+    """
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [fresh_task()]))
+    real_load = roster_mod.load
+    load_calls = {"n": 0}
+
+    def swap_after_recheck_load(path=None, base=None):
+        load_calls["n"] += 1
+        rost = real_load(path=path, base=base)
+        if load_calls["n"] == 3:  # the recheck-immediately-before-dispatch load
+            raw = json.loads(Path(roster_path).read_text())
+            del raw["workers"]["tester"]
+            Path(roster_path).write_text(json.dumps(raw))
+        return rost
+
+    monkeypatch.setattr(supervisor.roster_mod, "load", swap_after_recheck_load)
+
+    def fake_dispatch(worker, local_root, dry_run=False):
+        ledger_dir = os.path.join(local_root, "ledger")
+        os.makedirs(ledger_dir, exist_ok=True)
+        with open(os.path.join(ledger_dir, "%s.log" % worker.name), "a") as fh:
+            fh.write("2026-01-01T00:00:00Z START identity=x\n")
+            fh.write("2026-01-01T00:00:01Z STOP reason=ok\n")
+        return 0
+
+    monkeypatch.setattr(engine, "dispatch", fake_dispatch)
+    config = make_config(
+        tmp_path, roster_path,
+        provider_argv=_provider_argv([{"worker": "tester", "project": "workforce"}]),
+    )
+    result = supervisor.run(config, mode="execute")
+    # Exactly 3 loads for one dispatched action: state_before_provider,
+    # state_after_provider, and ONE recheck-at-dispatch. A second reload
+    # inside _dispatch_one itself would make this 4 and would have hit the
+    # roster mutated in swap_after_recheck_load above.
+    assert load_calls["n"] == 3
+    d = result["dispatched"][0]
+    assert d["attempted"] is True
+    assert d["outcome"] == "completed"
+
+
+def test_dispatch_one_dispatches_the_identical_worker_object_from_its_recheck(tmp_path, monkeypatch):
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [fresh_task()]))
+    real_load = roster_mod.load
+    loaded_rosters = []
+
+    def spy_load(path=None, base=None):
+        rost = real_load(path=path, base=base)
+        loaded_rosters.append(rost)
+        return rost
+
+    monkeypatch.setattr(supervisor.roster_mod, "load", spy_load)
+    dispatched = []
+    monkeypatch.setattr(
+        engine, "dispatch", lambda worker, local_root, dry_run=False: dispatched.append(worker) or 0)
+    config = make_config(
+        tmp_path, roster_path,
+        provider_argv=_provider_argv([{"worker": "tester", "project": "workforce"}]),
+    )
+    supervisor.run(config, mode="execute")
+    assert len(dispatched) == 1
+    assert dispatched[0] is loaded_rosters[-1].workers["tester"]
+
+
+# ---------------------------------------------------------------- truthful failure classification
+
+def test_run_execute_denied_dispatch_is_failed_never_completed(tmp_path, monkeypatch):
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [fresh_task()]))
+
+    def denied_dispatch(worker, local_root, dry_run=False):
+        ledger_dir = os.path.join(local_root, "ledger")
+        os.makedirs(ledger_dir, exist_ok=True)
+        with open(os.path.join(ledger_dir, "%s.log" % worker.name), "a") as fh:
+            fh.write("2026-01-01T00:00:00Z SCOPE_DENY reason=out-of-scope\n")
+        return 1
+
+    monkeypatch.setattr(engine, "dispatch", denied_dispatch)
+    config = make_config(
+        tmp_path, roster_path,
+        provider_argv=_provider_argv([{"worker": "tester", "project": "workforce"}]),
+    )
+    result = supervisor.run(config, mode="execute")
+    d = result["dispatched"][0]
+    assert d["outcome"] == "denied"
+    assert d["failed"] is True
+    assert d["completed"] is False
+    assert result["dispatch_failed"] == 1
+    assert result["dispatch_completed"] == 0
+
+
+def test_run_execute_nonzero_rc_without_error_event_is_still_failed_never_completed(tmp_path, monkeypatch):
+    """Defensive: even if ledger parsing found no ERROR/DENY row at all, a
+    non-zero exit code alone must still block "completed" and count as failed."""
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [fresh_task()]))
+
+    def mystery_nonzero_dispatch(worker, local_root, dry_run=False):
+        ledger_dir = os.path.join(local_root, "ledger")
+        os.makedirs(ledger_dir, exist_ok=True)
+        with open(os.path.join(ledger_dir, "%s.log" % worker.name), "a") as fh:
+            fh.write("2026-01-01T00:00:00Z START identity=x\n")
+            fh.write("2026-01-01T00:00:01Z STOP reason=ok\n")
+        return 1  # rc says failure even though the ledger looks clean
+
+    monkeypatch.setattr(engine, "dispatch", mystery_nonzero_dispatch)
+    config = make_config(
+        tmp_path, roster_path,
+        provider_argv=_provider_argv([{"worker": "tester", "project": "workforce"}]),
+    )
+    result = supervisor.run(config, mode="execute")
+    d = result["dispatched"][0]
+    assert d["completed"] is False
+    assert d["failed"] is True
+    assert result["dispatch_failed"] == 1
+
+
+def test_main_cli_returns_nonzero_when_execute_dispatch_is_denied(tmp_path, monkeypatch):
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [fresh_task()]))
+
+    def denied_dispatch(worker, local_root, dry_run=False):
+        ledger_dir = os.path.join(local_root, "ledger")
+        os.makedirs(ledger_dir, exist_ok=True)
+        with open(os.path.join(ledger_dir, "%s.log" % worker.name), "a") as fh:
+            fh.write("2026-01-01T00:00:00Z HOST_MUTATION_DENY reason=tier2\n")
+        return 1
+
+    monkeypatch.setattr(engine, "dispatch", denied_dispatch)
+    config = make_config(
+        tmp_path, roster_path,
+        provider_argv=_provider_argv([{"worker": "tester", "project": "workforce"}]),
+    )
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps({**config, "projects": list(config["projects"]),
+                                     "workers": list(config["workers"])}))
+    rc = supervisor.main(["--config", str(cfg_path), "--execute"])
+    assert rc == 1
 
 
 # ---------------------------------------------------------------- _run_provider
@@ -354,6 +508,42 @@ def test_run_provider_timeout_kills_full_process_group_not_just_leader(tmp_path)
             fh.write(str(child.pid))
             fh.flush()
         child.wait()
+    """ % str(pidfile)))
+    argv = [sys.executable, str(script)]
+    result = supervisor._run_provider(argv, {}, time_budget_secs=1, output_budget_bytes=4096)
+    assert result["ok"] is False
+    assert "timed out" in result["error"]
+    deadline = time.monotonic() + 3
+    child_pid = None
+    while time.monotonic() < deadline:
+        if pidfile.exists() and pidfile.stat().st_size:
+            child_pid = int(pidfile.read_text())
+            break
+        time.sleep(0.05)
+    assert child_pid is not None
+    deadline = time.monotonic() + 3
+    while pid_alive(child_pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not pid_alive(child_pid)
+
+
+def test_run_provider_kills_descendant_that_outlives_early_parent_exit(tmp_path):
+    """The provider (leader) can exit immediately -- via inherited stdout the
+    pipe write end stays open through its child, so our reader never sees
+    EOF and must still hit the time budget and kill the whole group by
+    proc.pid directly, even though the original leader pid is already gone
+    by the time the kill actually runs."""
+    pidfile = tmp_path / "child.pid"
+    script = tmp_path / "prov.py"
+    script.write_text(textwrap.dedent("""
+        import subprocess, sys
+        # Do not redirect stdout/stderr: this child inherits this process's
+        # own (our pipe's) fds, so the pipe write end stays open through it.
+        child = subprocess.Popen(["sleep", "30"])
+        with open(%r, "w") as fh:
+            fh.write(str(child.pid))
+            fh.flush()
+        sys.exit(0)  # leader exits now; child (and the inherited pipe) lives on
     """ % str(pidfile)))
     argv = [sys.executable, str(script)]
     result = supervisor._run_provider(argv, {}, time_budget_secs=1, output_budget_bytes=4096)

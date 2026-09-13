@@ -237,17 +237,20 @@ def collect_state(config: Dict[str, Any]) -> Dict[str, Any]:
 def _kill_process_group(proc: "subprocess.Popen") -> None:
     """Kill the provider's entire process group, not just the leader PID.
 
-    The provider was launched with ``start_new_session=True`` so it (and
-    anything it forks, unless that child calls ``setsid`` itself) shares one
-    process group. A plain ``proc.kill()`` on a timeout/budget cutoff would
-    leave any descendant the provider spawned running past the bound.
+    The provider is launched with ``start_new_session=True``, which calls
+    ``setsid`` before exec: that makes the *process group id* equal to
+    ``proc.pid`` itself, by definition, for the lifetime of the group --
+    not something that needs (or should) be rediscovered via
+    ``os.getpgid(proc.pid)`` at kill time. A lookup-based approach breaks
+    exactly when it matters most: if the provider forks a descendant and
+    then exits early itself (e.g. leaving that descendant holding the
+    inherited stdout pipe open), the leader pid can already be a fully
+    reaped zombie by the time the bound trips, and a lookup on it is not
+    guaranteed to still resolve. Signalling the group number directly has
+    no such dependency on the leader still being queryable.
     """
     try:
-        pgid = os.getpgid(proc.pid)
-    except ProcessLookupError:
-        return
-    try:
-        os.killpg(pgid, signal.SIGKILL)
+        os.killpg(proc.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
 
@@ -395,7 +398,7 @@ def _validate_action(action: Any, state: Dict[str, Any], config: Dict[str, Any],
 
 def _recheck_immediately_before_dispatch(
     config: Dict[str, Any], worker_name: str, project: str,
-) -> Tuple[Optional[dict], Optional[str]]:
+) -> Tuple[Optional[Any], Optional[dict], Optional[str]]:
     """Re-validate one worker's eligibility right before firing it.
 
     Proposals were validated against a snapshot taken after the provider
@@ -403,30 +406,41 @@ def _recheck_immediately_before_dispatch(
     dispatches) passes between that snapshot and any individual dispatch.
     This re-reads the roster and re-probes the ready feed one more time,
     immediately before ``engine.dispatch`` is called, closing that gap.
+
+    Returns ``(worker, row, None)`` on success, where ``worker`` is the
+    exact ``Worker`` object this specific roster load produced. The caller
+    must dispatch *that* object directly rather than loading the roster
+    again: a second, independent load could observe a roster that changed
+    in the instant between this check and the dispatch call, silently
+    firing a worker configuration that was never actually validated.
     """
     rost = roster_mod.load(path=config["roster_path"])
+    worker = rost.workers.get(worker_name)
     row, reason = _collect_worker_row(config, rost, worker_name)
     if row is None:
-        return None, reason
+        return None, None, reason
     if row["project"] != project:
-        return None, "worker belongs to a different project"
+        return None, None, "worker belongs to a different project"
     if row["busy"]:
-        return None, "worker is currently busy"
+        return None, None, "worker is currently busy"
     if row["monitoring_flag"]:
-        return None, "monitoring: %s" % row["monitoring_flag"]
+        return None, None, "monitoring: %s" % row["monitoring_flag"]
     if not row["ready_task_ids"]:
-        return None, "worker has no fresh eligible ready work at dispatch time"
-    return row, None
+        return None, None, "worker has no fresh eligible ready work at dispatch time"
+    return worker, row, None
 
 
-def _classify_ledger_delta(new_text: str) -> Dict[str, Any]:
+def _classify_ledger_delta(new_text: str, rc: int) -> Dict[str, Any]:
     """Truthfully classify what a dispatch call actually did from its own ledger rows.
 
     ``engine.dispatch``'s return code alone cannot distinguish a real
     completed shift from a clean SKIP (queue empty, lock busy) or an
     explicit SCOPE_DENY/HOST_MUTATION_DENY refusal -- all of those can
-    return 0 or 1 without ever starting real work. The ledger events the
-    call itself appended are the only truthful record.
+    return 0 or 1 without ever starting real work. But the reverse trust is
+    just as important: a non-zero ``rc`` or an explicit deny is *always*
+    ``failed`` here, and ``completed`` always requires ``rc == 0`` -- a
+    ledger-parsing gap (unexpected event shape, future engine change) must
+    never let a refused or non-zero-exit run be reported as a success.
     """
     events: List[str] = []
     for line in new_text.splitlines():
@@ -438,9 +452,9 @@ def _classify_ledger_delta(new_text: str) -> Dict[str, Any]:
     stopped = "STOP" in events
     errored = "ERROR" in events
     denied = any(e in _DENY_EVENTS for e in events)
-    skipped = "SKIP" in events and not started
-    completed = started and stopped and not errored
-    failed = errored
+    failed = errored or denied or rc != 0
+    completed = started and stopped and not failed and rc == 0
+    skipped = "SKIP" in events and not started and not failed
     if denied:
         outcome = "denied"
     elif failed:
@@ -464,20 +478,19 @@ def _dispatch_one(config: Dict[str, Any], worker_name: str, project: str) -> Dic
     """Fire one worker's own manual shift via the existing engine, honestly.
 
     Rechecks eligibility immediately before calling ``engine.dispatch``
-    (closing the gap since the last snapshot), then classifies the outcome
-    from the ledger rows the shift itself wrote -- never from the return
-    code or from mere presence of a CANDIDATE row -- since ``engine.dispatch``
-    takes no task id and its return code does not distinguish a completed
-    shift from a clean no-op or an explicit refusal.
+    (closing the gap since the last snapshot), dispatches the *exact*
+    ``Worker`` object that recheck validated (never a second, independent
+    roster load), then classifies the outcome from both the ledger rows the
+    shift itself wrote and its return code -- never from mere presence of a
+    CANDIDATE row, and never treating a non-zero return or an explicit deny
+    as anything but failed.
     """
-    row, reason = _recheck_immediately_before_dispatch(config, worker_name, project)
-    if row is None:
+    worker, row, reason = _recheck_immediately_before_dispatch(config, worker_name, project)
+    if worker is None:
         return {"worker": worker_name, "project": project, "attempted": False,
                 "started": False, "completed": False, "failed": False,
                 "outcome": "rejected_at_dispatch_time",
                 "reason": "revalidation immediately before dispatch failed: %s" % reason}
-    rost = roster_mod.load(path=config["roster_path"])
-    worker = rost.worker(worker_name)
     log_path = os.path.join(config["local_root"], "ledger", "%s.log" % worker_name)
     offset = os.path.getsize(log_path) if os.path.exists(log_path) else 0
     try:
@@ -491,7 +504,7 @@ def _dispatch_one(config: Dict[str, Any], worker_name: str, project: str) -> Dic
         with open(log_path, "r", encoding="utf-8") as fh:
             fh.seek(offset)
             new_text = fh.read()
-    classified = _classify_ledger_delta(new_text)
+    classified = _classify_ledger_delta(new_text, rc)
     return {
         "worker": worker_name,
         "project": project,
