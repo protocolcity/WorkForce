@@ -56,6 +56,11 @@ class ProviderAdapter:
     build_auth_check: Callable[[str], List[str]]
     build_allow_list: Callable[[SeatContext], List[str]]
     doc: str
+    # Pin used when hire's --model is omitted — an empty command-line model
+    # must never mean "whatever the vendor feels like today" for a seat
+    # meant to run unattended. "" here means the adapter's own vendor
+    # default is a fine, deliberate pin (currently true only for claude).
+    default_model: str = ""
 
     def resolve_binary(self) -> str:
         for name in self.binary_names:

@@ -157,27 +157,59 @@ outside the worker's configured `state_dir`.
 ## Generating a seat from a provider adapter
 
 `workforce hire <name> --provider {claude,cursor,grok,codex} --project <slug>
---repository /absolute/path [--remote <url>] [--model <pin>] [--held]
-[--dry-run]` writes the whole seat folder under the worker-config root —
-`runner.json`, `launch.py`, `mcp.json`, `CONTRACT.md`, `prompt.md` — from the
-named adapter, plus the roster row. Each adapter's command is checked against
-its own `bypass_flags` list and refuses to generate one (`AdapterError`); no
-generated command carries `--dangerously-skip-permissions`, `--force`/`--yolo`,
-or an equivalent tool-permission bypass. The cursor adapter does emit `--trust`
-— that flag only dismisses cursor-agent's interactive "trust this workspace?"
-prompt, which is required for headless dispatch; it is never emitted without
-`--sandbox enabled` immediately alongside it, which is the actual safety
-boundary, so `--trust` is not in `cursor`'s `bypass_flags` list. `--dry-run`
-prints the five file paths, the command, and the allow list without writing
-anything or touching the roster.
-`--held` clears the row's schedule so the desk shows the seat OFF (a bare
-hire without `--held` gets a normal cron schedule); `fire_now`/manual dispatch
-still work on a held seat. `--regenerate` rewrites an existing seat's folder,
-moving the previous one aside to `<seat>.backup-<timestamp>` first, and keeps
-the row's prior held state unless `--held`/`--no-held` is passed explicitly.
-The model pin is validated against the current `CANONICAL_MODEL_IDS`
-registry exactly as `workforce hire --workdir` does; shorthand ids are
-rejected.
+--repository /absolute/path [--remote <url>] [--model <pin>]
+[--schedule <cron-or-"manual">] [--held] [--workspace <path>]
+[--seat-root <path>] [--worklane-python <path>]
+[--worklane-runtime-dir <path>] [--interpreter <path>] [--dry-run]` writes
+the seat folder under the worker-config root — `runner.json`, `launch.py`,
+`mcp.json`, `CONTRACT.md`, `prompt.md`, plus a `permissions.json` for cursor
+or a `.grok/config.toml` for grok — from the named adapter, plus the roster
+row. Each adapter's command is checked against its own `bypass_flags` list
+and refuses to generate one (`AdapterError`); no generated command carries
+`--dangerously-skip-permissions`, `--force`/`--yolo`, or an equivalent
+tool-permission bypass. The cursor and grok adapters do emit `--trust` —
+that flag only dismisses the CLI's interactive "trust this workspace?"
+prompt, which is required for headless dispatch (cursor never emits it
+without `--sandbox enabled` immediately alongside it, which is the actual
+safety boundary), so `--trust` is not in either adapter's `bypass_flags`
+list. `--dry-run` prints the file paths, the command, and the allow list
+without writing anything or touching the roster.
+
+A generated seat never starts unattended by accident: `--schedule` defaults
+to `manual` (an informational string the daemon never fires, see
+`schedule.py`) rather than a live cron; pass an explicit five-field cron to
+arm auto-fire. `--held` clears the row's schedule entirely so the desk
+shows the seat OFF; `fire_now`/manual dispatch still work on a held seat.
+`--regenerate` rewrites an existing seat's folder, moving the previous one
+aside to `<seat>.backup-<timestamp>` first, and keeps the row's prior
+schedule/held state unless `--schedule`/`--held`/`--no-held` is passed
+explicitly. The model pin is validated against the current
+`CANONICAL_MODEL_IDS` registry exactly as `workforce hire --workdir` does;
+shorthand ids are rejected. An omitted `--model` falls back to the
+adapter's own pin (`composer-2.5` for cursor, `grok-4.6` for grok,
+`gpt-6-astra` for codex) rather than an unpinned vendor default; claude's
+own default is already a deliberate pin, so it stays unset.
+
+The seat's authority chain is, in order: the workspace root's `AGENTS.md`
+(the parent of the data home, when it has one — pass `--workspace` when it
+does not autodetect), the repository's own `AGENTS.md` when present, then
+the seat's own `CONTRACT.md`. `--seat-root` overrides where the folder is
+generated (default `<workspace or data home>/local/worker-config`);
+`--worklane-python`/`--worklane-runtime-dir` override the seat's worklane
+MCP wiring (default under the same workspace). The roster row's command
+runs under `--interpreter` (default: `sys.executable`, i.e. the interpreter
+running the `hire` command itself) — never a bare `python3`, which may
+resolve outside WorkForce's own venv. The row's `workdir`/`scope_home`
+default to the generated seat folder and `perimeter_grants` to
+`[seat_dir, repository]`; `env` carries `WL_AGENT_ID`/`TP_AGENT_ID`/
+`WORKLANE_RUNTIME_DIR` plus the same `PATH` the engine runs under so the
+seat's own subprocess can find vendor CLIs. Lane seats default to
+`max_passes=1`/`min_pass_secs=600` (one claimed ticket per shift, not a
+queue drain). `prompt.md` is rendered in the `task_runner`-consumed shape
+(`{authority}`/`{task_id}`/`{checkout}`/`{branch}` placeholders task_runner
+fills in at `prepare()`/`recover()` time), naming the prepared checkout,
+branch, and the WorkLane hand tools — not the legacy "check the queue, do
+one slice" prompt.
 
 ## Bounded AI supervisory pass
 

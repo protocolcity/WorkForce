@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from workforce.task_runner import PreparationError, _acquire_lock, prepare, recover
+from workforce.task_runner import PreparationError, _acquire_lock, exclude_from_git, prepare, recover
 
 
 def git(repo, *args):
@@ -419,3 +419,27 @@ def test_exec_retains_lock_and_releases_only_after_child_process_exits(setup):
     fd = _acquire_lock(lock_path)
     fcntl.flock(fd, fcntl.LOCK_UN)
     os.close(fd)
+
+
+def test_exclude_from_git_resolves_real_worktree_gitdir_and_is_idempotent(setup):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    checkout = Path(prepared["checkout"])
+    assert (checkout / ".git").is_file()  # a worktree checkout, not a real repo
+
+    exclude_from_git(checkout, [".cursor/", ".grok/"])
+    exclude_from_git(checkout, [".cursor/"])  # repeat call must not duplicate
+
+    common = Path(git(Path(config["repository"]), "rev-parse", "--git-common-dir"))
+    common = (Path(config["repository"]) / common).resolve() if not common.is_absolute() else common
+    worktree_git_dir = next(p for p in (common / "worktrees").iterdir() if p.is_dir())
+    exclude_text = (worktree_git_dir / "info" / "exclude").read_text()
+    assert exclude_text.count(".cursor/") == 1
+    assert exclude_text.count(".grok/") == 1
+
+
+def test_exclude_from_git_noop_without_git_dir(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    exclude_from_git(checkout, [".cursor/"])  # no .git at all -- must not raise
+    assert not (checkout / ".git").exists()

@@ -1093,6 +1093,7 @@ def test_generate_seat_folder_dry_run_writes_nothing(tmp_path):
     assert result["dry_run"] is True
     assert set(result["files"]) == {
         "runner.json", "launch.py", "mcp.json", "CONTRACT.md", "prompt.md",
+        "permissions.json",
     }
     seat_dir = tmp_path / "local" / "worker-config" / "demo"
     assert not seat_dir.exists()
@@ -1217,3 +1218,379 @@ def test_generate_seat_folder_regenerate_keeps_identity_and_custom_schedule(tmp_
     er = load(result["roster_path"], base=str(tmp_path))
     assert er.workers["demo"].identity == "demo-signer"
     assert er.workers["demo"].schedule == "0 9 * * 1-5"
+
+
+# --- wf-261: gaps from the first real hire -----------------------------
+
+
+def test_generate_seat_folder_defaults_to_manual_schedule(tmp_path):
+    """A generated seat must never start unattended by accident."""
+    repo = _seat_base(tmp_path)
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path),
+    )
+    er = load(result["roster_path"], base=str(tmp_path))
+    assert er.workers["demo"].schedule == "manual"
+
+
+def test_generate_seat_folder_honours_explicit_schedule(tmp_path):
+    repo = _seat_base(tmp_path)
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path), schedule="*/15 * * * *",
+    )
+    er = load(result["roster_path"], base=str(tmp_path))
+    assert er.workers["demo"].schedule == "*/15 * * * *"
+
+
+def test_generate_seat_folder_regenerate_schedule_override_wins_over_prior(tmp_path):
+    repo = _seat_base(tmp_path)
+    hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path), schedule="0 9 * * 1-5",
+    )
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path), regenerate=True,
+        schedule="manual",
+    )
+    er = load(result["roster_path"], base=str(tmp_path))
+    assert er.workers["demo"].schedule == "manual"
+
+
+def test_generate_seat_folder_authority_chain_is_workspace_then_repo_then_contract(tmp_path):
+    """Rule: workspace AGENTS.md, then <repository>/AGENTS.md, then CONTRACT.md."""
+    workspace = tmp_path
+    (workspace / "AGENTS.md").write_text("# workspace law\n")
+    data_home = workspace / "workforce"
+    (data_home / "local").mkdir(parents=True)
+    repo = workspace / "repo"
+    repo.mkdir()
+    (repo / "AGENTS.md").write_text("# project law\n")
+    _git_init(repo)
+
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(data_home),
+    )
+    er = load(result["roster_path"], base=str(data_home))
+    w = er.workers["demo"]
+    assert w.authority_chain == [
+        str(workspace / "AGENTS.md"),
+        str(repo / "AGENTS.md"),
+        w.contract,
+    ]
+
+
+def test_generate_seat_folder_authority_chain_explicit_workspace_flag(tmp_path):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "AGENTS.md").write_text("# workspace law\n")
+    base = tmp_path / "elsewhere"
+    (base / "local").mkdir(parents=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init(repo)
+
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(base), workspace=str(workspace),
+    )
+    er = load(result["roster_path"], base=str(base))
+    assert er.workers["demo"].authority_chain[0] == str(workspace / "AGENTS.md")
+
+
+@pytest.mark.parametrize("provider,pin", [("cursor", "composer-2.5"), ("grok", "grok-4.6")])
+def test_generate_seat_folder_defaults_model_to_adapter_pin(tmp_path, provider, pin):
+    repo = _seat_base(tmp_path)
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider=provider, project="recipes",
+        repository=str(repo), base=str(tmp_path),
+    )
+    er = load(result["roster_path"], base=str(tmp_path))
+    assert er.workers["demo"].model == pin
+
+
+def test_generate_seat_folder_explicit_model_wins_over_adapter_pin(tmp_path):
+    repo = _seat_base(tmp_path)
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path), model="cursor-grok-4.5-low",
+    )
+    er = load(result["roster_path"], base=str(tmp_path))
+    assert er.workers["demo"].model == "cursor-grok-4.5-low"
+
+
+def test_generate_seat_folder_claude_model_stays_vendor_default(tmp_path):
+    """claude's own default is already a deliberate pin — no override needed."""
+    repo = _seat_base(tmp_path)
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="claude", project="recipes",
+        repository=str(repo), base=str(tmp_path),
+    )
+    er = load(result["roster_path"], base=str(tmp_path))
+    assert er.workers["demo"].model == ""
+
+
+def test_generate_seat_folder_seat_root_defaults_under_workspace(tmp_path):
+    workspace = tmp_path
+    (workspace / "AGENTS.md").write_text("# workspace law\n")
+    data_home = workspace / "workforce"
+    (data_home / "local").mkdir(parents=True)
+    repo = workspace / "repo"
+    repo.mkdir()
+    _git_init(repo)
+
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(data_home),
+    )
+    assert result["seat_dir"] == str(workspace / "local" / "worker-config" / "demo")
+
+
+def test_generate_seat_folder_seat_root_override(tmp_path):
+    repo = _seat_base(tmp_path)
+    seat_root = tmp_path / "custom-seats"
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path),
+        worker_config_root=str(seat_root),
+    )
+    assert result["seat_dir"] == str(seat_root / "demo")
+
+
+def test_generate_seat_folder_worklane_paths_default_under_workspace(tmp_path):
+    workspace = tmp_path
+    (workspace / "AGENTS.md").write_text("# workspace law\n")
+    data_home = workspace / "workforce"
+    (data_home / "local").mkdir(parents=True)
+    repo = workspace / "repo"
+    repo.mkdir()
+    _git_init(repo)
+
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(data_home),
+    )
+    mcp = json.loads(result["file_bodies"]["mcp.json"])
+    server = mcp["mcpServers"]["worklane"]
+    assert server["command"] == str(
+        workspace / "local" / "worklane" / "current" / "venv" / "bin" / "python"
+    )
+    assert server["env"]["WORKLANE_RUNTIME_DIR"] == str(
+        workspace / "worklane" / "worklane" / "local"
+    )
+
+
+def test_generate_seat_folder_roster_row_uses_hiring_interpreter(tmp_path):
+    repo = _seat_base(tmp_path)
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path),
+    )
+    er = load(result["roster_path"], base=str(tmp_path))
+    assert er.workers["demo"].command[0] == sys.executable
+
+
+def test_generate_seat_folder_roster_row_carries_identity_env_block(tmp_path):
+    repo = _seat_base(tmp_path)
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path),
+    )
+    er = load(result["roster_path"], base=str(tmp_path))
+    env = er.workers["demo"].env
+    assert env["WL_AGENT_ID"] == "demo"
+    assert env["TP_AGENT_ID"] == "demo"
+    assert env["WORKLANE_RUNTIME_DIR"]
+    assert env["PATH"] == os.environ.get("PATH", "")
+
+
+def test_generate_seat_folder_workdir_scope_home_and_perimeter_grants(tmp_path):
+    repo = _seat_base(tmp_path)
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path),
+    )
+    er = load(result["roster_path"], base=str(tmp_path))
+    w = er.workers["demo"]
+    seat_dir = str(tmp_path / "local" / "worker-config" / "demo")
+    assert w.workdir == seat_dir
+    assert w.scope_home == seat_dir
+    assert w.perimeter_grants == [seat_dir, str(repo)]
+
+
+def test_generate_seat_folder_contract_and_prompt_paths_are_absolute(tmp_path):
+    repo = _seat_base(tmp_path)
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path),
+    )
+    raw = json.loads((tmp_path / "local" / "roster.json").read_text())
+    spec = raw["workers"]["demo"]
+    assert os.path.isabs(spec["contract"])
+    assert os.path.isabs(spec["prompt"])
+    assert os.path.isabs(spec["workdir"])
+
+
+def test_generate_seat_folder_lane_defaults_max_passes_one(tmp_path):
+    repo = _seat_base(tmp_path)
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path),
+    )
+    er = load(result["roster_path"], base=str(tmp_path))
+    assert er.workers["demo"].max_passes == 1
+    assert er.workers["demo"].min_pass_secs == 600
+
+
+def test_generate_seat_folder_prompt_uses_task_runner_placeholders(tmp_path):
+    repo = _seat_base(tmp_path)
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path),
+    )
+    prompt = result["file_bodies"]["prompt.md"]
+    for token in ("{authority}", "{task_id}", "{checkout}", "{branch}"):
+        assert token in prompt
+    assert "wl_show" in prompt and "wl_claim" in prompt and "wl_park" in prompt
+
+
+def test_generate_seat_folder_grok_gets_trust_flag_and_project_config(tmp_path):
+    repo = _seat_base(tmp_path)
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="grok", project="recipes",
+        repository=str(repo), base=str(tmp_path),
+    )
+    assert "--trust" in result["command"]
+    grok_config_key = os.path.join(".grok", "config.toml")
+    assert grok_config_key in result["file_bodies"]
+    body = result["file_bodies"][grok_config_key]
+    assert "demo" in body
+    seat_dir = tmp_path / "local" / "worker-config" / "demo"
+    assert (seat_dir / ".grok" / "config.toml").is_file()
+    launch_body = (seat_dir / "launch.py").read_text()
+    assert "_drop_grok_config" in launch_body
+
+
+def test_generate_seat_folder_cursor_gets_permissions_and_planting_launch(tmp_path):
+    repo = _seat_base(tmp_path)
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path),
+    )
+    seat_dir = tmp_path / "local" / "worker-config" / "demo"
+    assert (seat_dir / "permissions.json").is_file()
+    permissions = json.loads((seat_dir / "permissions.json").read_text())
+    allow = permissions["permissions"]["allow"]
+    assert any("Mcp(worklane:wl_show)" == a for a in allow)
+    deny = permissions["permissions"]["deny"]
+    assert any("Mcp(worklane:wl_close)" == d for d in deny)
+    launch_body = (seat_dir / "launch.py").read_text()
+    assert ".cursor" in launch_body and "cli.json" in launch_body
+
+
+def test_generate_seat_folder_claude_launch_py_has_no_provider_planting(tmp_path):
+    repo = _seat_base(tmp_path)
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="claude", project="recipes",
+        repository=str(repo), base=str(tmp_path),
+    )
+    seat_dir = tmp_path / "local" / "worker-config" / "demo"
+    launch_body = (seat_dir / "launch.py").read_text()
+    assert ".cursor" not in launch_body and ".grok" not in launch_body
+
+
+# --- wf-261 review findings: recovery planting, no-overwrite, git-exclude ---
+
+
+def _exec_launch_py(source, seat_dir, argv, monkeypatch, **patched):
+    """Exec a generated launch.py body as __main__, with task_runner patched.
+
+    Runs the real generated source (not a reimplementation) so these tests
+    catch the same regressions review found: planting skipped on recovery,
+    and an existing task config overwritten. ``__file__`` is set to the seat
+    dir's own launch.py so ``h=Path(__file__).parent`` resolves like a real
+    dispatch.
+    """
+    from workforce import task_runner as task_runner_mod
+    for name, value in patched.items():
+        monkeypatch.setattr(task_runner_mod, name, value)
+    monkeypatch.setattr(sys, "argv", ["launch.py"] + argv)
+    globs = {"__name__": "__main__", "__file__": str(seat_dir / "launch.py")}
+    with pytest.raises(SystemExit):
+        exec(compile(source, "<launch.py>", "exec"), globs)
+
+
+def test_launch_py_cursor_plants_identity_on_recovery_path(tmp_path, monkeypatch):
+    seat_dir = tmp_path / "seat"; seat_dir.mkdir()
+    (seat_dir / "mcp.json").write_text('{"mcpServers": {}}')
+    (seat_dir / "permissions.json").write_text('{"permissions": {}}')
+    checkout = tmp_path / "checkout"; checkout.mkdir()
+    (checkout / ".git").mkdir()
+    receipt = tmp_path / "preparation.json"
+    receipt.write_text(json.dumps({"checkout": str(checkout)}))
+
+    def fail_prepare(*a, **k):
+        raise AssertionError("prepare() must not run on the recovery path")
+
+    _exec_launch_py(
+        hire_mod.seat_templates.LAUNCH_PY_CURSOR, seat_dir,
+        ["--config", str(seat_dir / "runner.json"), "--recover-receipt", str(receipt),
+         "--recovery-reason", "provider crashed"],
+        monkeypatch, main=lambda argv: 0, prepare=fail_prepare,
+    )
+
+    assert (checkout / ".cursor" / "mcp.json").read_text() == '{"mcpServers": {}}'
+    assert (checkout / ".cursor" / "cli.json").read_text() == '{"permissions": {}}'
+    exclude = (checkout / ".git" / "info" / "exclude").read_text()
+    assert ".cursor/" in exclude
+
+
+def test_launch_py_grok_never_overwrites_existing_checkout_config(tmp_path, monkeypatch):
+    seat_dir = tmp_path / "seat"; seat_dir.mkdir()
+    (seat_dir / ".grok").mkdir()
+    (seat_dir / ".grok" / "config.toml").write_text("# seat config\n")
+    checkout = tmp_path / "checkout"; checkout.mkdir()
+    (checkout / ".git").mkdir()
+    (checkout / ".grok").mkdir()
+    (checkout / ".grok" / "config.toml").write_text("# task-provided config, keep me\n")
+    receipt = tmp_path / "preparation.json"
+    receipt.write_text(json.dumps({"checkout": str(checkout)}))
+
+    from workforce import task_runner as task_runner_mod
+    globs = {"__name__": "__main__", "__file__": str(seat_dir / "launch.py")}
+    monkeypatch.setattr(task_runner_mod, "main", lambda argv: 0)
+    monkeypatch.setattr(sys, "argv",
+                         ["launch.py", "--config", str(seat_dir / "runner.json"),
+                          "--recover-receipt", str(receipt), "--recovery-reason", "provider crashed"])
+    with pytest.raises(SystemExit):
+        exec(compile(hire_mod.seat_templates.LAUNCH_PY_GROK, "<launch.py>", "exec"), globs)
+
+    assert (checkout / ".grok" / "config.toml").read_text() == "# task-provided config, keep me\n"
+    exclude = (checkout / ".git" / "info" / "exclude").read_text()
+    assert ".grok/" in exclude
+
+
+def test_launch_py_grok_plants_config_on_recovery_when_absent(tmp_path, monkeypatch):
+    seat_dir = tmp_path / "seat"; seat_dir.mkdir()
+    (seat_dir / ".grok").mkdir()
+    (seat_dir / ".grok" / "config.toml").write_text("# seat config\n")
+    checkout = tmp_path / "checkout"; checkout.mkdir()
+    (checkout / ".git").mkdir()
+    receipt = tmp_path / "preparation.json"
+    receipt.write_text(json.dumps({"checkout": str(checkout)}))
+
+    from workforce import task_runner as task_runner_mod
+    globs = {"__name__": "__main__", "__file__": str(seat_dir / "launch.py")}
+    monkeypatch.setattr(task_runner_mod, "main", lambda argv: 0)
+    monkeypatch.setattr(sys, "argv",
+                         ["launch.py", "--config", str(seat_dir / "runner.json"),
+                          "--recover-receipt", str(receipt), "--recovery-reason", "provider crashed"])
+    with pytest.raises(SystemExit):
+        exec(compile(hire_mod.seat_templates.LAUNCH_PY_GROK, "<launch.py>", "exec"), globs)
+
+    assert (checkout / ".grok" / "config.toml").read_text() == "# seat config\n"
+    exclude = (checkout / ".git" / "info" / "exclude").read_text()
+    assert ".grok/" in exclude
