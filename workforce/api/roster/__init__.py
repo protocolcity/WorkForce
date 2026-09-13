@@ -72,6 +72,8 @@ from .constants import (  # noqa: F401
 from .desk import (  # noqa: F401
     _desk_json,
     _desk_owner_of,
+    _holding_evidence,
+    _holding_not_queried,
     _is_connection_exc,
     _queue_human_link,
     _worker_flags,

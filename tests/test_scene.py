@@ -63,7 +63,8 @@ def test_scene_model_groups_workers_into_workplace_sectors(tmp_path, monkeypatch
                 "next_fire", "queue", "health", "last_shift", "holding"):
         assert key in a
     assert a["cli"] == "true"  # command=["true"] fixture
-    assert a["holding"] == []  # not in_flight
+    assert a["holding"]["state"] == "not_queried"  # not in_flight
+    assert a["holding"]["items"] == []
 
 
 def test_scene_model_exposes_display_when_set(tmp_path, monkeypatch):
@@ -122,7 +123,11 @@ def test_scene_model_holding_from_desk_candidates_from_ledger(tmp_path, monkeypa
     }))
 
     def fake_holdings(w, statuses=None, **_kw):
-        return [{"id": "desk-only", "title": "from desk", "status": "in_progress"}]
+        return {
+            "state": "available", "source": "desk", "items": [
+                {"id": "desk-only", "title": "from desk", "status": "in_progress"},
+            ], "error": "", "partial": False,
+        }
 
     monkeypatch.setattr(_api_roster, "_worker_holdings", fake_holdings)
     model = board.scene_model(str(local))
@@ -130,7 +135,8 @@ def test_scene_model_holding_from_desk_candidates_from_ledger(tmp_path, monkeypa
                for s in model["sectors"]
                for row in s["workers"]}
     held = workers["morgan"]["holding"]
-    assert held[0]["id"] == "desk-only"
+    assert held["state"] == "available"
+    assert held["items"][0]["id"] == "desk-only"
     cands = workers["morgan"]["candidates"]
     assert cands[0]["id"] == "wf-158"
     assert cands[0]["status"] == "candidate"
@@ -153,8 +159,12 @@ def test_scene_model_holding_teaser_only_when_in_flight(tmp_path, monkeypatch):
     def fake_holdings(w, statuses=None, **_kw):
         # statuses kw is scene-path (in_progress-only teaser, wf-147)
         calls.append(w.name)
-        return [{"id": "ts-1", "title": "Land the bay claim line",
-                 "status": "in_progress", "href": "http://desk/t/ts-1"}]
+        return {
+            "state": "available", "source": "desk", "items": [
+                {"id": "ts-1", "title": "Land the bay claim line",
+                 "status": "in_progress", "href": "http://desk/t/ts-1"},
+            ], "error": "", "partial": False,
+        }
 
     monkeypatch.setattr(_api_roster, "_worker_holdings", fake_holdings)
     model = board.scene_model(str(local))
@@ -163,8 +173,8 @@ def test_scene_model_holding_teaser_only_when_in_flight(tmp_path, monkeypatch):
                for row in s["workers"]}
     assert model["in_flight"] == ["morgan"]
     assert calls == ["morgan"]
-    assert workers["morgan"]["holding"][0]["id"] == "ts-1"
-    assert workers["riley"]["holding"] == []
+    assert workers["morgan"]["holding"]["items"][0]["id"] == "ts-1"
+    assert workers["riley"]["holding"]["state"] == "not_queried"
 
 
 def test_scene_model_owned_and_next_fire_from_cron(tmp_path, monkeypatch):
@@ -376,7 +386,8 @@ def test_light_scene_schema_sentinels(tmp_path, monkeypatch):
     assert k["queue"] == "—"
     assert k["health"] == "ok"
     assert k["why"] == "light"
-    assert k["holding"] == []  # not in_flight, no desk holding
+    assert k["holding"]["state"] == "not_queried"
+    assert k["holding"]["items"] == []
     assert k["candidates"] == []
     assert k["last_shift"] is None
     # stable fields still present and typed
@@ -418,13 +429,48 @@ def test_light_scene_candidates_from_ledger_not_holding(tmp_path, monkeypatch):
     workers = {row["name"]: row
                for s in model["sectors"]
                for row in s["workers"]}
-    assert workers["kai"]["holding"] == []
+    assert workers["kai"]["holding"]["state"] == "not_queried"
+    assert workers["kai"]["holding"]["items"] == []
     cands = workers["kai"]["candidates"]
     assert len(cands) == 1
     assert cands[0]["id"] == "wf-158"
     assert cands[0]["status"] == "candidate"
     assert cands[0]["source"] == "ledger"
     assert desk_calls["n"] == 0
+
+
+def test_scene_model_holding_unavailable_vs_empty(tmp_path, monkeypatch):
+    """wf-250: desk down → unavailable; verified empty list → empty state."""
+    import datetime
+    local = _local(tmp_path)
+    down = _worker(tmp_path, "down", "hoodD")
+    clear = _worker(tmp_path, "clear", "hoodC")
+    roster = Roster(workers={"down": down, "clear": clear}, path="t")
+    _patch_roster(monkeypatch, roster)
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    (local / "daemon.json").write_text(json.dumps({
+        "state": "running", "in_flight": ["down", "clear"], "last_tick": now,
+    }))
+
+    def fake_holdings(w, statuses=None, **_kw):
+        if w.name == "down":
+            return {
+                "state": "unavailable", "source": "desk", "items": [],
+                "error": "in_progress: desk unreachable", "partial": False,
+            }
+        return {
+            "state": "empty", "source": "desk", "items": [],
+            "error": "", "partial": False,
+        }
+
+    monkeypatch.setattr(_api_roster, "_worker_holdings", fake_holdings)
+    workers = {row["name"]: row
+               for s in board.scene_model(str(local))["sectors"]
+               for row in s["workers"]}
+    assert workers["down"]["holding"]["state"] == "unavailable"
+    assert workers["down"]["holding"]["error"]
+    assert workers["clear"]["holding"]["state"] == "empty"
+    assert workers["clear"]["holding"]["items"] == []
 
 
 def test_staff_string_does_not_mis_bay_lane_hand(tmp_path, monkeypatch):

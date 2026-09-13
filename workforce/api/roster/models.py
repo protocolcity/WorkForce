@@ -22,6 +22,8 @@ from .constants import (
 )
 from .desk import (
     _desk_json,
+    _holding_evidence,
+    _holding_not_queried,
     _worker_flags,
     _worker_holdings,
     _worker_queue,
@@ -95,7 +97,7 @@ def _worker_full_data(
     wf-250: holdings come from desk probes (signed WorkLane claims). Ledger
     CANDIDATE rows are dispatch-input context only.
     """
-    holding: List[Dict[str, object]] = []
+    holding: Dict[str, object] = _holding_not_queried()
     candidates: List[Dict[str, object]] = []
     if w.name in in_flight_set:
         candidates = _ledger_candidates(local_root, w.name)
@@ -108,9 +110,17 @@ def _worker_full_data(
             )
             q = fq.result()
             try:
-                holding = (fh.result() or [])[:3]
-            except Exception:
-                holding = []
+                holding = fh.result()
+                if not isinstance(holding, dict):
+                    holding = _holding_evidence(
+                        [], state="unavailable", error="holdings probe failed")
+                items = list(holding.get("items") or [])
+                if len(items) > 3:
+                    holding = dict(holding)
+                    holding["items"] = items[:3]
+            except Exception as exc:
+                holding = _holding_evidence(
+                    [], state="unavailable", error=str(exc))
     else:
         q = _worker_queue(w)
     health = _worker_health(local_root, w, q)  # type: ignore[name-defined]
@@ -212,7 +222,7 @@ def scene_model(local_root: str, light: bool = False) -> Dict[str, object]:
                     candidates = _ledger_candidates(local_root, name)
                 else:
                     candidates = []
-                holding = []
+                holding = _holding_not_queried()
             else:
                 _wd = _wdata_by[name]
                 q = _wd["q"]
@@ -266,7 +276,7 @@ def scene_model(local_root: str, light: bool = False) -> Dict[str, object]:
             "queue": "—",
             "health": "ok",
             "why": "citizen",
-            "holding": [],
+            "holding": _holding_not_queried(),
             "candidates": [],
             "last_shift": None,
             "no_clock_in": True,
@@ -505,6 +515,7 @@ def worker_model(local_root: str, name: str) -> Optional[Dict[str, object]]:
         Ledger(os.path.join(local_root, "ledger"), name).tail(400), limit=10)
     # Holding = Owner: claims; ready = top of queue; flags = governance layer.
     holding = _worker_holdings(w)
+    holding_items = list(holding.get("items") or []) if isinstance(holding, dict) else []
     ready = _worker_ready_teaser(w) if w.queue_url else []
     flags = _worker_flags(w) if w.queue_url else []
     return {
@@ -520,7 +531,7 @@ def worker_model(local_root: str, name: str) -> Optional[Dict[str, object]]:
         "queue": q, "queue_url": w.queue_url or "",
         "health": health["cls"], "why": health["why"],
         "holding": holding,
-        "holding_count": len(holding),
+        "holding_count": len(holding_items),
         "ready": ready,
         "flags": flags,
         "law": law,
