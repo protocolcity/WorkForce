@@ -2015,3 +2015,21 @@ def test_parse_reviewer_findings_unwraps_a_json_findings_array():
     found = integrator.parse_reviewer_findings(body)
     assert found == ["boot() drops the item deep link", "renderProjectPanel() loses focus", "#map-reset does not clear focus"]
     assert integrator.parse_reviewer_findings('{"findings": []}') == []
+
+
+def test_workdir_from_comments_accepts_blockquoted_lines(tmp_path):
+    """pc-1487 rehearsal: WorkLane renders evidence notes as blockquotes, so the
+    seat's Workdir: line arrives as "> Workdir: …" and must still count."""
+    checkout = tmp_path / "wf-9" / "checkout"
+    checkout.mkdir(parents=True)
+    comments = [{"author": "tester", "body": "Evidence note:\n\n> Evidence: commit abc.\n> \n> Workdir: %s\n" % checkout}]
+    assert integrator.workdir_from_comments(comments, seat="tester") == str(checkout)
+
+
+def test_checkout_templates_override_per_worker(tmp_path):
+    cfg = make_config(tmp_path, str(tmp_path / "roster.json"),
+                      checkout_templates={"cursor-seat": "other/{worker}/{task_id}/checkout"})
+    order = {"worker": "cursor-seat", "task_id": "wf-9"}
+    assert integrator._checkout_path(cfg, order) == os.path.join(cfg["workspace_root"], "other/cursor-seat/wf-9/checkout")
+    order2 = {"worker": "claude-seat", "task_id": "wf-9"}
+    assert integrator._checkout_path(cfg, order2).endswith("local/task-runs/claude-seat/wf-9/checkout")

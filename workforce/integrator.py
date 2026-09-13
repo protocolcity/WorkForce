@@ -1932,7 +1932,7 @@ def main(argv=None) -> int:
     failed = any(
         r.get("outcome") in (
             "stopped", "stage_failed", "activate_failed", "merge_failed",
-            "main_moved", "main_unverified", "install_not_verified",
+            "main_moved", "main_unverified", "install_not_verified", "checkout_missing",
         )
         for r in results
     )
