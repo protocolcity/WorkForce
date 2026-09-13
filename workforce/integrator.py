@@ -223,6 +223,7 @@ def load_config(path: str) -> Dict[str, Any]:
             _DEFAULT_COORDINATOR_LOCK_TTL_SECS,
         ),
         "checkout_template": raw.get("checkout_template", _DEFAULT_CHECKOUT_TEMPLATE),
+        "checkout_templates": dict(raw.get("checkout_templates") or {}),
         "branch_template": raw.get("branch_template", _DEFAULT_BRANCH_TEMPLATE),
         "active_implementation_cap": raw.get("active_implementation_cap"),
         "workspace_root": raw.get("workspace_root") or str(Path(local_root).parent),
@@ -411,7 +412,9 @@ def wait_for_reviewer_ledger(
         sleep_fn(poll_interval_secs)
 
 
-_WORKDIR_MARKER_RE = re.compile(r"(?m)^Workdir:\s*(\S+)")
+# A seat evidence note is rendered by WorkLane as a blockquote, so the
+# Workdir: line may carry a leading "> " (pc-1487 rehearsal).
+_WORKDIR_MARKER_RE = re.compile(r"(?m)^(?:>\s*)?Workdir:\s*(\S+)")
 
 
 def _git_worktree_head_branch(path: str) -> Optional[str]:
@@ -469,7 +472,10 @@ def workdir_from_comments(
         if seat is not None and str(c.get("author") or "") != seat:
             continue
         body = str(c.get("body") or "")
-        if not body.lstrip().startswith("Owner:"):
+        # The Workdir line may sit in the seat's Owner claim or in one of its
+        # signed evidence notes (seats record it there); the author check above
+        # is the trust boundary, not the comment heading (pc-1487 rehearsal).
+        if not (body.lstrip().startswith("Owner:") or "Workdir:" in body):
             continue
         m = _WORKDIR_MARKER_RE.search(body)
         if m:
@@ -1183,7 +1189,8 @@ def _checkout_path(config: Dict[str, Any], order: Dict[str, Any]) -> str:
     override = order.get("checkout_override")
     if override:
         return override
-    rel = config["checkout_template"].format(worker=order["worker"], task_id=order["task_id"])
+    template = (config.get("checkout_templates") or {}).get(order["worker"]) or config["checkout_template"]
+    rel = template.format(worker=order["worker"], task_id=order["task_id"])
     return os.path.join(config["workspace_root"], rel)
 
 
@@ -1673,7 +1680,19 @@ def run_one(
 
     append_ledger_row(config["local_root"], project, "DISCOVER", ticket=task_id, worker=order["worker"])
 
-    suite = ops["run_suites"](checkout)
+    try:
+        suite = ops["run_suites"](checkout)
+    except FileNotFoundError:
+        # The seat's checkout is not where the template or its Workdir line
+        # says (pc-1487 rehearsal): stop this order with a durable comment
+        # instead of letting the whole pass die.
+        reason = "checkout missing: %s (seat Workdir: line or checkout_templates needed)" % checkout
+        ops["post_comment"](task_id, stopped_comment_body(reason))
+        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        result["outcome"] = "checkout_missing"
+        result["reason"] = reason
+        write_receipt(config["local_root"], project, result)
+        return result
     append_ledger_row(config["local_root"], project, "SUITES", ticket=task_id, rc=suite["rc"])
     decision = decide_after_suites(suite["rc"], rounds_used, config["max_recovery_rounds"])
     result["suites"] = {"rc": suite["rc"]}
@@ -1932,7 +1951,7 @@ def main(argv=None) -> int:
     failed = any(
         r.get("outcome") in (
             "stopped", "stage_failed", "activate_failed", "merge_failed",
-            "main_moved", "main_unverified", "install_not_verified",
+            "main_moved", "main_unverified", "install_not_verified", "checkout_missing",
         )
         for r in results
     )
