@@ -683,12 +683,13 @@ def run(config: Dict[str, Any], mode: str = "inspect",
             v["reason"] = "max_dispatch bound reached this pass"
     # wf-263 — align supervisor dispatch with the same active-implementation
     # cap the coordinator uses; clamp to headroom and refuse when at capacity.
-    # Lock scan only — never reload roster here (recheck path owns that load).
     capacity_blocked = False
     capacity_reason = ""
     if mode == "execute" and eligible:
+        proposed_seats = sorted({a["worker"] for a in eligible})
         cap_reason = pq_mod.dispatch_blocked_by_capacity(
             config["local_root"], config=config,
+            proposed_seats=proposed_seats,
         )
         if cap_reason:
             capacity_blocked = True
@@ -701,9 +702,20 @@ def run(config: Dict[str, Any], mode: str = "inspect",
         else:
             snap = pq_mod.implementation_capacity_snapshot(
                 config["local_root"], config=config,
+                exclude_workers=proposed_seats,
             )
-            headroom = int(snap.get("headroom") or 0)
-            if headroom < len(eligible):
+            headroom = max(0, int(snap.get("headroom") or 0))
+            if headroom <= 0:
+                capacity_blocked = True
+                capacity_reason = (
+                    "active implementation headroom %d — at capacity" % headroom
+                )
+                for v in validations:
+                    if v["valid"]:
+                        v["valid"] = False
+                        v["reason"] = capacity_reason
+                eligible = []
+            elif headroom < len(eligible):
                 kept = eligible[:headroom]
                 for v in validations:
                     if v["valid"] and v["action"] not in kept:

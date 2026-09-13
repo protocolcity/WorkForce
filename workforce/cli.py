@@ -1071,7 +1071,13 @@ def main(argv=None) -> int:
                 return 1
         cfg = {}
         if getattr(args, "cap", None) is not None:
-            cfg["active_implementation_cap"] = int(args.cap)
+            try:
+                cfg["active_implementation_cap"] = pq_mod.resolve_active_implementation_cap(
+                    {"active_implementation_cap": int(args.cap)},
+                )
+            except ValueError as exc:
+                print("qualify: cap: %s" % exc, file=sys.stderr)
+                return 1
         report = pq_mod.build_qualification_report(
             local_root, r.workers, evidence=evidence,
             window_days=max(1, int(getattr(args, "window_days", 7) or 7)),
