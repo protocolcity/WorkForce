@@ -389,6 +389,23 @@ def main(argv=None) -> int:
         help="remove existing file for the date and rewrite",
     )
 
+    p_integrate = sub.add_parser(
+        "integrate",
+        help="integrator job — deterministic post-shift pipeline (wf-265): "
+             "suites, PR, reviewer, findings, recovery, merge, install, close",
+    )
+    p_integrate.add_argument(
+        "--config", required=True,
+        help="absolute path to a per-project integration config JSON",
+    )
+    p_integrate.add_argument(
+        "--dry-run", action="store_true", help="print the plan; write nothing",
+    )
+    p_integrate.add_argument(
+        "--limit", type=int, default=1,
+        help="max parked orders to drive this pass (default: 1)",
+    )
+
     p_repin = sub.add_parser(
         "repin",
         help="Mode B re-pin: stage policy-checked roster diff + citizen --apply",
@@ -1097,6 +1114,28 @@ def main(argv=None) -> int:
             print("qualify: %s" % json_path)
             print("qualify: %s" % md_path)
         return 0
+
+    if args.cmd == "integrate":
+        from . import integrator as integrator_mod
+        try:
+            cfg = integrator_mod.load_config(args.config)
+            results = integrator_mod.run_pass(
+                cfg, dry_run=args.dry_run, limit=args.limit,
+            )
+        except integrator_mod.IntegratorError as exc:
+            print("integrate: %s" % exc, file=sys.stderr)
+            return 1
+        if not results:
+            print("integrate: no eligible parked orders")
+            return 0
+        for r in results:
+            reason = (" (%s)" % r["reason"]) if r.get("reason") else ""
+            print("integrate: %s — %s%s" % (r.get("task_id", "?"), r.get("outcome"), reason))
+        failed = any(
+            r.get("outcome") in ("stopped", "stage_failed", "activate_failed")
+            for r in results
+        )
+        return 1 if failed else 0
 
     if args.cmd == "digest-upsert":
         from . import digest_upsert as digest_mod
