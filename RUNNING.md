@@ -14,7 +14,7 @@ Run package tests with `python -m pytest tests -q`. Live dispatch is not a packa
 
 A `manual` (or other non-cron) schedule requires explicit `dispatch` or `fire_now`. Ticket events and route wakes do not start these workers. This is suitable for proving one authenticated implementation loop before enabling recurring work. A cron schedule opts into automatic clock and queue-event dispatch.
 
-Record a dedicated identity and project queue, an isolated checkout, provider authentication, allowed writes, wall-clock budget, empty/fault behavior, and result evidence. CLI discovery is not authentication; a START or queue-candidate CLAIM ledger row is not proof of a WorkLane claim. Verify the signed WorkLane Owner record and delivery before calling a run successful. A local CLI calling a hosted model is local execution, not a remote host.
+Record a dedicated identity and project queue, an isolated checkout, provider authentication, allowed writes, wall-clock budget, empty/fault behavior, and result evidence. CLI discovery is not authentication; a START or CANDIDATE ledger row is not proof of a WorkLane claim. Verify the signed WorkLane Owner record and delivery before calling a run successful. A local CLI calling a hosted model is local execution, not a remote host.
 
 ## Reusable task preparation
 

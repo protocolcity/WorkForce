@@ -73,40 +73,59 @@ def test_dry_run_spawns_nothing(tmp_path):
     assert "dry_run=1" in ledger_text(tmp_path)
 
 
-def test_dispatch_records_claim_from_ready_tasks(tmp_path):
-    """wf-158: START is followed by CLAIM ticket=… when ready payload lists tasks."""
+def test_dispatch_records_candidate_from_ready_tasks(tmp_path):
+    """wf-250: START is followed by CANDIDATE ticket=… when ready lists tasks."""
     w = make_worker(tmp_path)
     (tmp_path / "queue.json").write_text(json.dumps({
         "ok": True,
         "count": 2,
         "product": "workforce",
         "tasks": [
-            {"id": "wf-158", "title": "Engine-owned claim truth", "priority": 3},
+            {"id": "wf-158", "title": "Dispatch candidate truth", "priority": 3},
             {"id": "wf-159", "title": "next", "priority": 2},
         ],
     }))
-    # file:// probes have no product= query — CLAIM still carries ticket/title
+    # file:// probes have no product= query — CANDIDATE still carries ticket/title
     assert engine.dispatch(w, local(tmp_path)) == 0
     text = ledger_text(tmp_path)
     assert " START " in text
-    assert " CLAIM " in text and "ticket=wf-158" in text
+    assert " CANDIDATE " in text and "ticket=wf-158" in text
+    assert " CLAIM " not in text
     assert "ticket=wf-159" in text
     assert "title=" in text
-    # shift terminals clear open_claims window
-    from workforce.ledger import open_claims
+    from workforce.ledger import open_candidates, open_claims
     assert open_claims(text) == []
+    assert [c["ticket"] for c in open_candidates(text)] == []
 
 
-def test_dispatch_claim_absent_when_probe_is_count_only(tmp_path):
-    """Count-only ready probes stay valid; CLAIM is best-effort."""
+def test_dispatch_candidate_not_confirmed_claim(tmp_path):
+    """wf-250: worker that never wl_claims keeps candidate context, not ownership."""
+    w = make_worker(tmp_path)
+    (tmp_path / "queue.json").write_text(json.dumps({
+        "ok": True,
+        "count": 1,
+        "tasks": [{"id": "wf-248", "title": "MCP blocked before claim"}],
+    }))
+    assert engine.dispatch(w, local(tmp_path), dry_run=True) == 0
+    text = ledger_text(tmp_path)
+    from workforce.ledger import open_candidates, open_claims
+    assert open_claims(text) == []
+    cands = open_candidates(text)
+    assert len(cands) == 0  # dry-run DONE closes the candidate window
+    assert " CANDIDATE " in text and "ticket=wf-248" in text
+    assert " CLAIM " not in text
+
+
+def test_dispatch_candidate_absent_when_probe_is_count_only(tmp_path):
+    """Count-only ready probes stay valid; CANDIDATE is best-effort."""
     w = make_worker(tmp_path)
     (tmp_path / "queue.json").write_text(json.dumps({"ok": True, "count": 1}))
     assert engine.dispatch(w, local(tmp_path)) == 0
-    assert " CLAIM " not in ledger_text(tmp_path)
+    assert " CANDIDATE " not in ledger_text(tmp_path)
 
 
-def test_dry_run_records_claim_then_clears(tmp_path):
-    """Dry-run still writes CLAIM so verification can see handed work orders."""
+def test_dry_run_records_candidate_then_clears(tmp_path):
+    """Dry-run still writes CANDIDATE so verification can see handed work orders."""
     w = make_worker(tmp_path)
     (tmp_path / "queue.json").write_text(json.dumps({
         "ok": True, "count": 1,
@@ -114,10 +133,12 @@ def test_dry_run_records_claim_then_clears(tmp_path):
     }))
     assert engine.dispatch(w, local(tmp_path), dry_run=True) == 0
     text = ledger_text(tmp_path)
-    assert " CLAIM " in text and "ticket=wf-1" in text
+    assert " CANDIDATE " in text and "ticket=wf-1" in text
+    assert " CLAIM " not in text
     assert "dry_run=1" in text
-    from workforce.ledger import open_claims
+    from workforce.ledger import open_candidates, open_claims
     assert open_claims(text) == []
+    assert open_candidates(text) == []
 
 
 def test_empty_queue_skips_cleanly(tmp_path):
@@ -193,7 +214,7 @@ def test_revalidate_skips_foreign_claim_on_task_refetch(tmp_path, monkeypatch):
 
 
 def test_revalidate_keeps_backlog_and_dispatches(tmp_path, monkeypatch):
-    """wf-163: re-fetch still backlog → CLAIM + spawn as before."""
+    """wf-163: re-fetch still backlog → CANDIDATE + spawn as before."""
     marker = tmp_path / "ran"
     w = make_worker(
         tmp_path,
@@ -220,7 +241,8 @@ def test_revalidate_keeps_backlog_and_dispatches(tmp_path, monkeypatch):
     assert marker.exists()
     text = ledger_text(tmp_path)
     assert " START " in text
-    assert " CLAIM " in text and "ticket=pc-1111" in text
+    assert " CANDIDATE " in text and "ticket=pc-1111" in text
+    assert " CLAIM " not in text
     assert "foreign claim" not in text
 
 

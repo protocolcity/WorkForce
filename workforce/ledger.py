@@ -1,14 +1,15 @@
 """Ledger — the append-only per-worker record of shifts (RUNNER_SPEC §8).
 
 One file per worker under ``local/ledger/<worker>.log``. Events:
-START / DONE / STOP / SKIP / ERROR / WARN / SCOPE_DENY / CLAIM, each
-UTC-timestamped, with key=value pairs. The board reads this; nothing ever
-rewrites it.
+START / DONE / STOP / SKIP / ERROR / WARN / SCOPE_DENY / CANDIDATE / CLAIM,
+each UTC-timestamped, with key=value pairs. The board reads this; nothing
+ever rewrites it.
 
-CLAIM records which work order the engine handed a shift. Open
-claims live inside a START..(STOP|ERROR|dry-run DONE) window and clear
-when that window closes — no UNCLAIM event. Scene light path reads them
-so the live work line does not need a desk round-trip.
+CANDIDATE records ready work orders the engine handed a shift for dispatch.
+Legacy CLAIM rows mean the same dispatch-input history (wf-158) and are not
+confirmed WorkLane ownership. Open candidate rows live inside a
+START..(STOP|ERROR|dry-run DONE) window and clear when that window closes.
+Confirmed claims are authoritative from WorkLane, not from these rows.
 """
 
 import datetime
@@ -19,7 +20,10 @@ from typing import List, Optional, Union
 from ._utils import _parse_iso_z, _utc_iso_z, _utcnow
 
 EVENTS = ("START", "DONE", "STOP", "SKIP", "ERROR", "WARN", "GHOST", "SCOPE_DENY",
-          "HOST_MUTATION_DENY", "CLAIM")
+          "HOST_MUTATION_DENY", "CANDIDATE", "CLAIM")
+
+# Legacy wf-158 dispatch-input rows; not confirmed WorkLane ownership.
+_CANDIDATE_EVENTS = frozenset({"CANDIDATE", "CLAIM"})
 
 
 def _fmt(value: Union[str, int, float]) -> str:
@@ -138,15 +142,14 @@ def parse_shifts(text: str, limit: int = 20) -> List[dict]:
     return list(reversed(shifts))[:limit]
 
 
-def open_claims(text: str) -> List[dict]:
-    """CLAIM rows attached to the currently open (running) shift, if any.
+def open_candidates(text: str) -> List[dict]:
+    """CANDIDATE rows (and legacy CLAIM dispatch-input rows) in the open shift.
 
-    A CLAIM is open while its enclosing START has no terminal STOP / ERROR /
-    dry-run DONE. Multi-pass DONE lines do not clear claims. Empty list when
-    no shift is open — terminal events "clear" by closing the window.
+    Multi-pass DONE lines do not clear candidates. Empty when no shift is
+    open — terminal events close the window.
     """
     in_shift = False
-    claims: List[dict] = []
+    out: List[dict] = []
     for line in text.splitlines():
         ev = _parse_line(line)
         if ev is None:
@@ -154,15 +157,27 @@ def open_claims(text: str) -> List[dict]:
         kind = ev["event"]
         if kind == "START":
             in_shift = True
-            claims = []
-        elif kind == "CLAIM" and in_shift:
+            out = []
+        elif kind in _CANDIDATE_EVENTS and in_shift:
             row = {k: v for k, v in ev.items() if k not in ("ts", "event")}
             row["ts"] = ev["ts"]
-            claims.append(row)
+            if kind == "CLAIM":
+                row["legacy_claim"] = "1"
+            out.append(row)
         elif kind == "DONE" and in_shift and ev.get("dry_run") == "1":
             in_shift = False
-            claims = []
+            out = []
         elif kind in ("STOP", "ERROR") and in_shift:
             in_shift = False
-            claims = []
-    return claims if in_shift else []
+            out = []
+    return out if in_shift else []
+
+
+def open_claims(text: str) -> List[dict]:
+    """Confirmed work-order claims in the open shift.
+
+    CANDIDATE and legacy CLAIM dispatch-input rows are not ownership evidence.
+    Nothing appends confirmed-claim rows yet — WorkLane Owner markers stay
+    authoritative and holdings come from desk probes when queried.
+    """
+    return []

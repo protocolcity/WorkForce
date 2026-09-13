@@ -9,7 +9,7 @@ import workforce.api.roster as _api_roster  # noqa: E402
 from workforce.board import (  # noqa: E402
     _contract_rules, _law_stack, _worker_flags, _worker_queue, worker_model,
 )
-from workforce.ledger import open_claims, parse_shifts  # noqa: E402
+from workforce.ledger import open_candidates, open_claims, parse_shifts  # noqa: E402
 from workforce.roster import Roster, Worker  # noqa: E402
 
 LEDGER = """\
@@ -50,7 +50,7 @@ def test_parse_shifts_dry_run_closes_at_done():
     assert s["outcome"] == "ok" and s["dry_run"] and s["reason"] == "dry-run"
 
 
-def test_open_claims_empty_when_no_open_shift():
+def test_open_claims_empty_for_dispatch_input_rows():
     assert open_claims(LEDGER) == []
     text = ("2026-07-14T04:00:00Z START identity=x kind=lane queue=1 dry_run=0\n"
             "2026-07-14T04:00:01Z CLAIM ticket=wf-1 title=hello product=workforce\n"
@@ -59,50 +59,54 @@ def test_open_claims_empty_when_no_open_shift():
     assert open_claims(text) == []
 
 
-def test_open_claims_tracks_running_shift_and_clears_on_error():
+def test_open_candidates_tracks_running_shift_and_clears_on_error():
     import datetime
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     open_text = (
         "%s START identity=x kind=lane queue=2 dry_run=0\n"
-        "%s CLAIM ticket=wf-158 title=\"Engine claim\" product=workforce priority=3\n"
-        "%s CLAIM ticket=wf-159 title=other product=workforce\n"
+        "%s CLAIM ticket=wf-158 title=\"Legacy dispatch input\" product=workforce priority=3\n"
+        "%s CANDIDATE ticket=wf-159 title=other product=workforce\n"
     ) % (now, now, now)
-    held = open_claims(open_text)
+    held = open_candidates(open_text)
     assert [c["ticket"] for c in held] == ["wf-158", "wf-159"]
-    assert held[0]["title"] == "Engine claim"
+    assert held[0]["title"] == "Legacy dispatch input"
     assert held[0]["product"] == "workforce"
+    assert held[0]["legacy_claim"] == "1"
+    assert "legacy_claim" not in held[1]
+    assert open_claims(open_text) == []
     # multi-pass DONE does not clear
     mid = open_text + "%s DONE rc=0 on_pass=1\n" % now
-    assert len(open_claims(mid)) == 2
+    assert len(open_candidates(mid)) == 2
     # ERROR closes the window
     closed = mid + "%s ERROR reason=\"killed at budget\"\n" % now
-    assert open_claims(closed) == []
+    assert open_candidates(closed) == []
 
 
-def test_open_claims_clears_on_dry_run_done():
+def test_open_candidates_clears_on_dry_run_done():
     text = ("2026-07-14T04:00:00Z START identity=x kind=lane queue=1 dry_run=1\n"
-            "2026-07-14T04:00:00Z CLAIM ticket=wf-1 title=t product=workforce\n"
+            "2026-07-14T04:00:00Z CANDIDATE ticket=wf-1 title=t product=workforce\n"
             "2026-07-14T04:00:00Z DONE dry_run=1 argv_head=cli argv_len=3\n")
+    assert open_candidates(text) == []
     assert open_claims(text) == []
 
 
-def test_ledger_holdings_maps_open_claims(tmp_path):
+def test_ledger_candidates_maps_open_candidates(tmp_path):
     import datetime
     local = tmp_path / "local"
     (local / "ledger").mkdir(parents=True)
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     (local / "ledger" / "kai.log").write_text(
         "%s START identity=kai kind=lane queue=1 dry_run=0\n"
-        "%s CLAIM ticket=wf-158 title=\"Engine-owned claim\" product=workforce priority=3\n"
+        "%s CANDIDATE ticket=wf-158 title=\"Dispatch candidate\" product=workforce priority=3\n"
         % (now, now)
     )
-    held = _api_roster._ledger_holdings(str(local), "kai", owner="kai")
+    held = _api_roster._ledger_candidates(str(local), "kai")
     assert len(held) == 1
     assert held[0]["id"] == "wf-158"
-    assert held[0]["title"] == "Engine-owned claim"
+    assert held[0]["title"] == "Dispatch candidate"
     assert held[0]["product"] == "workforce"
     assert held[0]["priority"] == 3
-    assert held[0]["owner"] == "kai"
+    assert held[0]["status"] == "candidate"
     assert held[0]["source"] == "ledger"
     assert "open=wf-158" in held[0]["href"]
 
