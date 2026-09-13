@@ -73,6 +73,17 @@ existing reservation with a fresh prompt, result path, and receipt (marked
 `state: "recovered"` with `recovery_of` and `recovery_reason`); it never
 overwrites earlier evidence.
 
+The recovered attempt's prompt always carries the reason so the seat sees why
+it was recovered instead of silently re-running the fresh-preparation prompt
+(wf-257 — a recovery whose reason went unread ran a no-op shift). Rendering
+passes `recovery_reason`, `recovery_attempt`, and `recovery_of` into the
+template fields (empty strings on a fresh preparation, so a template that
+references them never renders a literal placeholder), and a "Recovery: this
+is recovery attempt N of \<task\>. Reason: \<text\>. Act on the reason before
+anything else." block is always prepended to the rendered prompt when the
+reason is non-empty — even for a host template with no `{recovery_reason}`
+slot, so existing worker prompts benefit without editing.
+
 A per-reservation OS lock (`state_dir/worker/task-id/lock`, held open across
 the provider's exec) excludes a second start against the same reservation.
 Because the lock is tied to the holding process's open file descriptor, the
@@ -117,8 +128,11 @@ provider is actually running. `workforce dispatch <worker> --recover-receipt
 `engine.dispatch` instead: the two flags are appended to the worker's own
 `command` argv (a task_runner-based worker command is exactly the invocation
 above), and the shift's ledger START/CANDIDATE/STOP (or ERROR) rows are tagged
-`recovery=1`. The engine still holds its own per-worker lock and enforces the
-worker's budget for the recovered attempt, and still makes no WorkLane writes.
+`recovery=1`; the CANDIDATE row also carries `reason` (first 80 chars of the
+recovery reason) and `reason_sha` (its sha256, truncated) so the ledger names
+why the recovery ran, not just that it did. The engine still holds its own
+per-worker lock and enforces the worker's budget for the recovered attempt,
+and still makes no WorkLane writes.
 task_runner's own reservation lock and ready-eligibility re-check, run inside
 the spawned subprocess, are unchanged — a second concurrent start (through the
 engine or run directly) is still refused, and an ungated task still fails
