@@ -107,6 +107,12 @@ def load_config(path: str) -> Dict[str, Any]:
     time_budget = _positive_int(raw["time_budget_secs"], "time_budget_secs")
     output_budget = _positive_int(raw["output_budget_bytes"], "output_budget_bytes")
     max_dispatch = _positive_int(raw["max_dispatch"], "max_dispatch")
+    stop_file = raw.get("stop_file")
+    if stop_file is not None:
+        stop_file = str(_abs_path(stop_file, "stop_file"))
+    max_consecutive_provider_failures = raw.get("max_consecutive_provider_failures", 3)
+    max_consecutive_provider_failures = _positive_int(
+        max_consecutive_provider_failures, "max_consecutive_provider_failures")
     return {
         "local_root": str(local_root),
         "roster_path": str(roster_path),
@@ -116,6 +122,8 @@ def load_config(path: str) -> Dict[str, Any]:
         "time_budget_secs": time_budget,
         "output_budget_bytes": output_budget,
         "max_dispatch": max_dispatch,
+        "stop_file": stop_file,
+        "max_consecutive_provider_failures": max_consecutive_provider_failures,
     }
 
 
@@ -232,6 +240,103 @@ def collect_state(config: Dict[str, Any]) -> Dict[str, Any]:
         "workers": eligible,
         "excluded_workers": excluded,
     }
+
+
+def _has_eligible_ready_work(state: Dict[str, Any]) -> bool:
+    """True when at least one worker row is actually dispatchable right now.
+
+    Mirrors ``_validate_action``'s dispatch-eligibility criteria (not busy,
+    no monitoring flag, non-empty ready feed): a busy or stale-flagged
+    worker still appears in ``state["workers"]`` with its ``ready_task_ids``
+    so an operator can see it, but it can never be dispatched, so it must
+    not count toward the empty-scope skip either -- otherwise the pass would
+    launch the provider only to have every proposal rejected as invalid.
+    """
+    return any(
+        not row["busy"] and not row["monitoring_flag"] and row["ready_task_ids"]
+        for row in state["workers"].values()
+    )
+
+
+def _recent_provider_invoking_reports(local_root: str, limit: int) -> List[Dict[str, Any]]:
+    """The newest ``limit`` provider-invoking evidence reports, newest first.
+
+    Ordering is by filename, not by parsing each report's own ``generated_at``
+    -- the filename's timestamp prefix is assigned by ``_write_evidence`` at
+    write time from the same source, so it sorts identically for well-formed
+    reports without requiring every file to be opened just to order them, and
+    it still gives a filename-based freshness ordering even when a report's
+    own content is unreadable/malformed. An unreadable/malformed report is
+    represented as ``provider_ok: False`` -- fail closed, since a corrupt
+    report must never silently hide a failure streak from the escalation
+    check. Reports for a pass that never reached the provider
+    (``provider_skipped: True`` -- stopped_by_operator, no_eligible_ready_work,
+    or a prior escalated_provider_failures skip) are walked past entirely,
+    not just excluded from the count: the consecutive-failure streak is a
+    property of actual provider outcomes, so a skip in between two failures
+    must not break the streak, and an escalated skip must not silently reset
+    it either -- only a real provider success (including on an acknowledged
+    pass) ends it.
+    """
+    out_dir = os.path.join(local_root, "reports", "supervisor")
+    if not os.path.isdir(out_dir):
+        return []
+    names = sorted((n for n in os.listdir(out_dir) if n.endswith(".json")), reverse=True)
+    reports: List[Dict[str, Any]] = []
+    for name in names:
+        if len(reports) >= limit:
+            break
+        path = os.path.join(out_dir, name)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if not isinstance(data, dict):
+                raise ValueError("evidence report is not a JSON object")
+        except (OSError, ValueError, json.JSONDecodeError):
+            reports.append({"provider_ok": False})
+            continue
+        if data.get("provider_skipped"):
+            continue
+        reports.append(data)
+    return reports
+
+
+def _provider_failures_escalated(local_root: str, limit: int) -> bool:
+    """True only when at least ``limit`` provider-invoking reports exist and
+    every one of the newest ``limit`` recorded an explicit provider failure
+    (``provider_ok is False``). Fewer than ``limit`` such reports means there
+    is not yet enough history to prove a full consecutive-failure streak, so
+    this never escalates on a thin history."""
+    reports = _recent_provider_invoking_reports(local_root, limit)
+    if len(reports) < limit:
+        return False
+    return all(r.get("provider_ok") is False for r in reports)
+
+
+def _skip_result(generated_at: str, mode: str, pass_outcome: str,
+                  state_before_provider: Optional[Dict[str, Any]] = None,
+                  acknowledgement: Optional[str] = None) -> Dict[str, Any]:
+    """Build a complete evidence-shaped result for a pass that never reaches
+    the provider (operator stop, empty scope, or escalated failures)."""
+    result: Dict[str, Any] = {
+        "generated_at": generated_at,
+        "mode": mode,
+        "pass_outcome": pass_outcome,
+        "state_before_provider": state_before_provider,
+        "state_after_provider": None,
+        "provider_skipped": True,
+        "provider_ok": None,
+        "provider_error": None,
+        "proposals": [],
+        "dispatch_attempted": 0,
+        "dispatch_started": 0,
+        "dispatch_completed": 0,
+        "dispatch_failed": 0,
+        "dispatched": [],
+    }
+    if acknowledgement is not None:
+        result["provider_failure_acknowledgement"] = acknowledgement
+    return result
 
 
 def _kill_process_group(proc: "subprocess.Popen") -> None:
@@ -514,11 +619,45 @@ def _dispatch_one(config: Dict[str, Any], worker_name: str, project: str) -> Dic
     }
 
 
-def run(config: Dict[str, Any], mode: str = "inspect") -> Dict[str, Any]:
-    """One bounded pass. ``mode`` is ``inspect`` (default, no dispatch) or ``execute``."""
+def run(config: Dict[str, Any], mode: str = "inspect",
+        acknowledge_provider_failures: Optional[str] = None) -> Dict[str, Any]:
+    """One bounded pass. ``mode`` is ``inspect`` (default, no dispatch) or ``execute``.
+
+    Cheapest, most operator-controllable checks run first, each able to end
+    the pass without ever launching the provider: an operator ``stop_file``
+    (checked before any state is even collected), then an empty-scope check
+    against a fresh snapshot, then a consecutive-provider-failure escalation
+    read from this module's own recent evidence. ``acknowledge_provider_
+    failures`` lifts the escalation refusal for this one pass only and is
+    recorded in that pass's evidence -- it never resets the streak itself.
+    """
     if mode not in ("inspect", "execute"):
         raise SupervisorError("mode must be 'inspect' or 'execute'")
+
+    stop_file = config.get("stop_file")
+    if stop_file and os.path.exists(stop_file):
+        result = _skip_result(_utc_iso_z(), mode, "stopped_by_operator")
+        _write_evidence(config["local_root"], result)
+        return result
+
     state_before_provider = collect_state(config)
+
+    if not _has_eligible_ready_work(state_before_provider):
+        result = _skip_result(
+            state_before_provider["generated_at"], mode, "no_eligible_ready_work",
+            state_before_provider=state_before_provider)
+        _write_evidence(config["local_root"], result)
+        return result
+
+    if acknowledge_provider_failures is None and _provider_failures_escalated(
+        config["local_root"], config.get("max_consecutive_provider_failures", 3),
+    ):
+        result = _skip_result(
+            state_before_provider["generated_at"], mode, "escalated_provider_failures",
+            state_before_provider=state_before_provider)
+        _write_evidence(config["local_root"], result)
+        return result
+
     provider_result = _run_provider(
         config["provider_argv"], state_before_provider,
         config["time_budget_secs"], config["output_budget_bytes"],
@@ -544,11 +683,19 @@ def run(config: Dict[str, Any], mode: str = "inspect") -> Dict[str, Any]:
                 for a in eligible
             ]
             dispatch_results = [f.result() for f in futures]
+    if not provider_result["ok"]:
+        pass_outcome = "provider_failed"
+    elif mode == "execute":
+        pass_outcome = "dispatched"
+    else:
+        pass_outcome = "proposed"
     result: Dict[str, Any] = {
         "generated_at": state_after_provider["generated_at"],
         "mode": mode,
+        "pass_outcome": pass_outcome,
         "state_before_provider": state_before_provider,
         "state_after_provider": state_after_provider,
+        "provider_skipped": False,
         "provider_ok": provider_result["ok"],
         "provider_error": provider_result.get("error"),
         "proposals": validations,
@@ -561,6 +708,8 @@ def run(config: Dict[str, Any], mode: str = "inspect") -> Dict[str, Any]:
         "dispatch_failed": sum(1 for d in dispatch_results if d.get("failed")),
         "dispatched": dispatch_results,
     }
+    if acknowledge_provider_failures is not None:
+        result["provider_failure_acknowledgement"] = acknowledge_provider_failures
     _write_evidence(config["local_root"], result)
     return result
 
@@ -595,12 +744,31 @@ def main(argv=None):
     parser.add_argument("--config", required=True, help="Absolute path to a supervisor config JSON file")
     parser.add_argument("--execute", action="store_true",
                          help="Dispatch validated eligible actions instead of inspect/propose only")
+    parser.add_argument("--acknowledge-provider-failures", metavar="REASON", default=None,
+                         help="Lift a consecutive-provider-failure escalation for this pass only; "
+                              "the reason is recorded in this pass's evidence")
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
-        result = run(config, mode="execute" if args.execute else "inspect")
+        result = run(config, mode="execute" if args.execute else "inspect",
+                     acknowledge_provider_failures=args.acknowledge_provider_failures)
     except SupervisorError as exc:
         print("Supervisor pass stopped: %s" % exc, file=sys.stderr)
+        return 1
+    outcome = result["pass_outcome"]
+    if outcome == "stopped_by_operator":
+        print("Supervisor pass stopped by operator stop_file. Evidence: %s" % result["evidence_path"])
+        return 0
+    if outcome == "no_eligible_ready_work":
+        print("Supervisor pass: no eligible ready work in scope; provider not called. "
+              "Evidence: %s" % result["evidence_path"])
+        return 0
+    if outcome == "escalated_provider_failures":
+        print("Supervisor pass stopped: %d consecutive provider failures; refusing to call the "
+              "provider. Re-run with --acknowledge-provider-failures \"reason\" to override this "
+              "pass only. Evidence: %s" % (
+                  config.get("max_consecutive_provider_failures", 3), result["evidence_path"]),
+              file=sys.stderr)
         return 1
     accepted = sum(1 for v in result["proposals"] if v["valid"])
     rejected = len(result["proposals"]) - accepted
