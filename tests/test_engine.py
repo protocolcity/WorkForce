@@ -2121,6 +2121,22 @@ def test_incomplete_stop_with_no_continuation_budget_fails_honestly(tmp_path):
     assert calls.read_text() == "1"  # never blindly retried
 
 
+def test_permission_cancelled_stop_is_denied_not_end_turn_not_budget_kill(tmp_path):
+    """wf-262: grok's real stopReason for a denied run_terminal_command
+    (cancellation_category=permission_cancelled in its own trace) is the
+    same "cancelled" string as any other cancelled turn — it must classify
+    as incomplete/denied, never be confused with a genuine end_turn
+    completion, and never be reported as a budget kill (a distinct failure
+    mode with its own "killed at budget" ledger reason)."""
+    w, calls = _fake_task_runner_worker(tmp_path, continuation_attempts=0)
+    assert engine.dispatch(w, local(tmp_path)) == 1
+    text = ledger_text(tmp_path)
+    assert "incomplete: cancelled" in text
+    assert "killed at budget" not in text
+    assert "DONE" not in text
+    assert calls.read_text() == "1"  # a denied-tool stop is never auto-continued
+
+
 def test_incomplete_stop_auto_continues_through_task_runner_recovery(tmp_path):
     """One bounded continuation reaches end_turn → honest DONE, evidence of the resume."""
     w, calls = _fake_task_runner_worker(tmp_path, continuation_attempts=1)
