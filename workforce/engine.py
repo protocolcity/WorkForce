@@ -1918,10 +1918,15 @@ def dispatch(
         # live ready snapshot may still list other backlog this attempt is
         # not touching (wf-255 review).
         if recover_receipt:
+            candidate_extra = dict(recovery_kv)
+            candidate_extra["reason_sha"] = hashlib.sha256(
+                recovery_reason.encode("utf-8")
+            ).hexdigest()[:12]
+            candidate_extra["reason"] = recovery_reason[:80]
             _record_candidates(
                 ledger, [{"id": recovery_task_id}],
                 product=product_from_queue_url(worker.queue_url) or "",
-                extra=recovery_kv,
+                extra=candidate_extra,
                 limit=1,
             )
         elif ready_tasks:

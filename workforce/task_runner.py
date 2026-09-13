@@ -66,6 +66,17 @@ def _render(value, fields):
     return re.sub(r"\{([a-z_]+)\}", lambda m: fields.get(m[1], m[0]), value)
 
 
+def _recovery_block(task_id, attempt, reason):
+    """Prepend-able notice ensuring the seat sees the recovery reason.
+
+    Rendered unconditionally onto every recovered prompt regardless of
+    whether the seat's own template has a {recovery_reason} slot, so an
+    existing host prompt benefits without editing (wf-257).
+    """
+    return ("Recovery: this is recovery attempt %s of %s. Reason: %s. "
+            "Act on the reason before anything else.\n\n" % (attempt, task_id, reason))
+
+
 def _eligible_tasks(config, fetch):
     """Return (project, worker, eligible tasks) from the authoritative ready feed."""
     project = _slug(config["project"])
@@ -167,7 +178,8 @@ def prepare(config, fetch=_fetch):
         fields = {"project": project, "worker": worker, "task_id": task_id,
                   "branch": branch, "checkout": str(checkout),
                   "git_common_dir": str(common), "result": str(reservation / "result.md"),
-                  "authority": authority_text}
+                  "authority": authority_text,
+                  "recovery_reason": "", "recovery_attempt": "", "recovery_of": ""}
         prompt = _render(prompt_template, fields)
         prompt_path = reservation / "prompt.md"
         prompt_path.write_text(prompt)
@@ -295,8 +307,11 @@ def recover(config, receipt_path, reason, fetch=_fetch, legacy_stop_evidence=Non
     fields = {"project": project, "worker": worker, "task_id": task_id,
               "branch": old["branch"], "checkout": str(checkout),
               "git_common_dir": str(common), "result": str(attempt / "result.md"),
-              "authority": authority_text}
+              "authority": authority_text,
+              "recovery_reason": reason, "recovery_attempt": str(n),
+              "recovery_of": str(canonical_receipt_path)}
     prompt = _render(prompt_template, fields)
+    prompt = _recovery_block(task_id, n, reason) + prompt
     prompt_path = attempt / "prompt.md"
     prompt_path.write_text(prompt)
     fields.update(prompt=prompt, prompt_file=str(prompt_path))

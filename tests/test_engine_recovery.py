@@ -277,6 +277,8 @@ def test_recovery_candidate_names_only_the_recovered_task(tmp_path, prepared, de
     assert "p-2" not in candidate_lines[0]
     assert "p-3" not in candidate_lines[0]
     assert "recovery=1" in candidate_lines[0]
+    assert 'reason="candidate scope check"' in candidate_lines[0]
+    assert "reason_sha=" in candidate_lines[0]
 
 
 def test_recovery_receipt_outside_state_dir_is_refused(tmp_path, prepared, desk):
