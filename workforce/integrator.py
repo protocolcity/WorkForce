@@ -104,6 +104,14 @@ def _str_list(value: Any, field: str) -> List[str]:
     return list(value)
 
 
+def _abs_path_map(value: Any, field: str) -> Dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or not all(isinstance(k, str) and k for k in value):
+        raise IntegratorError("%s must be a string-keyed object of absolute paths" % field)
+    return {k: _abs_path(v, "%s[%s]" % (field, k)) for k, v in value.items()}
+
+
 def _positive_int(value: Any, field: str, default: int) -> int:
     if value is None:
         return default
@@ -158,12 +166,8 @@ def load_config(path: str) -> Dict[str, Any]:
     if verify_cmd is not None:
         verify_cmd = _str_list(verify_cmd, "verify_cmd")
 
-    reviewer_prompt_path = raw.get("reviewer_prompt_path")
-    if reviewer_prompt_path is not None:
-        reviewer_prompt_path = _nonempty_str(reviewer_prompt_path, "reviewer_prompt_path")
-    reviewer_output_path = raw.get("reviewer_output_path")
-    if reviewer_output_path is not None:
-        reviewer_output_path = _nonempty_str(reviewer_output_path, "reviewer_output_path")
+    reviewer_prompt_paths = _abs_path_map(raw.get("reviewer_prompt_paths"), "reviewer_prompt_paths")
+    reviewer_output_paths = _abs_path_map(raw.get("reviewer_output_paths"), "reviewer_output_paths")
     release_root = raw.get("release_root")
     if release_root is not None:
         release_root = _abs_path(release_root, "release_root")
@@ -200,8 +204,8 @@ def load_config(path: str) -> Dict[str, Any]:
         "stage_cmd": stage_cmd,
         "activate_cmd": activate_cmd,
         "reviewer_dispatch_cmd": reviewer_dispatch_cmd,
-        "reviewer_prompt_path": reviewer_prompt_path,
-        "reviewer_output_path": reviewer_output_path,
+        "reviewer_prompt_paths": reviewer_prompt_paths,
+        "reviewer_output_paths": reviewer_output_paths,
         "reviewer_by_provider": reviewer_by_provider,
         "screenshot_cmd": screenshot_cmd,
         "verify_cmd": verify_cmd,
@@ -292,13 +296,20 @@ def reviewer_ledger_offset(local_root: str, reviewer: str) -> int:
 
 
 def latest_reviewer_terminal_event(local_root: str, reviewer: str, since_offset: int) -> Optional[str]:
-    """The reviewer job's DONE/ERROR/STOP row appended after *since_offset* bytes.
+    """``"DONE"``/``"ERROR"``/``None`` from the ledger rows appended after *since_offset*.
 
     ``since_offset`` must be the ledger's size at dispatch time (from
     :func:`reviewer_ledger_offset`) — rows entirely within the first
     *since_offset* bytes are pre-existing and never satisfy the wait, even
-    when their timestamp equals or exceeds the dispatch time. ``None`` when
-    no terminal row has landed in the appended tail yet.
+    when their timestamp equals or exceeds the dispatch time.
+
+    Scans the appended rows in order (not newest-first): a real engine shift
+    with ``max_passes 1`` appends ``DONE`` and then ``STOP`` as its normal
+    end-of-shift marker, so a trailing ``STOP`` after a ``DONE`` must never
+    be read as a failure. ``ERROR`` anywhere fails the wait immediately;
+    ``DONE`` with no ``ERROR`` succeeds regardless of a following ``STOP``;
+    anything else (including a lone ``STOP`` with no ``DONE`` yet) means
+    ``None`` — still running, keep waiting.
     """
     path = _reviewer_ledger_path(local_root, reviewer)
     try:
@@ -307,12 +318,16 @@ def latest_reviewer_terminal_event(local_root: str, reviewer: str, since_offset:
             tail = fh.read()
     except OSError:
         return None
-    for line in reversed(tail.splitlines()):
+    saw_done = False
+    for line in tail.splitlines():
         parts = line.strip().split(" ", 2)
         if len(parts) < 2 or parts[1] not in ("DONE", "ERROR", "STOP"):
             continue
-        return parts[1]
-    return None
+        if parts[1] == "ERROR":
+            return "ERROR"
+        if parts[1] == "DONE":
+            saw_done = True
+    return "DONE" if saw_done else None
 
 
 def wait_for_reviewer_ledger(
@@ -327,9 +342,9 @@ def wait_for_reviewer_ledger(
 ) -> Optional[str]:
     """Poll the reviewer's ledger for a terminal row until *timeout_secs*.
 
-    Returns the terminal event name (``DONE``/``ERROR``/``STOP``) or
-    ``None`` on timeout — the caller treats anything but ``DONE`` as a
-    failed review, never as a clean pass.
+    Returns ``"DONE"``/``"ERROR"``/``None`` (timeout or still running) — the
+    caller treats anything but ``"DONE"`` as a failed review, never as a
+    clean pass.
     """
     deadline = now_fn() + timeout_secs
     while True:
@@ -345,7 +360,12 @@ _WORKDIR_MARKER_RE = re.compile(r"(?m)^Workdir:\s*(\S+)")
 
 
 def workdir_from_comments(
-    comments: Optional[Sequence[Dict[str, Any]]], seat: Optional[str] = None,
+    comments: Optional[Sequence[Dict[str, Any]]],
+    seat: Optional[str] = None,
+    *,
+    task_id: Optional[str] = None,
+    checkout_template: Optional[str] = None,
+    workspace_root: Optional[str] = None,
 ) -> Optional[str]:
     """The seat's latest ``Owner:`` claim comment's ``Workdir:`` line, or ``None``.
 
@@ -356,6 +376,14 @@ def workdir_from_comments(
     comment on the same order must never redirect this seat's checkout — and
     only an absolute path, never a relative one that could resolve outside
     the intended workspace.
+
+    When *task_id* is also given, the claimed path is only accepted when it
+    ends with ``/<task_id>/checkout`` or equals *checkout_template*'s
+    expansion for *seat*/*task_id* — a stale ``Workdir:`` left over from an
+    earlier order on the same seat (e.g. ``.../wf-264/checkout`` while this
+    order is ``wf-265``) must never redirect this order's suites, PR,
+    review, or merge to the wrong tree. Returns ``None`` on a mismatch so
+    the caller falls back to the template.
     """
     workdir: Optional[str] = None
     for c in comments or []:
@@ -371,7 +399,17 @@ def workdir_from_comments(
             candidate = m.group(1).strip()
             if os.path.isabs(candidate):
                 workdir = candidate
-    return workdir
+    if workdir is None or task_id is None:
+        return workdir
+    if workdir.endswith("/%s/checkout" % task_id):
+        return workdir
+    if checkout_template and seat is not None:
+        expansion = os.path.join(
+            workspace_root or "", checkout_template.format(worker=seat, task_id=task_id),
+        )
+        if workdir == expansion:
+            return workdir
+    return None
 
 
 def _read_stable_file(
@@ -981,12 +1019,24 @@ def discover_candidates(
         tid = str(t.get("id") or "").strip()
         if not tid:
             continue
+        comments = t.get("comments")
+        raw_workdir = workdir_from_comments(comments, seat=seat)
+        checkout_override = workdir_from_comments(
+            comments, seat=seat, task_id=tid,
+            checkout_template=config["checkout_template"],
+            workspace_root=config["workspace_root"],
+        )
+        if raw_workdir is not None and checkout_override is None:
+            append_ledger_row(
+                config["local_root"], config["project"], "DISCOVER",
+                ticket=tid, worker=seat, workdir_mismatch=raw_workdir,
+            )
         candidates.append({
             "task_id": tid,
             "worker": seat,
             "provider": provider,
             "title": str(t.get("title") or ""),
-            "checkout_override": workdir_from_comments(t.get("comments"), seat=seat),
+            "checkout_override": checkout_override,
         })
     candidates.sort(key=lambda c: c["task_id"])
     return candidates[:headroom] if headroom < len(candidates) else candidates
@@ -1127,20 +1177,25 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
     def dispatch_reviewer(reviewer: str, prompt: str) -> Dict[str, Any]:
         if not config.get("reviewer_dispatch_cmd"):
             raise IntegratorError("reviewer_dispatch_cmd not configured")
+        prompt_path = (config.get("reviewer_prompt_paths") or {}).get(reviewer)
+        output_path = (config.get("reviewer_output_paths") or {}).get(reviewer)
+        if not prompt_path or not output_path:
+            # The registered reviewer jobs load their prompt from their own
+            # worker-config file and write their transcript to their own
+            # output file — with no mapping for this reviewer there is
+            # nowhere correct to write the prompt or read the review from,
+            # so an unattended merge must never rest on whatever static
+            # prompt happened to be on disk already.
+            raise IntegratorError(
+                "no reviewer_prompt_paths/reviewer_output_paths mapping for reviewer %r"
+                % reviewer
+            )
         argv = [a.replace("{reviewer}", reviewer) for a in config["reviewer_dispatch_cmd"]]
         env = dict(os.environ)
         env["WORKFORCE_DATA_DIR"] = str(Path(config["local_root"]).parent)
         if "--file" not in argv:
             argv = argv + ["--file", config["roster_path"]]
 
-        prompt_tpl = config.get("reviewer_prompt_path")
-        output_tpl = config.get("reviewer_output_path")
-        if not (prompt_tpl and output_tpl):
-            r = _run(argv, input_text=prompt, env=env)
-            return {"ok": r["rc"] == 0, "output": r["output"]}
-
-        prompt_path = prompt_tpl.format(reviewer=reviewer)
-        output_path = output_tpl.format(reviewer=reviewer)
         os.makedirs(os.path.dirname(prompt_path), exist_ok=True)
         with open(prompt_path, "w", encoding="utf-8") as fh:
             fh.write(prompt)

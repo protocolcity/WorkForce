@@ -17,8 +17,14 @@
   "verify_cmd": ["/path/to/project/scripts/print_installed_version.sh"],
   "screenshot_cmd": [],
   "reviewer_dispatch_cmd": ["python3", "-m", "workforce", "dispatch", "{reviewer}"],
-  "reviewer_prompt_path": "/path/to/OneSeo/local/run/{reviewer}.prompt.md",
-  "reviewer_output_path": "/path/to/OneSeo/local/run/{reviewer}.out",
+  "reviewer_prompt_paths": {
+    "workflow-reviewer": "/path/to/OneSeo/local/worker-config/workflow-reviewer/prompt.md",
+    "cursor-reviewer": "/path/to/OneSeo/local/worker-config/cursor-reviewer/workers/cursor-reviewer/prompt.md"
+  },
+  "reviewer_output_paths": {
+    "workflow-reviewer": "/path/to/OneSeo/local/run/workflow-reviewer.out",
+    "cursor-reviewer": "/path/to/OneSeo/local/run/cursor-reviewer.out"
+  },
   "reviewer_by_provider": {
     "cursor": "workflow-reviewer",
     "claude": "cursor-reviewer",
