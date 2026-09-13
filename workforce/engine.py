@@ -416,7 +416,7 @@ def _tasks_from_probe(data: dict) -> List[dict]:
     """Extract task dicts with ids from a ready-probe payload (host-neutral).
 
     Ready feeds commonly ship ``tasks`` (WorkLane); ``items`` is accepted as
-    a synonym. Count-only probes (no task list) yield ``[]`` — CLAIM is a
+    a synonym. Count-only probes (no task list) yield ``[]`` — CANDIDATE is a
     best-effort teaser, never required for dispatch.
     """
     if not isinstance(data, dict):
@@ -490,16 +490,17 @@ def _probe_queue(
     return count
 
 
-def _record_claims(
+def _record_candidates(
     ledger: Ledger,
     tasks: List[dict],
     *,
     product: str = "",
     limit: int = 3,
 ) -> int:
-    """Append CLAIM events for ready tasks handed to this shift.
+    """Append CANDIDATE events for ready tasks handed to this shift.
 
-    Caps at *limit* (scene bay teaser size). Returns how many CLAIMs written.
+    Caps at *limit* (scene bay teaser size). Returns how many rows written.
+    These are dispatch-input evidence, not confirmed WorkLane claims.
     """
     n = 0
     for t in tasks[: max(0, int(limit))]:
@@ -520,7 +521,7 @@ def _record_claims(
                 kv["priority"] = int(pri)  # type: ignore[arg-type]
             except (TypeError, ValueError):
                 kv["priority"] = str(pri)
-        ledger.append("CLAIM", **kv)
+        ledger.append("CANDIDATE", **kv)
         n += 1
     return n
 
@@ -1804,11 +1805,11 @@ def dispatch(worker: Worker, local_root: str, dry_run: bool = False) -> int:
             **chain_kwargs,
         )
 
-        # wf-158 — engine-owned claim truth: record ready work orders this
+        # wf-250 — dispatch-input evidence: record ready work orders this
         # shift was handed (wake-on-route and clock fire both use dispatch).
-        # Cleared by STOP/ERROR/dry-run DONE via open_claims window close.
+        # Cleared by STOP/ERROR/dry-run DONE via open_candidates window close.
         if ready_tasks:
-            _record_claims(
+            _record_candidates(
                 ledger, ready_tasks,
                 product=product_from_queue_url(worker.queue_url) or "",
             )
