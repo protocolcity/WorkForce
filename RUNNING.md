@@ -103,3 +103,27 @@ worker's own config/identity requests the recovery; the new worker signs its
 own WorkLane claim before any writes. The target checkout is always the one
 in the canonical original receipt — never an arbitrary path or foreign
 repository.
+
+## Bounded AI supervisory pass
+
+`python -m workforce.supervisor --config /absolute/path/supervisor.json` is a
+single manual invocation, not a service: an explicit `local_root` (runtime
+home), `roster_path`, `projects`/`workers` allowlists, `provider_argv`, a
+`time_budget_secs`/`output_budget_bytes` pair, and `max_dispatch` are all
+required. Default mode is inspect/propose — it collects a fresh snapshot of
+exactly the configured manual (non-cron) lane workers, hands it to the
+configured provider as untrusted JSON (the provider has no mutation tools and
+cannot exceed the byte cap even mid-stream), and validates every proposed
+`{worker, project, task_id}` action against a re-checked ready feed (exact
+`worker:` label, `backlog` status, matching project, no blocking gate),
+worker allowlist membership, busy/lock state, and recent-shift monitoring
+flags before reporting it eligible. `--execute` dispatches only the actions
+that pass every check, through the existing `engine.dispatch` for that
+worker — which re-probes and works its own ready feed in its own order, so
+the evidence records what the engine actually picked up (ledger `CANDIDATE`
+rows), not merely what was requested. Every pass writes
+`local/reports/supervisor/<timestamp>.json` with the snapshot, provider
+result, validation reasons, and dispatch outcomes; it never closes WorkLane
+work and never invents a recovery — a stale/failed monitoring flag must be
+resolved through the explicit preserved-reservation recovery protocol above,
+not a fresh dispatch.
