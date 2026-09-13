@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import engine
+from . import provider_qualification as pq_mod
 from . import roster as roster_mod
 from ._utils import _utc_iso_z
 from .ledger import parse_shifts
@@ -113,6 +114,10 @@ def load_config(path: str) -> Dict[str, Any]:
     max_consecutive_provider_failures = raw.get("max_consecutive_provider_failures", 3)
     max_consecutive_provider_failures = _positive_int(
         max_consecutive_provider_failures, "max_consecutive_provider_failures")
+    active_implementation_cap = raw.get("active_implementation_cap")
+    if active_implementation_cap is not None:
+        active_implementation_cap = _positive_int(
+            active_implementation_cap, "active_implementation_cap")
     return {
         "local_root": str(local_root),
         "roster_path": str(roster_path),
@@ -124,6 +129,7 @@ def load_config(path: str) -> Dict[str, Any]:
         "max_dispatch": max_dispatch,
         "stop_file": stop_file,
         "max_consecutive_provider_failures": max_consecutive_provider_failures,
+        "active_implementation_cap": active_implementation_cap,
     }
 
 
@@ -675,6 +681,50 @@ def run(config: Dict[str, Any], mode: str = "inspect",
         if v["valid"] and v["action"] not in eligible:
             v["valid"] = False
             v["reason"] = "max_dispatch bound reached this pass"
+    # wf-263 — align supervisor dispatch with the same active-implementation
+    # cap the coordinator uses; clamp to headroom and refuse when at capacity.
+    capacity_blocked = False
+    capacity_reason = ""
+    if mode == "execute" and eligible:
+        proposed_seats = sorted({a["worker"] for a in eligible})
+        cap_reason = pq_mod.dispatch_blocked_by_capacity(
+            config["local_root"], config=config,
+            proposed_seats=proposed_seats,
+        )
+        if cap_reason:
+            capacity_blocked = True
+            capacity_reason = cap_reason
+            for v in validations:
+                if v["valid"]:
+                    v["valid"] = False
+                    v["reason"] = cap_reason
+            eligible = []
+        else:
+            snap = pq_mod.implementation_capacity_snapshot(
+                config["local_root"], config=config,
+                exclude_workers=proposed_seats,
+            )
+            headroom = max(0, int(snap.get("headroom") or 0))
+            if headroom <= 0:
+                capacity_blocked = True
+                capacity_reason = (
+                    "active implementation headroom %d — at capacity" % headroom
+                )
+                for v in validations:
+                    if v["valid"]:
+                        v["valid"] = False
+                        v["reason"] = capacity_reason
+                eligible = []
+            elif headroom < len(eligible):
+                kept = eligible[:headroom]
+                for v in validations:
+                    if v["valid"] and v["action"] not in kept:
+                        v["valid"] = False
+                        v["reason"] = (
+                            "active implementation headroom %d < proposals"
+                            % headroom
+                        )
+                eligible = kept
     dispatch_results: List[Dict[str, Any]] = []
     if mode == "execute" and eligible:
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(eligible)) as pool:
@@ -698,6 +748,8 @@ def run(config: Dict[str, Any], mode: str = "inspect",
         "provider_skipped": False,
         "provider_ok": provider_result["ok"],
         "provider_error": provider_result.get("error"),
+        "capacity_blocked": capacity_blocked,
+        "capacity_reason": capacity_reason,
         "proposals": validations,
         # Truthful counts -- never treat len(dispatch_results) as "dispatched"
         # (a rejected-at-dispatch-time or exception row is neither started
