@@ -9,6 +9,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from workforce import cli  # noqa: E402
 from workforce import engine  # noqa: E402
 from workforce import provider_qualification as pq  # noqa: E402
 from workforce.ledger import Ledger  # noqa: E402
@@ -59,6 +60,16 @@ def test_resolve_active_implementation_cap_from_config():
     assert pq.resolve_active_implementation_cap({"active_implementation_cap": 3}) == 3
 
 
+def test_resolve_active_implementation_cap_rejects_zero():
+    with pytest.raises(ValueError, match=">= 1"):
+        pq.resolve_active_implementation_cap({"active_implementation_cap": 0})
+
+
+def test_resolve_active_implementation_cap_rejects_negative():
+    with pytest.raises(ValueError, match=">= 1"):
+        pq.resolve_active_implementation_cap({"active_implementation_cap": -1})
+
+
 def test_count_active_implementations_ignores_orphan_lock(tmp_path, monkeypatch):
     local = tmp_path / "local"
     local.mkdir()
@@ -96,6 +107,39 @@ def test_dispatch_blocked_by_capacity_when_at_cap(tmp_path, monkeypatch):
     (lock_dir / "pid").write_text("42")
     monkeypatch.setattr(engine, "_pid_alive", lambda pid: True)
     reason = pq.dispatch_blocked_by_capacity(str(local), workers)
+    assert reason is not None
+    assert "cap 1 reached" in reason
+
+
+def _live_lock(local, worker_name, monkeypatch, pid="42"):
+    lock_dir = local / "locks" / ("%s.lock" % worker_name)
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    (lock_dir / "pid").write_text(pid)
+    monkeypatch.setattr(engine, "_pid_alive", lambda _pid: True)
+
+
+def test_dispatch_not_blocked_when_proposed_seat_holds_own_lock(tmp_path, monkeypatch):
+    local = tmp_path / "local"
+    local.mkdir()
+    w = _worker(tmp_path, name="seat-a")
+    workers = {w.name: w}
+    _live_lock(local, w.name, monkeypatch)
+    reason = pq.dispatch_blocked_by_capacity(
+        str(local), workers, proposed_seats=[w.name],
+    )
+    assert reason is None
+
+
+def test_dispatch_blocked_when_different_seat_holds_lock(tmp_path, monkeypatch):
+    local = tmp_path / "local"
+    local.mkdir()
+    holder = _worker(tmp_path, name="seat-a")
+    other = _worker(tmp_path, name="seat-b")
+    workers = {holder.name: holder, other.name: other}
+    _live_lock(local, holder.name, monkeypatch)
+    reason = pq.dispatch_blocked_by_capacity(
+        str(local), workers, proposed_seats=[other.name],
+    )
     assert reason is not None
     assert "cap 1 reached" in reason
 
@@ -180,3 +224,21 @@ def test_format_report_includes_related_work():
     md = pq.format_qualification_report(report)
     assert "wf-260" in md
     assert "wf-262" in md
+
+
+def test_qualify_cap_zero_exits_nonzero(tmp_path, monkeypatch, capsys):
+    data_dir = tmp_path / "wf-home"
+    data_dir.mkdir()
+    local = data_dir / "local"
+    local.mkdir()
+    w = _worker(tmp_path)
+    roster_path = data_dir / "roster.json"
+    spec = {f: getattr(w, f) for f in Worker.__dataclass_fields__ if f != "name"}
+    roster_path.write_text(json.dumps({"workers": {w.name: spec}}))
+    monkeypatch.setenv("WORKFORCE_DATA_DIR", str(data_dir))
+    monkeypatch.delenv("WORKFORCE_ROSTER", raising=False)
+    rc = cli.main(["--file", str(roster_path), "qualify", "--cap", "0"])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "qualify: cap:" in captured.err
+    assert ">= 1" in captured.err

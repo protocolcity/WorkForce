@@ -206,6 +206,15 @@ def _infer_provider_from_worker(worker) -> str:
     return "unknown"
 
 
+def _require_positive_cap(val: Any, label: str) -> int:
+    """Reject non-integers, booleans, zero, and negatives for capacity limits."""
+    if isinstance(val, bool) or not isinstance(val, int):
+        raise ValueError("%s must be a positive integer" % label)
+    if val < 1:
+        raise ValueError("%s must be >= 1" % label)
+    return val
+
+
 def resolve_active_implementation_cap(
     config: Optional[Dict[str, Any]] = None,
 ) -> int:
@@ -216,16 +225,16 @@ def resolve_active_implementation_cap(
     if config is not None:
         val = config.get("active_implementation_cap")
         if val is not None:
-            cap = int(val)
-            if cap < 1:
-                raise ValueError("active_implementation_cap must be >= 1")
-            return cap
+            return _require_positive_cap(val, "active_implementation_cap")
     env = (os.environ.get(ENV_ACTIVE_IMPLEMENTATION_CAP) or "").strip()
     if env:
-        cap = int(env)
-        if cap < 1:
-            raise ValueError("%s must be >= 1" % ENV_ACTIVE_IMPLEMENTATION_CAP)
-        return cap
+        try:
+            cap = int(env)
+        except ValueError:
+            raise ValueError(
+                "%s must be a positive integer" % ENV_ACTIVE_IMPLEMENTATION_CAP
+            ) from None
+        return _require_positive_cap(cap, ENV_ACTIVE_IMPLEMENTATION_CAP)
     return DEFAULT_ACTIVE_IMPLEMENTATION_CAP
 
 
@@ -281,6 +290,7 @@ def implementation_capacity_snapshot(
     *,
     cap: Optional[int] = None,
     config: Optional[Dict[str, Any]] = None,
+    exclude_workers: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """Current active implementations vs the resolved cap."""
     resolved_cap = cap if cap is not None else resolve_active_implementation_cap(config)
@@ -288,11 +298,15 @@ def implementation_capacity_snapshot(
         active = count_active_implementations(local_root, workers)
     else:
         active = scan_active_locks(local_root)
+    exclude = frozenset(exclude_workers or ())
+    if exclude:
+        active = [row for row in active if row["worker"] not in exclude]
+    active_count = len(active)
     return {
         "cap": resolved_cap,
-        "active_count": len(active),
-        "at_capacity": len(active) >= resolved_cap,
-        "headroom": max(0, resolved_cap - len(active)),
+        "active_count": active_count,
+        "at_capacity": active_count >= resolved_cap,
+        "headroom": max(0, resolved_cap - active_count),
         "active": active,
         "scope": (
             "Live locks only — does not count direct task_runner recoveries "
@@ -728,9 +742,16 @@ def dispatch_blocked_by_capacity(
     workers: Optional[Dict[str, object]] = None,
     *,
     config: Optional[Dict[str, Any]] = None,
+    proposed_seats: Optional[Sequence[str]] = None,
 ) -> Optional[str]:
-    """Return a refusal reason when at implementation capacity, else None."""
-    snap = implementation_capacity_snapshot(local_root, workers, config=config)
+    """Return a refusal reason when at implementation capacity, else None.
+
+    ``proposed_seats`` names are excluded from the active count so a seat
+    recovering its own reservation is not refused as additional capacity.
+    """
+    snap = implementation_capacity_snapshot(
+        local_root, workers, config=config, exclude_workers=proposed_seats,
+    )
     if snap["at_capacity"]:
         names = ", ".join(a["worker"] for a in snap["active"]) or "(unknown)"
         return (
