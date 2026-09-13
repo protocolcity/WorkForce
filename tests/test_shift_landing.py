@@ -134,8 +134,8 @@ def test_scan_worker_clear_when_patch_already_on_landing(tmp_path):
     _git(hood, "commit", "-m", "plant ARCHITECTURE.md")
     tip = _git(hood, "rev-parse", "HEAD").stdout.strip()
     _git(hood, "checkout", "main")
-    _git(hood, "cherry-pick", tip)
-    # This git FF-applies the cherry-pick (parent is HEAD) so main == tip.
+    _git(hood, "cherry-pick", "--ff", tip)
+    # Explicit fast-forward avoids relying on identical commit timestamps.
     assert sl.scan_worker(w, str(tmp_path / "local")) is None
 
 
