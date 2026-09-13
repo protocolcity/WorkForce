@@ -57,6 +57,8 @@ def make_config(tmp_path, roster_path, **over):
         time_budget_secs=5,
         output_budget_bytes=65536,
         max_dispatch=2,
+        # Multi-dispatch tests predate wf-263 cap=1; raise ceiling for them.
+        active_implementation_cap=2,
     )
     cfg.update(over)
     return cfg
