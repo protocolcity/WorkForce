@@ -1677,7 +1677,12 @@ def run_one(
 
     append_ledger_row(config["local_root"], project, "DISCOVER", ticket=task_id, worker=order["worker"])
 
-    if not os.path.isdir(checkout):
+    try:
+        suite = ops["run_suites"](checkout)
+    except FileNotFoundError:
+        # The seat's checkout is not where the template or its Workdir line
+        # says (pc-1487 rehearsal): stop this order with a durable comment
+        # instead of letting the whole pass die.
         reason = "checkout missing: %s (seat Workdir: line or checkout_templates needed)" % checkout
         ops["post_comment"](task_id, stopped_comment_body(reason))
         append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
@@ -1685,7 +1690,6 @@ def run_one(
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
         return result
-    suite = ops["run_suites"](checkout)
     append_ledger_row(config["local_root"], project, "SUITES", ticket=task_id, rc=suite["rc"])
     decision = decide_after_suites(suite["rc"], rounds_used, config["max_recovery_rounds"])
     result["suites"] = {"rc": suite["rc"]}
