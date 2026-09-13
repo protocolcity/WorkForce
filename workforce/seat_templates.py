@@ -7,7 +7,10 @@ from ``<cwd>/.cursor`` and grok reads its MCP servers from
 launched in, which is the prepared checkout task_runner hands the process,
 not this seat folder. The launcher plants the seat's own copy there before
 exec (never overwriting an existing task's settings) so the seat signs
-WorkLane as itself instead of falling back to a user-scope config.
+WorkLane as itself instead of falling back to a user-scope config, on both
+the first dispatch and engine-mediated recovery. The planted files are also
+appended to the checkout worktree's git info/exclude so a seat's own `git
+add` never commits them.
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ raise SystemExit(subprocess.call(result['argv'],cwd=result['checkout'],env=dict(
 
 LAUNCH_PY_CURSOR = '''import json,os,subprocess,sys
 from pathlib import Path
-from workforce.task_runner import prepare,_acquire_lock,main as task_runner_main
+from workforce.task_runner import prepare,_acquire_lock,exclude_from_git,main as task_runner_main
 h=Path(__file__).parent
 # Engine-mediated recovery: forward operator recovery flags to task_runner
 # unchanged. The roster command carries --config runner.json so the engine
@@ -43,24 +46,32 @@ h=Path(__file__).parent
 argv=list(sys.argv[1:])
 while '--config' in argv:
     i=argv.index('--config'); del argv[i:i+2]
+def _plant_cursor(checkout):
+    # cursor-agent reads MCP servers and permissions from <cwd>/.cursor, and
+    # the provider runs inside the prepared checkout; plant the seat's own
+    # identity there so it signs WorkLane as itself. Never overwrite existing
+    # task settings, and never let the plant land in the seat's own commit.
+    if not checkout: return
+    _settings=Path(checkout)/'.cursor'; _settings.mkdir(exist_ok=True)
+    for _src,_dst in (('mcp.json','mcp.json'),('permissions.json','cli.json')):
+        _s=h/_src; _d=_settings/_dst
+        if _s.exists() and not _d.exists(): _d.write_text(_s.read_text())
+    exclude_from_git(checkout,['.cursor/'])
 if argv:
+    if '--recover-receipt' in argv:
+        try: _plant_cursor(json.loads(Path(argv[argv.index('--recover-receipt')+1]).read_text()).get('checkout'))
+        except Exception: pass
     raise SystemExit(task_runner_main(['--config',str(h/'runner.json')]+argv))
 result=prepare(json.loads((h/'runner.json').read_text()))
 if result is None:raise SystemExit(0)
 lock_fd=_acquire_lock(result['lock'])
-# cursor-agent reads MCP servers and permissions from <cwd>/.cursor, and the
-# provider runs inside the prepared checkout; plant the seat's own identity
-# there so it signs WorkLane as itself. Never overwrite existing task settings.
-_settings=Path(result['checkout'])/'.cursor'; _settings.mkdir(exist_ok=True)
-for _src,_dst in (('mcp.json','mcp.json'),('permissions.json','cli.json')):
-    _s=h/_src; _d=_settings/_dst
-    if _s.exists() and not _d.exists(): _d.write_text(_s.read_text())
+_plant_cursor(result['checkout'])
 raise SystemExit(subprocess.call(result['argv'],cwd=result['checkout'],env=dict(os.environ)))
 '''
 
 LAUNCH_PY_GROK = '''import json,os,subprocess,sys
 from pathlib import Path
-from workforce.task_runner import prepare,_acquire_lock,main as task_runner_main
+from workforce.task_runner import prepare,_acquire_lock,exclude_from_git,main as task_runner_main
 h=Path(__file__).parent
 # Engine-mediated recovery: forward operator recovery flags to task_runner
 # unchanged. The roster command carries --config runner.json so the engine
@@ -72,7 +83,11 @@ def _drop_grok_config(checkout):
     import shutil
     cfg=h/'.grok'/'config.toml'
     if not cfg.exists() or not checkout: return
-    dst=Path(checkout)/'.grok'; dst.mkdir(exist_ok=True); shutil.copy(cfg,dst/'config.toml')
+    dst=Path(checkout)/'.grok'; dst.mkdir(exist_ok=True)
+    dst_cfg=dst/'config.toml'
+    # Never overwrite an existing task-provided config.toml in the checkout.
+    if not dst_cfg.exists(): shutil.copy(cfg,dst_cfg)
+    exclude_from_git(checkout,['.grok/'])
 if argv:
     if '--recover-receipt' in argv:
         try: _drop_grok_config(json.loads(Path(argv[argv.index('--recover-receipt')+1]).read_text()).get('checkout'))
