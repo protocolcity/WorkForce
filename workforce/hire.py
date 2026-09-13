@@ -879,6 +879,11 @@ def _backup_seat_dir(seat_dir: str) -> str:
 
     stamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     backup = "%s.backup-%s" % (seat_dir, stamp)
+    suffix = 2
+    while os.path.exists(backup):
+        # Two regenerates within the same wall-clock second — keep both.
+        backup = "%s.backup-%s-%d" % (seat_dir, stamp, suffix)
+        suffix += 1
     os.rename(seat_dir, backup)
     return backup
 
@@ -902,7 +907,7 @@ def generate_seat_folder(
     worklane_python: Optional[str] = None,
     worklane_runtime_dir: Optional[str] = None,
     authority_chain: Optional[List[str]] = None,
-    held: bool = False,
+    held: Optional[bool] = None,
     regenerate: bool = False,
     dry_run: bool = False,
     base: Optional[str] = None,
@@ -942,6 +947,16 @@ def generate_seat_folder(
         roster_path=path if os.path.isfile(path) else None,
         base=base,
     )
+
+    prior_spec = {}
+    if os.path.isfile(path):
+        prior_spec = (_read_raw(path).get("workers") or {}).get(slug) or {}
+    # held has no dedicated roster field — an empty schedule means the daemon
+    # never auto-fires the seat, so that's what "held" resolves to on a prior
+    # row. --regenerate keeps that state unless the caller explicitly passes
+    # --held/--no-held; a brand-new hire defaults to not held (active cron).
+    prior_held = bool(prior_spec) and (prior_spec.get("schedule") or "") == ""
+    held = held if held is not None else (prior_held if regenerate else False)
 
     worker_config_root = worker_config_root or _default_worker_config_root(base)
     seat_dir = os.path.join(worker_config_root, slug)
