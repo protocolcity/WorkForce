@@ -14,8 +14,8 @@ def _build_command(ctx: SeatContext, binary: str) -> List[str]:
     # mcp.json, not arbitrary MCP servers. --force/--yolo (Run Everything)
     # are never emitted here.
     cmd = [
-        binary, "--trust", "--print", "--auto-review",
-        "--sandbox", "enabled", "--approve-mcps",
+        binary, "--trust", "--sandbox", "enabled",
+        "--print", "--auto-review", "--approve-mcps",
     ]
     if ctx.model:
         cmd += ["--model", ctx.model]

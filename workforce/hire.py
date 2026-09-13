@@ -933,9 +933,6 @@ def generate_seat_folder(
         raise RosterError("hire needs a persona name (slug empty)")
     if slug in FORBIDDEN_HIRE_NAMES or name.strip().lower() in FORBIDDEN_HIRE_NAMES:
         raise RosterError("cannot hire %r — permanent synthetic citizen seat" % name)
-    identity = slugify(identity) if identity else slug
-    if identity in FORBIDDEN_HIRE_NAMES:
-        raise RosterError("identity %r is reserved (synthetic citizen)" % identity)
     if not project:
         raise RosterError("generate_seat_folder needs a project store slug")
     if not repository or not os.path.isdir(repository):
@@ -948,9 +945,31 @@ def generate_seat_folder(
         base=base,
     )
 
-    prior_spec = {}
-    if os.path.isfile(path):
-        prior_spec = (_read_raw(path).get("workers") or {}).get(slug) or {}
+    raw = _read_raw(path)
+    workers = raw.setdefault("workers", {})
+    was_present = slug in workers
+    prior_spec = workers.get(slug) or {}
+    if was_present and not regenerate and not dry_run:
+        raise RosterError(
+            "worker %r already on the roster — pass regenerate=true to "
+            "rewrite its seat folder" % slug
+        )
+
+    # --regenerate keeps the prior row's identity unless the caller explicitly
+    # passes --identity; a brand-new hire defaults identity to the slug.
+    identity = (
+        slugify(identity) if identity
+        else (prior_spec.get("identity") if regenerate and prior_spec else "") or slug
+    )
+    if identity in FORBIDDEN_HIRE_NAMES:
+        raise RosterError("identity %r is reserved (synthetic citizen)" % identity)
+    if not was_present and not dry_run:
+        for existing_name, spec in workers.items():
+            if isinstance(spec, dict) and spec.get("identity") == identity:
+                raise RosterError(
+                    "identity %r already used by %r" % (identity, existing_name)
+                )
+
     # held has no dedicated roster field — an empty schedule means the daemon
     # never auto-fires the seat, so that's what "held" resolves to on a prior
     # row. --regenerate keeps that state unless the caller explicitly passes
@@ -1076,21 +1095,14 @@ def generate_seat_folder(
         with open(os.path.join(seat_dir, filename), "w", encoding="utf-8") as fh:
             fh.write(body)
 
-    raw = _read_raw(path)
-    workers = raw.setdefault("workers", {})
-    was_present = slug in workers
-    if was_present and not regenerate:
-        raise RosterError("worker %r already on the roster" % slug)
-    if not was_present:
-        for existing_name, spec in workers.items():
-            if isinstance(spec, dict) and spec.get("identity") == identity:
-                raise RosterError(
-                    "identity %r already used by %r" % (identity, existing_name)
-                )
-
-    prior = workers.get(slug) if was_present else {}
-    prior_budget = int((prior or {}).get("budget_secs") or budget_secs)
-    prior_max_passes = (prior or {}).get("max_passes")
+    prior_budget = int(prior_spec.get("budget_secs") or budget_secs)
+    prior_max_passes = prior_spec.get("max_passes")
+    # --regenerate keeps the prior row's actual cron unless held overrides it;
+    # a brand-new hire (or a regenerate with no prior row) gets the default.
+    if regenerate and prior_spec and not held:
+        schedule = prior_spec.get("schedule") or "*/30 * * * *"
+    else:
+        schedule = "" if held else "*/30 * * * *"
 
     w = Worker(
         name=slug,
@@ -1107,7 +1119,7 @@ def generate_seat_folder(
         max_passes=int(prior_max_passes) if prior_max_passes is not None else 0,
         # held (D12/D15 desk OFF): no cron field means the daemon never
         # auto-fires this seat — fire_now still works for a manual dispatch.
-        schedule="" if held else "*/30 * * * *",
+        schedule=schedule,
         queue_url=queue_url,
         keychain_service=keychain_service,
         keychain_env=keychain_env,
@@ -1128,7 +1140,7 @@ def generate_seat_folder(
         load(path=path, base=base)
     except RosterError:
         if was_present:
-            workers[slug] = prior
+            workers[slug] = prior_spec
         else:
             workers.pop(slug, None)
         _atomic_write_json(path, raw)
