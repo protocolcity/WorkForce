@@ -79,8 +79,32 @@ def main(argv=None) -> int:
 
     p_hire = sub.add_parser("hire", help="employ a worker (papers + roster row)")
     p_hire.add_argument("name", help="persona name (becomes the identity slug)")
-    p_hire.add_argument("--workdir", required=True,
-                        help="project folder (absolute path)")
+    p_hire.add_argument("--workdir",
+                        help="project folder (absolute path); required unless --provider")
+    p_hire.add_argument(
+        "--provider", choices=("claude", "cursor", "grok", "codex"), default="",
+        help="generate the D13 seat shape (5 files + roster row) from a "
+             "provider adapter instead of planting bare papers under --workdir",
+    )
+    p_hire.add_argument("--repository", default="",
+                        help="--provider: repository path for the generated seat")
+    p_hire.add_argument("--remote", default="",
+                        help="--provider: expected git remote URL")
+    p_hire.add_argument("--regenerate", action="store_true",
+                        help="--provider: rewrite an existing seat's folder from "
+                             "the adapter, keeping identity/budget/held")
+    p_hire.add_argument("--held", action="store_true",
+                        help="--provider: mark the roster row held (desk shows OFF)")
+    p_hire.add_argument(
+        "--no-held", action="store_true",
+        help="--provider --regenerate: force held=false, overriding the "
+             "prior row's held state",
+    )
+    p_hire.add_argument("--max-turns", type=int, default=60,
+                        help="--provider: max-turns passed to the generated command")
+    p_hire.add_argument("--test-commands", default="",
+                        help="--provider: verify command(s) rendered into "
+                             "CONTRACT.md/prompt.md")
     p_hire.add_argument("--role", default="", help="role title (e.g. Market Analyst)")
     p_hire.add_argument("--display", default="", help="Persona · Role (optional)")
     p_hire.add_argument("--kind", choices=("lane", "job"), default="lane")
@@ -457,6 +481,55 @@ def main(argv=None) -> int:
             shift_wt_arg = True
         elif getattr(args, "no_shift_worktree", False):
             shift_wt_arg = False
+
+        if getattr(args, "provider", ""):
+            from .adapters import AdapterError
+            if getattr(args, "held", False) and getattr(args, "no_held", False):
+                print("hire error: --held and --no-held are mutually exclusive",
+                      file=sys.stderr)
+                return 1
+            held_arg = None
+            if getattr(args, "held", False):
+                held_arg = True
+            elif getattr(args, "no_held", False):
+                held_arg = False
+            repository = args.repository or args.workdir
+            if not repository:
+                print("hire error: --provider needs --repository (or --workdir)",
+                      file=sys.stderr)
+                return 1
+            try:
+                result = hire_mod.generate_seat_folder(
+                    name=args.name,
+                    provider=args.provider,
+                    project=args.project,
+                    repository=repository,
+                    remote=args.remote,
+                    identity=args.identity,
+                    model=args.model,
+                    max_turns=args.max_turns,
+                    test_commands=args.test_commands,
+                    held=held_arg,
+                    regenerate=args.regenerate,
+                    dry_run=args.dry_run,
+                    base=_base,
+                    roster_path=args.file,
+                )
+            except (RosterError, AdapterError) as exc:
+                print("hire error: %s" % exc, file=sys.stderr)
+                return 1
+            print(result.get("msg") or ("hired %s" % args.name))
+            if args.dry_run:
+                for filename, path in sorted(result.get("files", {}).items()):
+                    print("  file: %s -> %s" % (filename, path))
+                print("  command: %s" % " ".join(result.get("command", [])))
+                print("  allow_list: %s" % ", ".join(result.get("allow_list", [])))
+            return 0
+
+        if not args.workdir:
+            print("hire error: --workdir is required unless --provider is given",
+                  file=sys.stderr)
+            return 1
         try:
             result = hire_mod.hire(
                 name=args.name,
