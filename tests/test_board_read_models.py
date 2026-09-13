@@ -423,9 +423,11 @@ def test_worker_model_includes_flags(tmp_path, monkeypatch):
     }}}))
 
     monkeypatch.setattr(
-        _api_roster, "_worker_holdings",
-        lambda _w: {"state": "empty", "source": "desk", "items": [],
-                    "error": "", "partial": False},
+        _api_roster, "_worker_holdings_evidence",
+        lambda _w, statuses=None: {
+            "state": "empty", "source": "desk", "items": [],
+            "error": "", "partial": False,
+        },
     )
     monkeypatch.setattr(_api_roster, "_worker_ready_teaser", lambda _w, **_kw: [])
     monkeypatch.setattr(_api_roster, "_worker_flags",
@@ -544,19 +546,72 @@ def test_worker_holdings_unavailable_vs_verified_empty(tmp_path, monkeypatch):
         return None
 
     monkeypatch.setattr(roster_mod, "_desk_json", desk_down)
-    down = roster_mod._worker_holdings(w, ("in_progress",))
+    down = roster_mod._worker_holdings_evidence(w, ("in_progress",))
     assert down["state"] == "unavailable"
-    assert down["items"] == []
+    assert roster_mod._worker_holdings(w, ("in_progress",)) == []
     assert down["error"]
 
     def desk_empty(_path, timeout=5.0):
         return {"tasks": []}
 
     monkeypatch.setattr(roster_mod, "_desk_json", desk_empty)
-    empty = roster_mod._worker_holdings(w, ("in_progress",))
+    empty = roster_mod._worker_holdings_evidence(w, ("in_progress",))
     assert empty["state"] == "empty"
-    assert empty["items"] == []
+    assert roster_mod._worker_holdings(w, ("in_progress",)) == []
     assert empty["error"] == ""
+
+
+def test_worker_holdings_list_ok_detail_fail_is_partial_not_empty(tmp_path, monkeypatch):
+    """wf-250: list succeeds but Owner detail fails → partial, not verified empty."""
+    from workforce.api import roster as roster_mod
+
+    w = make_worker(tmp_path)
+    w.name = "salem"
+    w.identity = "salem"
+    w.queue_url = "http://127.0.0.1:8799/api/admin/tasks/ready?product=workforce"
+
+    monkeypatch.setattr(
+        roster_mod, "_desk_json",
+        lambda path, timeout=5.0: (
+            {"tasks": [{"id": "wf-9", "title": "needs owner", "status": "in_progress"}]}
+            if "status=in_progress" in path else {"tasks": []}
+        ),
+    )
+    monkeypatch.setattr(
+        roster_mod, "_desk_owner_of",
+        lambda tid, product="": ("", False, "detail unreachable"),
+    )
+    ev = roster_mod._worker_holdings_evidence(w, ("in_progress",))
+    assert ev["state"] == "partial"
+    assert ev["partial"] is True
+    assert ev["items"] == []
+    assert roster_mod._worker_holdings(w, ("in_progress",)) == []
+    assert "detail unreachable" in ev["error"]
+
+
+def test_desk_owner_of_bare_id_requires_project(tmp_path, monkeypatch):
+    """wf-250: bare numeric ids must pass explicit project= on detail fetch."""
+    from workforce.api import roster as roster_mod
+
+    calls = []
+
+    def fake_desk(path, timeout=5.0):
+        calls.append(path)
+        return {
+            "task": {
+                "id": "250",
+                "comments": [{"body": "Owner: salem\nWorkdir: /tmp"}],
+            },
+        }
+
+    monkeypatch.setattr(roster_mod, "_desk_json", fake_desk)
+    blocked = roster_mod._desk_owner_of("250", "")
+    assert blocked == ("", False, "bare task id requires project")
+    assert calls == []
+
+    owner, ok, err = roster_mod._desk_owner_of("250", "workforce")
+    assert ok is True and err == "" and owner == "salem"
+    assert calls == ["/api/admin/tasks/250?project=workforce"]
 
 
 def test_worker_holdings_requires_owner_not_label(tmp_path, monkeypatch):
@@ -580,18 +635,19 @@ def test_worker_holdings_requires_owner_not_label(tmp_path, monkeypatch):
             ]}
         return {"tasks": []}
 
-    def fake_owner(tid):
-        owner_calls.append(tid)
-        return "salem" if tid == "wf-148" else "you"
+    def fake_owner(tid, product=""):
+        owner_calls.append((tid, product))
+        return ("salem", True, "") if tid == "wf-148" else ("you", True, "")
 
     monkeypatch.setattr(roster_mod, "_desk_json", fake_desk)
     monkeypatch.setattr(roster_mod, "_desk_owner_of", fake_owner)
+    ev = roster_mod._worker_holdings_evidence(w, ("in_progress",))
     held = roster_mod._worker_holdings(w, ("in_progress",))
-    assert held["state"] == "available"
-    assert [h["id"] for h in held["items"]] == ["wf-148"]
-    assert held["items"][0]["owner"] == "salem"
-    assert held["items"][0]["owner_verified"] is True
-    assert set(owner_calls) == {"wf-147", "wf-148"}
+    assert ev["state"] == "available"
+    assert [h["id"] for h in held] == ["wf-148"]
+    assert held[0]["owner"] == "salem"
+    assert held[0]["owner_verified"] is True
+    assert set(owner_calls) == {("wf-147", "workforce"), ("wf-148", "workforce")}
 
 
 def test_worker_holdings_partial_when_owner_cap_hit(tmp_path, monkeypatch):
@@ -609,11 +665,15 @@ def test_worker_holdings_partial_when_owner_cap_hit(tmp_path, monkeypatch):
         roster_mod, "_desk_json",
         lambda _path, timeout=5.0: {"tasks": tasks},
     )
-    monkeypatch.setattr(roster_mod, "_desk_owner_of", lambda tid: "salem")
-    held = roster_mod._worker_holdings(w, ("in_progress",))
-    assert held["state"] == "partial"
-    assert held["partial"] is True
-    assert len(held["items"]) == 5
+    monkeypatch.setattr(
+        roster_mod, "_desk_owner_of",
+        lambda tid, product="": ("salem", True, ""),
+    )
+    ev = roster_mod._worker_holdings_evidence(w, ("in_progress",))
+    assert ev["state"] == "partial"
+    assert ev["partial"] is True
+    assert len(ev["items"]) == 5
+    assert len(roster_mod._worker_holdings(w, ("in_progress",))) == 5
 
 
 def test_client_gone_write_swallows_broken_pipe(tmp_path):
