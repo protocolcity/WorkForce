@@ -126,6 +126,20 @@ closed. Direct `task_runner --recover-receipt` invocation, outside `workforce
 dispatch`, remains available for an operator who is not ready to route through
 the engine; it is simply not engine-visible.
 
+A recovered shift through the engine is always a forced single pass: the
+worker's own `max_passes` (drain or multi-pass) never re-spawns the recovery
+argv a second time, and the forced ceiling is recorded on the START row
+(`recovery_single_pass=1`). If the primary recovery attempt exits with a
+vendor-limit signature and the worker has `fallback_runtime` set, the engine
+does not fall back — a recovery targets one specific reservation, and a
+silent runtime switch mid-recovery is not a lawful takeover; it logs
+`ERROR reason="fallback skipped during recovery"` instead. The shift's
+CANDIDATE evidence names only the task being resumed (read from the
+canonical original receipt), not the live ready snapshot, which may still
+list other backlog this attempt is not touching; dispatch refuses before
+START (ERROR, no ledger writes) if the receipt is unreadable or resolves
+outside the worker's configured `state_dir`.
+
 ## Bounded AI supervisory pass
 
 `python -m workforce.supervisor --config /absolute/path/supervisor.json` is a

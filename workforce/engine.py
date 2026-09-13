@@ -45,6 +45,7 @@ import hashlib
 import http.client
 import json
 import os
+from pathlib import Path
 import re
 import shutil
 import socket
@@ -1699,6 +1700,72 @@ def _host_mutation_check(worker: Worker, ledger: Ledger) -> bool:
     return False
 
 
+class _RecoveryReceiptError(RuntimeError):
+    """Recovery receipt could not be resolved to a task id (bad path / bad state_dir)."""
+
+
+def _worker_state_dir(worker: Worker) -> Optional[str]:
+    """Extract task_runner ``state_dir`` from a ``--config`` JSON in worker.command.
+
+    A recovery-capable worker's command is ``task_runner --config PATH``
+    (RUNNING.md "Reusable task preparation"); PATH's own ``state_dir`` is the
+    boundary a recovery receipt must resolve inside. Returns None when the
+    command has no ``--config`` or the config is unreadable / missing the field.
+    """
+    argv = list(worker.command or [])
+    config_path = None
+    for i, arg in enumerate(argv):
+        if arg == "--config" and i + 1 < len(argv):
+            config_path = argv[i + 1]
+            break
+    if not config_path:
+        return None
+    try:
+        with open(config_path, "r", encoding="utf-8") as fh:
+            config = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    state_dir = config.get("state_dir") if isinstance(config, dict) else None
+    return state_dir if isinstance(state_dir, str) and state_dir else None
+
+
+def _resolve_recovery_task_id(recover_receipt: str, worker: Worker) -> str:
+    """Read the recovered task_id from the canonical original receipt.
+
+    Recovery CANDIDATE evidence must name only the task being resumed, not
+    the live ready snapshot (a recovered shift's ready probe may still list
+    other backlog tickets this attempt is not touching). Fails closed
+    (raises ``_RecoveryReceiptError``) when the receipt is unreadable or
+    resolves outside the worker's configured ``state_dir``.
+    """
+    from . import task_runner as _task_runner
+
+    state_dir = _worker_state_dir(worker)
+    if not state_dir:
+        raise _RecoveryReceiptError("recovery receipt: worker has no resolvable state_dir")
+    try:
+        state_real = os.path.realpath(state_dir)
+        receipt_real = os.path.realpath(recover_receipt)
+    except OSError as exc:
+        raise _RecoveryReceiptError("recovery receipt path error: %s" % exc)
+    if os.path.commonpath([state_real, receipt_real]) != state_real:
+        raise _RecoveryReceiptError("recovery receipt lies outside the worker's state_dir")
+    receipt_path = Path(receipt_real)
+    if not receipt_path.is_file():
+        raise _RecoveryReceiptError("recovery receipt does not exist")
+    reservation = _task_runner._canonical_reservation(receipt_path)
+    canonical_path = reservation / "preparation.json"
+    try:
+        with open(canonical_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise _RecoveryReceiptError("canonical receipt unreadable: %s" % exc)
+    task_id = data.get("task_id") if isinstance(data, dict) else None
+    if not isinstance(task_id, str) or not task_id:
+        raise _RecoveryReceiptError("canonical receipt missing task_id")
+    return task_id
+
+
 def dispatch(
     worker: Worker, local_root: str, dry_run: bool = False,
     recover_receipt: Optional[str] = None, recovery_reason: Optional[str] = None,
@@ -1723,6 +1790,13 @@ def dispatch(
         ledger.append("ERROR", reason="recover-receipt and recovery-reason must be used together")
         return 1
     recovery_kv: Dict[str, object] = {"recovery": 1} if recover_receipt else {}
+    recovery_task_id: Optional[str] = None
+    if recover_receipt:
+        try:
+            recovery_task_id = _resolve_recovery_task_id(recover_receipt, worker)
+        except _RecoveryReceiptError as exc:
+            ledger.append("ERROR", reason=str(exc), **recovery_kv)
+            return 1
     ready_tasks: List[dict] = []
     try:
         # Host-mutation / scope before preflight: a tier-2 argv must
@@ -1822,6 +1896,9 @@ def dispatch(
         if getattr(worker, "shift_worktree", False):
             chain_kwargs["shift_worktree"] = 1
             chain_kwargs["shift_cwd"] = shift_cwd
+        start_kv = dict(recovery_kv)
+        if recover_receipt:
+            start_kv["recovery_single_pass"] = 1
         ledger.append(
             "START",
             identity=worker.identity, kind=worker.kind,
@@ -1831,17 +1908,26 @@ def dispatch(
             contract_sha=contract_sha, prompt_sha=prompt_sha,
             dry_run=int(dry_run),
             **chain_kwargs,
-            **recovery_kv,
+            **start_kv,
         )
 
         # wf-250 — dispatch-input evidence: record ready work orders this
         # shift was handed (wake-on-route and clock fire both use dispatch).
         # Cleared by STOP/ERROR/dry-run DONE via open_candidates window close.
-        if ready_tasks:
+        # Under recovery, CANDIDATE names only the task being resumed — the
+        # live ready snapshot may still list other backlog this attempt is
+        # not touching (wf-255 review).
+        if recover_receipt:
+            _record_candidates(
+                ledger, [{"id": recovery_task_id}],
+                product=product_from_queue_url(worker.queue_url) or "",
+                extra=recovery_kv,
+                limit=1,
+            )
+        elif ready_tasks:
             _record_candidates(
                 ledger, ready_tasks,
                 product=product_from_queue_url(worker.queue_url) or "",
-                extra=recovery_kv or None,
             )
 
         if dry_run:
@@ -1869,7 +1955,10 @@ def dispatch(
         deadline = time.monotonic() + worker.budget_secs
         prev_queue = queue_count
         passes = 0
-        pass_ceiling = effective_pass_ceiling(worker)
+        # wf-255 review — recovery is a single explicit operator resume: force
+        # the ceiling to 1 regardless of the worker's own max_passes so the
+        # drain loop can never re-spawn the recovery argv a second time.
+        pass_ceiling = 1 if recover_receipt else effective_pass_ceiling(worker)
         while True:
             remain = deadline - time.monotonic()
             outfh.write("--- pass %d ---\n" % (passes + 1))
@@ -1889,6 +1978,14 @@ def dispatch(
             if rc != 0:
                 reason = _classify_exit(out_path)
                 if worker.fallback_runtime and reason.startswith("vendor limit:"):
+                    if recover_receipt:
+                        # wf-255 review — no silent takeover-by-fallback during
+                        # an operator-invoked recovery of a specific reservation.
+                        ledger.append(
+                            "ERROR", reason="fallback skipped during recovery",
+                            **recovery_kv,
+                        )
+                        return 1
                     ledger.append("WARN", reason="quota-fallback",
                                   primary=os.path.basename(worker.command[0]),
                                   fallback=worker.fallback_runtime)
@@ -1930,6 +2027,11 @@ def dispatch(
                           secs=int(time.monotonic() - pass_t0), **usage, **recovery_kv)
 
             if passes >= pass_ceiling:
+                if recover_receipt:
+                    # Forced single-pass ceiling — not the worker's own soft/
+                    # hard ceiling, so no early-idle WARN (an explicit
+                    # operator resume of one reservation is not process decay).
+                    return _stop_ok("recovery single pass complete")
                 if worker.max_passes == 0:
                     return _stop_ok(
                         "drain hard cap (%d passes)" % pass_ceiling,
