@@ -296,7 +296,7 @@ def reviewer_ledger_offset(local_root: str, reviewer: str) -> int:
 
 
 def latest_reviewer_terminal_event(local_root: str, reviewer: str, since_offset: int) -> Optional[str]:
-    """``"DONE"``/``"ERROR"``/``None`` from the ledger rows appended after *since_offset*.
+    """``"DONE"``/``"ERROR"``/``"SKIP"``/``None`` from the ledger rows appended after *since_offset*.
 
     ``since_offset`` must be the ledger's size at dispatch time (from
     :func:`reviewer_ledger_offset`) — rows entirely within the first
@@ -306,10 +306,19 @@ def latest_reviewer_terminal_event(local_root: str, reviewer: str, since_offset:
     Scans the appended rows in order (not newest-first): a real engine shift
     with ``max_passes 1`` appends ``DONE`` and then ``STOP`` as its normal
     end-of-shift marker, so a trailing ``STOP`` after a ``DONE`` must never
-    be read as a failure. ``ERROR`` anywhere fails the wait immediately;
-    ``DONE`` with no ``ERROR`` succeeds regardless of a following ``STOP``;
-    anything else (including a lone ``STOP`` with no ``DONE`` yet) means
-    ``None`` — still running, keep waiting.
+    be read as a failure. ``ERROR`` anywhere fails the wait immediately.
+
+    A ``DONE`` only counts once this reviewer's own ``START`` row has also
+    appeared after the offset — the engine writes ``SKIP`` (lock held by
+    another concurrently running shift of the same reviewer) and returns
+    without ever reaching ``START`` when it does not actually run; without
+    this check a ``DONE`` written by that *other* shift (already in flight
+    before this dispatch, terminating after our offset) would be misread as
+    this dispatch's own completed review. A ``SKIP`` with no ``START`` after
+    it means this dispatch did not run at all — return ``"SKIP"`` so the
+    caller retries later rather than reading a stranger's review or a stale
+    failure. Anything else (including a lone ``STOP`` with no ``DONE`` yet)
+    means ``None`` — still running, keep waiting.
     """
     path = _reviewer_ledger_path(local_root, reviewer)
     try:
@@ -318,16 +327,26 @@ def latest_reviewer_terminal_event(local_root: str, reviewer: str, since_offset:
             tail = fh.read()
     except OSError:
         return None
+    saw_start = False
     saw_done = False
+    saw_skip = False
     for line in tail.splitlines():
         parts = line.strip().split(" ", 2)
-        if len(parts) < 2 or parts[1] not in ("DONE", "ERROR", "STOP"):
+        if len(parts) < 2 or parts[1] not in ("START", "DONE", "ERROR", "STOP", "SKIP"):
             continue
         if parts[1] == "ERROR":
             return "ERROR"
-        if parts[1] == "DONE":
+        if parts[1] == "START":
+            saw_start = True
+        elif parts[1] == "DONE":
             saw_done = True
-    return "DONE" if saw_done else None
+        elif parts[1] == "SKIP":
+            saw_skip = True
+    if saw_done and saw_start:
+        return "DONE"
+    if saw_skip and not saw_start:
+        return "SKIP"
+    return None
 
 
 def wait_for_reviewer_ledger(
@@ -342,9 +361,9 @@ def wait_for_reviewer_ledger(
 ) -> Optional[str]:
     """Poll the reviewer's ledger for a terminal row until *timeout_secs*.
 
-    Returns ``"DONE"``/``"ERROR"``/``None`` (timeout or still running) — the
-    caller treats anything but ``"DONE"`` as a failed review, never as a
-    clean pass.
+    Returns ``"DONE"``/``"ERROR"``/``"SKIP"``/``None`` (timeout or still
+    running) — the caller treats anything but ``"DONE"`` as a failed or
+    not-yet-completed review, never as a clean pass.
     """
     deadline = now_fn() + timeout_secs
     while True:
@@ -359,6 +378,17 @@ def wait_for_reviewer_ledger(
 _WORKDIR_MARKER_RE = re.compile(r"(?m)^Workdir:\s*(\S+)")
 
 
+def _git_worktree_head_branch(path: str) -> Optional[str]:
+    """The checked-out branch at *path*, or ``None`` if it is not a usable git worktree."""
+    if not os.path.isdir(os.path.join(path, ".git")) and not os.path.isfile(os.path.join(path, ".git")):
+        return None
+    r = _run(["git", "symbolic-ref", "--short", "HEAD"], cwd=path)
+    if r["rc"] != 0:
+        return None
+    branch = r["output"].strip()
+    return branch or None
+
+
 def workdir_from_comments(
     comments: Optional[Sequence[Dict[str, Any]]],
     seat: Optional[str] = None,
@@ -366,6 +396,7 @@ def workdir_from_comments(
     task_id: Optional[str] = None,
     checkout_template: Optional[str] = None,
     workspace_root: Optional[str] = None,
+    branch_template: Optional[str] = None,
 ) -> Optional[str]:
     """The seat's latest ``Owner:`` claim comment's ``Workdir:`` line, or ``None``.
 
@@ -377,13 +408,23 @@ def workdir_from_comments(
     only an absolute path, never a relative one that could resolve outside
     the intended workspace.
 
-    When *task_id* is also given, the claimed path is only accepted when it
-    ends with ``/<task_id>/checkout`` or equals *checkout_template*'s
-    expansion for *seat*/*task_id* — a stale ``Workdir:`` left over from an
-    earlier order on the same seat (e.g. ``.../wf-264/checkout`` while this
-    order is ``wf-265``) must never redirect this order's suites, PR,
-    review, or merge to the wrong tree. Returns ``None`` on a mismatch so
-    the caller falls back to the template.
+    When *task_id* is also given, the claimed path is only accepted when
+    either:
+
+    - it equals *checkout_template*'s expansion for *seat*/*task_id* (the
+      strongest signal — this is exactly where the host would have put it),
+      or
+    - it ends with ``/<task_id>/checkout`` *and* the directory exists as a
+      git worktree whose checked-out branch equals *branch_template*'s
+      expansion for *seat*/*task_id*.
+
+    A bare ``/<task_id>/checkout`` suffix is not enough on its own: a stale
+    directory left over from an earlier recovery attempt on the same task id
+    (a different tree entirely, e.g. reused after a prior checkout was torn
+    down and rebuilt elsewhere) would otherwise redirect this order's
+    suites, PR, review, or merge to the wrong tree just because its path
+    happens to end the same way. Returns ``None`` on a mismatch so the
+    caller falls back to the template and can record it.
     """
     workdir: Optional[str] = None
     for c in comments or []:
@@ -401,13 +442,15 @@ def workdir_from_comments(
                 workdir = candidate
     if workdir is None or task_id is None:
         return workdir
-    if workdir.endswith("/%s/checkout" % task_id):
-        return workdir
     if checkout_template and seat is not None:
         expansion = os.path.join(
             workspace_root or "", checkout_template.format(worker=seat, task_id=task_id),
         )
         if workdir == expansion:
+            return workdir
+    if workdir.endswith("/%s/checkout" % task_id) and branch_template and seat is not None:
+        expected_branch = branch_template.format(worker=seat, task_id=task_id)
+        if _git_worktree_head_branch(workdir) == expected_branch:
             return workdir
     return None
 
@@ -1025,6 +1068,7 @@ def discover_candidates(
             comments, seat=seat, task_id=tid,
             checkout_template=config["checkout_template"],
             workspace_root=config["workspace_root"],
+            branch_template=config["branch_template"],
         )
         if raw_workdir is not None and checkout_override is None:
             append_ledger_row(
@@ -1212,12 +1256,22 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
         r = _run(argv, env=env)
         if r["rc"] != 0:
             return {"ok": False, "output": r["output"]}
+        if "lock held" in (r["output"] or "").lower():
+            # The dispatch command exits 0 even when it found the reviewer's
+            # own lock held by another concurrently running shift (the
+            # engine's SKIP path) — that shift is not this dispatch's review
+            # and must never be read as one; retry this dispatch later.
+            return {"ok": False, "retry": True, "output": "reviewer dispatch skipped: %s" % r["output"]}
         event = wait_for_reviewer_ledger(config["local_root"], reviewer, since_offset)
+        if event == "SKIP":
+            return {"ok": False, "retry": True, "output": "reviewer dispatch skipped (lock held)"}
         if event != "DONE":
             return {"ok": False, "output": "reviewer ledger terminal event: %s" % (event or "timeout")}
         content = _read_stable_file(output_path)
         if content is None:
             return {"ok": False, "output": "could not read reviewer output %s" % output_path}
+        if not content.strip():
+            return {"ok": False, "empty": True, "output": "reviewer output %s was empty after DONE" % output_path}
         return {"ok": True, "output": content}
 
     def merge_pr(checkout: str, pr_number: Any) -> Dict[str, Any]:
@@ -1545,6 +1599,28 @@ def run_one(
     prompt = build_reviewer_prompt(order, diff)
     review = ops["dispatch_reviewer"](reviewer, prompt)
     append_ledger_row(config["local_root"], project, "REVIEW", ticket=task_id, reviewer=reviewer, ok=review.get("ok"))
+
+    if review.get("retry"):
+        # The reviewer's own lock was held by another concurrently running
+        # shift of the same reviewer — this dispatch never actually ran, so
+        # there is no review to act on. Never charge this against the
+        # recovery-round budget or read a stranger's in-flight review as
+        # ours; just retry the whole review step on the next pass.
+        append_ledger_row(config["local_root"], project, "SKIP", ticket=task_id, reason="reviewer lock held")
+        result["outcome"] = "review_retry"
+        result["reason"] = review.get("output") or "reviewer dispatch skipped; retry next pass"
+        write_receipt(config["local_root"], project, result)
+        return result
+
+    if review.get("empty"):
+        reason = review.get("output") or "reviewer output was empty after DONE"
+        ops["post_comment"](task_id, stopped_comment_body(reason))
+        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        result["outcome"] = "review_empty"
+        result["reason"] = reason
+        write_receipt(config["local_root"], project, result)
+        return result
+
     findings = parse_reviewer_findings(review.get("output", "")) if review.get("ok") else [
         "reviewer dispatch failed"
     ]
