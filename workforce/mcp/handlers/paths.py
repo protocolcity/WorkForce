@@ -16,6 +16,7 @@ def resolve_paths(
     env_data = (os.environ.get("WORKFORCE_DATA_DIR") or "").strip()
     data = (data_dir or env_data or "").strip()
     roster = (roster_path or env_roster or "").strip()
+    data_explicit = bool(data)
 
     if roster and not data:
         # roster.json lives in …/local/roster.json
@@ -36,9 +37,14 @@ def resolve_paths(
                 break
         if not roster:
             roster = os.path.join(data, "local", "roster.json")
-    local_root = os.path.dirname(os.path.realpath(roster))
-    if os.path.basename(local_root) != "local":
+    if data_explicit:
+        # An explicit data_dir (argument or WORKFORCE_DATA_DIR) always owns
+        # local_root, even when the roster lives in an independent location.
         local_root = os.path.join(os.path.realpath(data), "local")
+    else:
+        local_root = os.path.dirname(os.path.realpath(roster))
+        if os.path.basename(local_root) != "local":
+            local_root = os.path.join(os.path.realpath(data), "local")
     return {
         "data_dir": os.path.realpath(data),
         "roster_path": os.path.realpath(roster),
