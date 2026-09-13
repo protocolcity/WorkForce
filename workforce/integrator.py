@@ -808,6 +808,20 @@ def parse_reviewer_findings(output_text: str) -> List[str]:
         data = None
     if isinstance(data, dict) and isinstance(data.get("findings"), list):
         return [str(f).strip() for f in data["findings"] if str(f).strip()]
+    # A reviewer that answers the structured prompt with prose followed by a
+    # {"findings": [...]} object on its own line (the pc-1492 rehearsal) must
+    # yield one finding per entry; the transcript collapse below would drop
+    # an untyped JSON line.
+    for line in text.splitlines():
+        candidate = line.strip()
+        if not candidate.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(candidate)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(parsed, dict) and isinstance(parsed.get("findings"), list):
+            return [str(f).strip() for f in parsed["findings"] if str(f).strip()]
 
     body = _reviewer_transcript_body(text).strip()
     if not body:
