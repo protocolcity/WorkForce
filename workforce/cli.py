@@ -2,6 +2,7 @@
 
 import argparse
 import datetime
+import json
 import os
 import sys
 
@@ -279,6 +280,27 @@ def main(argv=None) -> int:
         "--include-run-logs", action="store_true",
         help="also scan bounded tails of local/run/<worker>.out "
              "(opt-in; default remains desk-only)",
+    )
+
+    p_qualify = sub.add_parser(
+        "qualify",
+        help="provider qualification matrix, constraint audit, throughput — wf-263",
+    )
+    p_qualify.add_argument(
+        "--write-report", action="store_true",
+        help="write local/reports/qualification/YYYY-MM-DD.{json,md}",
+    )
+    p_qualify.add_argument(
+        "--evidence", default="",
+        help="optional absolute path to host evidence JSON (records list)",
+    )
+    p_qualify.add_argument(
+        "--window-days", type=int, default=7,
+        help="ledger throughput window (default: 7)",
+    )
+    p_qualify.add_argument(
+        "--cap", type=int, default=None,
+        help="active implementation cap override (default: env or 1)",
     )
 
     p_digest = sub.add_parser(
@@ -1030,6 +1052,44 @@ def main(argv=None) -> int:
         # Exit 1 on ungated hit so patrol / ghost_audit argv can WARN.
         if any_ungated or any_error:
             return 1
+        return 0
+
+    if args.cmd == "qualify":
+        from . import provider_qualification as pq_mod
+        try:
+            r = roster_mod.load(args.file, base=_base)
+        except roster_mod.RosterError as exc:
+            print("roster error: %s" % exc, file=sys.stderr)
+            return 1
+        evidence = []
+        evidence_path = (getattr(args, "evidence", None) or "").strip()
+        if evidence_path:
+            try:
+                evidence = pq_mod.load_evidence_file(evidence_path)
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                print("qualify: evidence: %s" % exc, file=sys.stderr)
+                return 1
+        cfg = {}
+        if getattr(args, "cap", None) is not None:
+            cfg["active_implementation_cap"] = int(args.cap)
+        report = pq_mod.build_qualification_report(
+            local_root, r.workers, evidence=evidence,
+            window_days=max(1, int(getattr(args, "window_days", 7) or 7)),
+            config=cfg or None,
+        )
+        cap = report.get("capacity") or {}
+        print(
+            "qualify: cap=%d active=%d headroom=%d"
+            % (cap.get("cap", 0), cap.get("active_count", 0), cap.get("headroom", 0))
+        )
+        if getattr(args, "write_report", False):
+            json_path, md_path = pq_mod.write_qualification_report(
+                local_root, r.workers, evidence=evidence,
+                window_days=max(1, int(getattr(args, "window_days", 7) or 7)),
+                config=cfg or None,
+            )
+            print("qualify: %s" % json_path)
+            print("qualify: %s" % md_path)
         return 0
 
     if args.cmd == "digest-upsert":
