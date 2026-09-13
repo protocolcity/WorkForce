@@ -14,6 +14,7 @@ import http.server
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import threading
@@ -277,6 +278,28 @@ def test_recovery_candidate_names_only_the_recovered_task(tmp_path, prepared, de
     assert "p-2" not in candidate_lines[0]
     assert "p-3" not in candidate_lines[0]
     assert "recovery=1" in candidate_lines[0]
+    assert 'reason="candidate scope check"' in candidate_lines[0]
+    assert "reason_sha=" in candidate_lines[0]
+
+
+def test_recovery_candidate_reason_is_sanitized_to_one_ledger_line(tmp_path, prepared, desk):
+    config, config_path, result, out_marker = prepared
+    worker = make_worker(tmp_path, config, config_path, desk)
+    hostile = 'has "quotes", \'ticks\' and\nnewlines\tand\\backslashes %s'
+
+    rc = engine.dispatch(worker, local(tmp_path),
+                          recover_receipt=result["receipt"], recovery_reason=hostile)
+
+    assert rc == 0
+    text = ledger_text(tmp_path)
+    candidate_lines = [l for l in text.splitlines() if " CANDIDATE " in l]
+    assert len(candidate_lines) == 1
+    line = candidate_lines[0]
+    parts = shlex.split(line)
+    reason_field = next(p for p in parts if p.startswith("reason="))
+    assert reason_field == 'reason=has quotes, ticks and newlines andbackslashes %s'
+    assert "reason_sha=" in line
+    assert "\n" not in line and "\t" not in line
 
 
 def test_recovery_receipt_outside_state_dir_is_refused(tmp_path, prepared, desk):
