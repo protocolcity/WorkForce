@@ -114,9 +114,13 @@ required. Default mode is inspect/propose — it collects a fresh snapshot of
 exactly the configured manual (non-cron) lane workers, hands it to the
 configured provider as untrusted JSON over a byte-and-time-bounded pipe (the
 bound is enforced during the read itself, and a timeout/over-budget cutoff
-kills the provider's whole process group, not just its leader PID — this
-module does not and cannot claim that a generic provider argv has no tool
-access; that is the operator's own configuration to trust or not), then
+kills the provider's whole process group by its own pid — the provider is
+launched with `start_new_session=True`, which makes that pid the process
+group id by definition, so the kill never depends on looking up a leader
+that may already have exited early while a descendant it forked lives on,
+possibly still holding the inherited stdout pipe open; this module does not
+and cannot claim that a generic provider argv has no tool access — that is
+the operator's own configuration to trust or not), then
 **re-fetches state again** after the provider returns and validates every
 proposed `{worker, project}` action against that later snapshot. `engine.
 dispatch` takes no task id — a worker always re-probes and works its own
@@ -127,12 +131,15 @@ worker/project allowlist membership, no duplicate WORKER across proposals in
 the same pass, matching project, busy/lock state, recent-shift monitoring
 flags, and at least one fresh eligible ready task. `--execute` re-checks
 each validated worker **again, immediately before** its own dispatch call
-(closing the gap since the last snapshot), then dispatches through the
-existing `engine.dispatch`. Because dispatch's return code alone cannot
-distinguish a completed shift from a clean SKIP or an explicit SCOPE_DENY/
-HOST_MUTATION_DENY refusal, the outcome is classified from the ledger rows
-that call itself wrote (`attempted`/`started`/`completed`/`failed`, plus an
-`outcome` string) — never from `len(results)` and never assumed from mere
+(closing the gap since the last snapshot), then dispatches the *exact*
+`Worker` object that recheck returned — never a second, independent roster
+load that could observe a config changed in between. Because dispatch's
+return code alone cannot distinguish a completed shift from a clean SKIP or
+an explicit SCOPE_DENY/HOST_MUTATION_DENY refusal, the outcome is classified
+from both the ledger rows that call itself wrote and its return code
+(`attempted`/`started`/`completed`/`failed`, plus an `outcome` string) — a
+denied refusal or any non-zero return code is always `failed` and can never
+be `completed`, never from `len(results)`, and never assumed from mere
 `CANDIDATE` row presence. Every pass writes exactly one evidence file under
 `local/reports/supervisor/` with a unique, exclusively-created filename (a
 timestamp alone can collide) with its own path embedded inside it; it never
