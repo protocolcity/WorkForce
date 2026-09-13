@@ -223,6 +223,7 @@ def load_config(path: str) -> Dict[str, Any]:
             _DEFAULT_COORDINATOR_LOCK_TTL_SECS,
         ),
         "checkout_template": raw.get("checkout_template", _DEFAULT_CHECKOUT_TEMPLATE),
+        "checkout_templates": dict(raw.get("checkout_templates") or {}),
         "branch_template": raw.get("branch_template", _DEFAULT_BRANCH_TEMPLATE),
         "active_implementation_cap": raw.get("active_implementation_cap"),
         "workspace_root": raw.get("workspace_root") or str(Path(local_root).parent),
@@ -411,7 +412,9 @@ def wait_for_reviewer_ledger(
         sleep_fn(poll_interval_secs)
 
 
-_WORKDIR_MARKER_RE = re.compile(r"(?m)^Workdir:\s*(\S+)")
+# A seat evidence note is rendered by WorkLane as a blockquote, so the
+# Workdir: line may carry a leading "> " (pc-1487 rehearsal).
+_WORKDIR_MARKER_RE = re.compile(r"(?m)^(?:>\s*)?Workdir:\s*(\S+)")
 
 
 def _git_worktree_head_branch(path: str) -> Optional[str]:
@@ -1183,7 +1186,8 @@ def _checkout_path(config: Dict[str, Any], order: Dict[str, Any]) -> str:
     override = order.get("checkout_override")
     if override:
         return override
-    rel = config["checkout_template"].format(worker=order["worker"], task_id=order["task_id"])
+    template = (config.get("checkout_templates") or {}).get(order["worker"]) or config["checkout_template"]
+    rel = template.format(worker=order["worker"], task_id=order["task_id"])
     return os.path.join(config["workspace_root"], rel)
 
 
@@ -1673,6 +1677,14 @@ def run_one(
 
     append_ledger_row(config["local_root"], project, "DISCOVER", ticket=task_id, worker=order["worker"])
 
+    if not os.path.isdir(checkout):
+        reason = "checkout missing: %s (seat Workdir: line or checkout_templates needed)" % checkout
+        ops["post_comment"](task_id, stopped_comment_body(reason))
+        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        result["outcome"] = "checkout_missing"
+        result["reason"] = reason
+        write_receipt(config["local_root"], project, result)
+        return result
     suite = ops["run_suites"](checkout)
     append_ledger_row(config["local_root"], project, "SUITES", ticket=task_id, rc=suite["rc"])
     decision = decide_after_suites(suite["rc"], rounds_used, config["max_recovery_rounds"])
