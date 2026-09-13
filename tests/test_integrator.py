@@ -1657,8 +1657,10 @@ def test_default_ops_dispatch_reviewer_passes_file_and_data_dir_env(tmp_path):
 
 
 def _git(args, cwd):
+    _git_env = dict(os.environ, GIT_AUTHOR_NAME='integrator-test', GIT_AUTHOR_EMAIL='integrator-test@example.invalid',
+                   GIT_COMMITTER_NAME='integrator-test', GIT_COMMITTER_EMAIL='integrator-test@example.invalid')
     import subprocess
-    r = subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True)
+    r = subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True, env=_git_env)
     assert r.returncode == 0, r.stderr
     return r.stdout.strip()
 
