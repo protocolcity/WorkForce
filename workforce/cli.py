@@ -101,10 +101,40 @@ def main(argv=None) -> int:
              "prior row's held state",
     )
     p_hire.add_argument("--max-turns", type=int, default=60,
-                        help="--provider: max-turns passed to the generated command")
+                        help="--provider: max-turns passed to the generated command "
+                             "(claude/grok only; cursor has no per-turn cap, budget_secs "
+                             "is its wall-clock budget)")
     p_hire.add_argument("--test-commands", default="",
                         help="--provider: verify command(s) rendered into "
                              "CONTRACT.md/prompt.md")
+    p_hire.add_argument(
+        "--workspace", default="",
+        help="--provider: workspace root for the authority chain and the "
+             "shared worklane/worker-config paths (default: the data home's "
+             "parent, when it has an AGENTS.md)",
+    )
+    p_hire.add_argument(
+        "--seat-root", default="",
+        help="--provider: folder the seat's own 5-6 files are generated "
+             "under (default: <workspace or data home>/local/worker-config)",
+    )
+    p_hire.add_argument(
+        "--worklane-python", default="",
+        help="--provider: interpreter the seat's mcp.json/config.toml uses "
+             "to run worklane.mcp (default: <workspace>/local/worklane/"
+             "current/venv/bin/python)",
+    )
+    p_hire.add_argument(
+        "--worklane-runtime-dir", default="",
+        help="--provider: WORKLANE_RUNTIME_DIR for the seat's worklane MCP "
+             "server (default: <workspace>/worklane/worklane/local)",
+    )
+    p_hire.add_argument(
+        "--interpreter", default="",
+        help="--provider: interpreter the roster command launches launch.py "
+             "with (default: sys.executable — the interpreter running this "
+             "hire command)",
+    )
     p_hire.add_argument("--role", default="", help="role title (e.g. Market Analyst)")
     p_hire.add_argument("--display", default="", help="Persona · Role (optional)")
     p_hire.add_argument("--kind", choices=("lane", "job"), default="lane")
@@ -115,7 +145,14 @@ def main(argv=None) -> int:
              "maps onto kind/staff, conflicts rejected",
     )
     p_hire.add_argument("--identity", default="", help="signing id (default: slug of name)")
-    p_hire.add_argument("--schedule", default="*/30 * * * *")
+    p_hire.add_argument(
+        "--schedule", default=None,
+        help="cron string, or an informational string the daemon never "
+             "fires (e.g. 'manual', see schedule.py); default: "
+             "'*/30 * * * *' for a bare hire, 'manual' for a --provider "
+             "lane seat — a generated seat never starts unattended by "
+             "accident",
+    )
     p_hire.add_argument("--model", default="")
     p_hire.add_argument("--project", default="",
                         help="Desk project slug for the ready-queue probe")
@@ -509,11 +546,17 @@ def main(argv=None) -> int:
                     model=args.model,
                     max_turns=args.max_turns,
                     test_commands=args.test_commands,
+                    schedule=args.schedule,
                     held=held_arg,
                     regenerate=args.regenerate,
                     dry_run=args.dry_run,
                     base=_base,
                     roster_path=args.file,
+                    workspace=args.workspace or None,
+                    worker_config_root=args.seat_root or None,
+                    worklane_python=args.worklane_python or None,
+                    worklane_runtime_dir=args.worklane_runtime_dir or None,
+                    interpreter=args.interpreter,
                 )
             except (RosterError, AdapterError) as exc:
                 print("hire error: %s" % exc, file=sys.stderr)
@@ -538,7 +581,7 @@ def main(argv=None) -> int:
                 role=args.role,
                 kind=args.kind,
                 identity=args.identity,
-                schedule=args.schedule,
+                schedule=args.schedule if args.schedule is not None else "*/30 * * * *",
                 model=args.model,
                 queue_url=args.queue_url,
                 project=args.project,
