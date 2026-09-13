@@ -2033,3 +2033,19 @@ def test_checkout_templates_override_per_worker(tmp_path):
     assert integrator._checkout_path(cfg, order) == os.path.join(cfg["workspace_root"], "other/cursor-seat/wf-9/checkout")
     order2 = {"worker": "claude-seat", "task_id": "wf-9"}
     assert integrator._checkout_path(cfg, order2).endswith("local/task-runs/claude-seat/wf-9/checkout")
+
+
+def test_run_one_stops_with_checkout_missing_when_suites_cannot_start(tmp_path, monkeypatch):
+    """A missing checkout raises FileNotFoundError from the real run_suites; the
+    pass must stop the order with checkout_missing, not die."""
+    w = make_worker(tmp_path, name="tester", command=["claude", "-p", "x"])
+    roster_path = write_roster(tmp_path, [w])
+    cfg = make_config(tmp_path, roster_path)
+    posted = []
+    def run_suites(checkout):
+        raise FileNotFoundError(checkout)
+    ops = {"run_suites": run_suites, "post_comment": lambda tid, body: posted.append((tid, body))}
+    order = {"task_id": "wf-9", "worker": "tester", "provider": "claude", "title": "t", "checkout_override": None}
+    result = integrator.run_one(order, cfg, ops)
+    assert result["outcome"] == "checkout_missing"
+    assert posted and posted[0][0] == "wf-9"
