@@ -116,22 +116,31 @@ accordingly: an optional absolute `stop_file` path — if that file exists at
 pass start, the pass stops immediately (`pass_outcome: "stopped_by_operator"`,
 exit 0) before state is even collected; a fresh snapshot of exactly the
 configured manual (non-cron) lane workers — if no eligible worker row in it
-carries a non-empty ready-task-id list, the pass stops without ever launching
-the provider (`pass_outcome: "no_eligible_ready_work"`, exit 0; excluded
-workers, busy flags, and monitoring flags still appear in that snapshot so an
-operator can see stale/busy state); and an optional
+is currently dispatchable (not busy, no monitoring flag, and a non-empty
+ready-task-id list — the same criteria dispatch validation applies), the pass
+stops without ever launching the provider (`pass_outcome:
+"no_eligible_ready_work"`, exit 0; excluded workers, and any busy or
+monitoring-flagged worker's own ready-task-id list, still appear in that
+snapshot so an operator can see stale/busy state even though it did not
+count toward eligibility); and an optional
 `max_consecutive_provider_failures` (default 3) — before calling the
-provider, the newest that-many evidence reports under
-`local/reports/supervisor/` (ordered by filename, which is timestamp-prefixed
-at write time) are read, and if every one of them recorded an explicit
-`provider_ok: false` (an unreadable/malformed report among them counts as a
-failure too — fail closed), the pass refuses to call the provider
-(`pass_outcome: "escalated_provider_failures"`, exit 1, a reason on stderr).
+provider, the newest that-many evidence reports that actually reached the
+provider (`provider_skipped` not set) are read, walking past any
+`stopped_by_operator`/`no_eligible_ready_work`/`escalated_provider_failures`
+skip report in between without breaking or counting it, ordered by filename
+(timestamp-prefixed at write time), and if every one of those provider-
+invoking reports recorded an explicit `provider_ok: false` (an
+unreadable/malformed report among them counts as a failure too — fail
+closed), the pass refuses to call the provider (`pass_outcome:
+"escalated_provider_failures"`, exit 1, a reason on stderr) — an escalated
+skip's own report is itself walked past by the next pass rather than treated
+as ending the streak, so escalation latches until a real provider success.
 `--acknowledge-provider-failures "reason"` lifts that refusal for one pass
 only and records the reason as `provider_failure_acknowledgement` in that
 pass's own evidence — there is no automatic reset of the streak. Fewer than
-`max_consecutive_provider_failures` reports on disk, or any one of the recent
-reports recording a success, means no escalation. Every evidence report
+`max_consecutive_provider_failures` provider-invoking reports on disk, or any
+one of the recent provider-invoking reports recording a success, means no
+escalation. Every evidence report
 carries `pass_outcome`, one of `no_eligible_ready_work` |
 `stopped_by_operator` | `escalated_provider_failures` | `provider_failed` |
 `proposed` | `dispatched` — the last two mean the provider was actually

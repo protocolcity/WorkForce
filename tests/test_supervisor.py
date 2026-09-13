@@ -860,6 +860,43 @@ def test_run_no_eligible_ready_work_still_reports_excluded_busy_monitoring(tmp_p
     assert "cron-scheduled" in state["excluded_workers"]["cronjob"]
 
 
+def test_run_never_launches_provider_when_only_busy_worker_has_ready_work(tmp_path, monkeypatch):
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [fresh_task()]))
+    lock_dir = tmp_path / "local" / "locks" / "tester.lock"
+    lock_dir.mkdir(parents=True)
+    (lock_dir / "pid").write_text(str(os.getpid()))  # our own pid is alive -> busy
+    marker = tmp_path / "provider-called.marker"
+    config = make_config(tmp_path, roster_path, provider_argv=_marker_provider_argv(marker))
+    result = supervisor.run(config, mode="inspect")
+    assert not marker.exists()
+    assert result["pass_outcome"] == "no_eligible_ready_work"
+    assert result["state_before_provider"]["workers"]["tester"]["busy"] is True
+    assert result["state_before_provider"]["workers"]["tester"]["ready_task_ids"] == ["wf-1"]
+
+
+def test_run_never_launches_provider_when_only_monitoring_flagged_worker_has_ready_work(
+        tmp_path, monkeypatch):
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [fresh_task()]))
+    ledger_dir = tmp_path / "local" / "ledger"
+    ledger_dir.mkdir(parents=True)
+    (ledger_dir / "tester.log").write_text(
+        "2026-01-01T00:00:00Z START identity=tester-id\n"
+        "2026-01-01T00:00:01Z ERROR reason=boom rc=1\n"
+    )
+    marker = tmp_path / "provider-called.marker"
+    config = make_config(tmp_path, roster_path, provider_argv=_marker_provider_argv(marker))
+    result = supervisor.run(config, mode="inspect")
+    assert not marker.exists()
+    assert result["pass_outcome"] == "no_eligible_ready_work"
+    row = result["state_before_provider"]["workers"]["tester"]
+    assert row["monitoring_flag"] == "stale_or_failed_last_shift"
+    assert row["ready_task_ids"] == ["wf-1"]
+
+
 def test_run_execute_mode_no_eligible_ready_work_never_dispatches(tmp_path, monkeypatch):
     w = make_worker(tmp_path)
     roster_path = write_roster(tmp_path, [w])
@@ -1047,6 +1084,52 @@ def test_run_escalation_treats_malformed_recent_report_as_failure(tmp_path, monk
     # Newest report by filename -- deliberately corrupt, not valid JSON at all.
     with open(os.path.join(out_dir, "20260101T000002Z-deadbeefcafe.json"), "w") as fh:
         fh.write("{not valid json")
+    marker = tmp_path / "provider-called.marker"
+    config = make_config(tmp_path, roster_path, provider_argv=_marker_provider_argv(marker),
+                          max_consecutive_provider_failures=3)
+    result = supervisor.run(config, mode="inspect")
+    assert not marker.exists()
+    assert result["pass_outcome"] == "escalated_provider_failures"
+
+
+def test_run_escalation_latches_past_its_own_escalated_skip_report(tmp_path, monkeypatch):
+    """fail, fail, fail, escalated_provider_failures -> the next pass must still escalate.
+
+    The escalated skip itself has provider_ok=None (never reached the
+    provider), so it must be walked past when counting the streak rather
+    than treated as a success that would silently clear it.
+    """
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [fresh_task()]))
+    local_root = str(tmp_path / "local")
+    _seed_evidence_reports(local_root, [
+        {"generated_at": "2026-01-01T00:00:0%dZ" % i, "provider_ok": False} for i in range(3)
+    ] + [
+        {"generated_at": "2026-01-01T00:00:03Z", "provider_ok": None,
+         "provider_skipped": True, "pass_outcome": "escalated_provider_failures"},
+    ])
+    marker = tmp_path / "provider-called.marker"
+    config = make_config(tmp_path, roster_path, provider_argv=_marker_provider_argv(marker),
+                          max_consecutive_provider_failures=3)
+    result = supervisor.run(config, mode="inspect")
+    assert not marker.exists()
+    assert result["pass_outcome"] == "escalated_provider_failures"
+
+
+def test_run_escalation_streak_ignores_an_intervening_no_eligible_skip(tmp_path, monkeypatch):
+    """fail, fail, no_eligible_ready_work, fail -> the streak is still 3 failures."""
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [fresh_task()]))
+    local_root = str(tmp_path / "local")
+    _seed_evidence_reports(local_root, [
+        {"generated_at": "2026-01-01T00:00:00Z", "provider_ok": False},
+        {"generated_at": "2026-01-01T00:00:01Z", "provider_ok": False},
+        {"generated_at": "2026-01-01T00:00:02Z", "provider_ok": None,
+         "provider_skipped": True, "pass_outcome": "no_eligible_ready_work"},
+        {"generated_at": "2026-01-01T00:00:03Z", "provider_ok": False},
+    ])
     marker = tmp_path / "provider-called.marker"
     config = make_config(tmp_path, roster_path, provider_argv=_marker_provider_argv(marker),
                           max_consecutive_provider_failures=3)
