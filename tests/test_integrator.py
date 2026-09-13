@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import sys
 import time
 
@@ -646,6 +647,20 @@ def test_parse_reviewer_findings_splits_numbered_grok_blob():
     ]
 
 
+def test_parse_reviewer_findings_does_not_fail_open_on_word_none():
+    """Second-pass review finding 2: a substring match on "none" must not
+    swallow a real finding whose own text happens to contain that word."""
+    assert integrator.parse_reviewer_findings(
+        "returns none on validation failure"
+    ) == ["returns none on validation failure"]
+
+
+def test_parse_reviewer_findings_does_not_fail_open_on_word_clean():
+    assert integrator.parse_reviewer_findings(
+        "checkout is not clean after stage"
+    ) == ["checkout is not clean after stage"]
+
+
 def test_parse_reviewer_findings_concatenates_grok_ndjson_text_events():
     events = [
         {"type": "thought", "data": "thinking, not a finding"},
@@ -747,6 +762,38 @@ def test_run_one_skips_activate_when_seat_in_flight(tmp_path):
     assert "run_stage" in ops.calls
 
 
+def test_run_one_resumes_from_activate_after_seat_in_flight_without_remerging(tmp_path):
+    """Second-pass review finding 1: activate_skipped must be resumable.
+
+    A pass parked at ``activate_skipped`` persists merged/bumped/staged
+    state; once the blocking seat clears, the next ``run_one`` call for the
+    same order must finish from activate — never re-running suites, review,
+    or ``merge_pr``.
+    """
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    _write_live_lock(cfg["local_root"], "other-seat")
+    ops = FakeOps(tmp_path)
+    order = make_order()
+
+    first = integrator.run_one(order, cfg, ops.as_dict())
+    assert first["outcome"] == "activate_skipped"
+    assert ops.calls.count("merge_pr") == 1
+    assert "run_activate" not in ops.calls
+
+    shutil.rmtree(os.path.join(cfg["local_root"], "locks"))
+    second = integrator.run_one(order, cfg, ops.as_dict())
+    assert second["outcome"] == "closed"
+    assert ops.calls.count("merge_pr") == 1
+    assert ops.calls.count("run_suites") == 1
+    assert ops.calls.count("dispatch_reviewer") == 1
+    assert ops.calls.count("write_version") == 1
+    assert ops.calls.count("run_stage") == 1
+    assert "run_activate" in ops.calls
+    assert "close_order" in ops.calls
+    assert second["version"] == {"from": "1.0.0", "to": "1.0.1"}
+
+
 # --------------------------------------------------------------------------
 # wf-265 review recovery — refuse the version bump when main moved
 # (finding 6)
@@ -759,6 +806,32 @@ def test_run_one_refuses_bump_when_origin_main_moved_during_merge(tmp_path):
     ops = FakeOps(tmp_path, pre_merge_sha="sha-before", merge_parent_sha="sha-after-someone-else-merged")
     result = integrator.run_one(make_order(), cfg, ops.as_dict())
     assert result["outcome"] == "main_moved"
+    assert "write_version" not in ops.calls
+    assert "run_stage" not in ops.calls
+    assert "close_order" not in ops.calls
+
+
+def test_run_one_stops_main_unverified_when_pre_merge_sha_empty(tmp_path):
+    """Second-pass review finding 3: an empty pre-merge SHA must stop the
+    order before merge/bump/stage, not be treated as unverifiable-but-ok."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, pre_merge_sha="")
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "main_unverified"
+    assert "merge_pr" not in ops.calls
+    assert "write_version" not in ops.calls
+    assert "run_stage" not in ops.calls
+    assert "close_order" not in ops.calls
+
+
+def test_run_one_stops_main_unverified_when_merge_parent_sha_empty(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, merge_parent_sha="")
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "main_unverified"
+    assert "merge_pr" in ops.calls
     assert "write_version" not in ops.calls
     assert "run_stage" not in ops.calls
     assert "close_order" not in ops.calls
