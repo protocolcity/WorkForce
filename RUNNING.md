@@ -211,6 +211,27 @@ fills in at `prepare()`/`recover()` time), naming the prepared checkout,
 branch, and the WorkLane hand tools — not the legacy "check the queue, do
 one slice" prompt.
 
+## Provider qualification and throughput
+
+`python -m workforce qualify` (wf-263) builds a read-model over roster rows,
+provider adapters, seat templates, ledger shifts, and optional host evidence
+JSON. It audits hardcoded tool lists, permission modes, budgets, and
+single-pass throttles — classifying each as a necessary boundary, capability
+gap, user preference, or temporary throttle — and writes
+`local/reports/qualification/YYYY-MM-DD.{json,md}` when passed
+`--write-report`. Host evidence (dated stage/status records) overlays the
+per-seat matrix via `--evidence /absolute/path.json`; a dry run or roster row
+alone is not an implementation pass.
+
+The active-implementation cap defaults to **1** (serial qualification on a
+16 GiB host). Override with `$WORKFORCE_ACTIVE_IMPLEMENTATION_CAP` or
+supervisor config `active_implementation_cap`. The same cap is enforced in
+bounded supervisor execute passes: dispatch is refused or clamped to headroom
+when live lane locks reach the ceiling. Observational coexistence of two
+checkouts is not proof of safe universal concurrency — retain serial
+execution until a bounded trial records memory pressure and non-overlapping
+paths.
+
 ## Bounded AI supervisory pass
 
 `python -m workforce.supervisor --config /absolute/path/supervisor.json` is a

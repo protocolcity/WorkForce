@@ -57,6 +57,8 @@ def make_config(tmp_path, roster_path, **over):
         time_budget_secs=5,
         output_budget_bytes=65536,
         max_dispatch=2,
+        # Multi-dispatch tests predate wf-263 cap=1; raise ceiling for them.
+        active_implementation_cap=2,
     )
     cfg.update(over)
     return cfg
@@ -1228,3 +1230,100 @@ def test_run_pass_outcome_provider_failed(tmp_path, monkeypatch):
     )
     result = supervisor.run(config, mode="inspect")
     assert result["pass_outcome"] == "provider_failed"
+
+
+# ---------------------------------------------------------------- wf-263 capacity recovery
+
+
+def _live_lock(local_root, worker_name, monkeypatch, pid="42"):
+    lock_dir = Path(local_root) / "locks" / ("%s.lock" % worker_name)
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    (lock_dir / "pid").write_text(pid)
+    monkeypatch.setattr(engine, "_pid_alive", lambda _pid: True)
+
+
+def test_run_execute_headroom_clamp_blocks_all_when_over_capacity(tmp_path, monkeypatch):
+    w1 = make_worker(tmp_path, name="a", identity="a-id")
+    w2 = make_worker(tmp_path, name="b", identity="b-id")
+    w3 = make_worker(tmp_path, name="c", identity="c-id")
+    w4 = make_worker(tmp_path, name="d", identity="d-id")
+    w5 = make_worker(tmp_path, name="e", identity="e-id")
+    roster_path = write_roster(tmp_path, [w1, w2, w3, w4, w5])
+    local_root = str(tmp_path / "local")
+    _live_lock(local_root, "a", monkeypatch, pid="41")
+    _live_lock(local_root, "b", monkeypatch, pid="42")
+    monkeypatch.setattr(
+        engine, "_probe_ready",
+        lambda worker, *a, **kw: (1, [fresh_task("wf-1", worker=worker.name)]))
+    dispatched = []
+
+    def fake_dispatch(worker, _local_root, dry_run=False):
+        dispatched.append(worker.name)
+        return 0
+
+    monkeypatch.setattr(engine, "dispatch", fake_dispatch)
+    config = make_config(
+        tmp_path, roster_path,
+        workers=["a", "b", "c", "d", "e"],
+        active_implementation_cap=1,
+        max_dispatch=3,
+        provider_argv=_provider_argv([
+            {"worker": "c", "project": "workforce"},
+            {"worker": "d", "project": "workforce"},
+            {"worker": "e", "project": "workforce"},
+        ]),
+    )
+    result = supervisor.run(config, mode="execute")
+    assert dispatched == []
+    assert result["capacity_blocked"] is True
+    assert result["capacity_reason"] is not None
+    rejected = [v for v in result["proposals"] if not v["valid"]]
+    assert len(rejected) == 3
+    assert all(v["reason"] for v in rejected)
+
+
+def test_run_execute_headroom_clamp_rejects_all_on_negative_headroom(tmp_path, monkeypatch):
+    from workforce import provider_qualification as pq_mod
+
+    w1 = make_worker(tmp_path, name="a", identity="a-id")
+    w2 = make_worker(tmp_path, name="b", identity="b-id")
+    w3 = make_worker(tmp_path, name="c", identity="c-id")
+    roster_path = write_roster(tmp_path, [w1, w2, w3])
+    monkeypatch.setattr(
+        engine, "_probe_ready",
+        lambda worker, *a, **kw: (1, [fresh_task("wf-1", worker=worker.name)]))
+    real_snap = pq_mod.implementation_capacity_snapshot
+
+    def negative_headroom_snap(local_root, workers=None, **kw):
+        snap = dict(real_snap(local_root, workers, **kw))
+        snap["headroom"] = -1
+        snap["at_capacity"] = False
+        return snap
+
+    monkeypatch.setattr(
+        pq_mod, "implementation_capacity_snapshot", negative_headroom_snap,
+    )
+    monkeypatch.setattr(pq_mod, "dispatch_blocked_by_capacity", lambda *a, **kw: None)
+    dispatched = []
+
+    def fake_dispatch(worker, _local_root, dry_run=False):
+        dispatched.append(worker.name)
+        return 0
+
+    monkeypatch.setattr(engine, "dispatch", fake_dispatch)
+    config = make_config(
+        tmp_path, roster_path,
+        workers=["a", "b", "c"],
+        active_implementation_cap=3,
+        max_dispatch=3,
+        provider_argv=_provider_argv([
+            {"worker": "a", "project": "workforce"},
+            {"worker": "b", "project": "workforce"},
+            {"worker": "c", "project": "workforce"},
+        ]),
+    )
+    result = supervisor.run(config, mode="execute")
+    assert dispatched == []
+    assert result["capacity_blocked"] is True
+    assert "headroom 0" in result["capacity_reason"]
+    assert all(not v["valid"] for v in result["proposals"])
