@@ -1073,3 +1073,98 @@ def test_git_remote_status(tmp_path):
     plain_dir = tmp_path / "plain"
     plain_dir.mkdir()
     assert hire_mod.git_remote_status(str(plain_dir)) == "no-git"
+
+
+def _seat_base(tmp_path):
+    """A disposable WorkForce base: local/ + a git repo for the generated seat."""
+    (tmp_path / "local").mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init(repo)
+    return repo
+
+
+def test_generate_seat_folder_dry_run_writes_nothing(tmp_path):
+    repo = _seat_base(tmp_path)
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path), dry_run=True,
+    )
+    assert result["dry_run"] is True
+    assert set(result["files"]) == {
+        "runner.json", "launch.py", "mcp.json", "CONTRACT.md", "prompt.md",
+    }
+    seat_dir = tmp_path / "local" / "worker-config" / "demo"
+    assert not seat_dir.exists()
+    for flag in ("--force", "--yolo"):
+        assert flag not in result["command"]
+
+
+def test_generate_seat_folder_writes_five_files_and_roster_row(tmp_path):
+    repo = _seat_base(tmp_path)
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path),
+    )
+    seat_dir = tmp_path / "local" / "worker-config" / "demo"
+    for filename in ("runner.json", "launch.py", "mcp.json", "CONTRACT.md", "prompt.md"):
+        assert (seat_dir / filename).is_file()
+
+    er = load(result["roster_path"], base=str(tmp_path))
+    assert "demo" in er.workers
+    w = er.workers["demo"]
+    assert w.identity == "demo"
+    assert w.schedule  # not held -> a real cron schedule
+
+
+def test_generate_seat_folder_held_clears_the_schedule(tmp_path):
+    repo = _seat_base(tmp_path)
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path), held=True,
+    )
+    er = load(result["roster_path"], base=str(tmp_path))
+    assert er.workers["demo"].schedule == ""
+
+
+def test_generate_seat_folder_rejects_bypass_free_but_unknown_provider(tmp_path):
+    repo = _seat_base(tmp_path)
+    with pytest.raises(hire_mod.AdapterError, match="unknown provider"):
+        hire_mod.generate_seat_folder(
+            name="demo", provider="chatgpt", project="recipes",
+            repository=str(repo), base=str(tmp_path), dry_run=True,
+        )
+
+
+def test_generate_seat_folder_refuses_to_clobber_without_regenerate(tmp_path):
+    repo = _seat_base(tmp_path)
+    hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path),
+    )
+    with pytest.raises(RosterError, match="regenerate"):
+        hire_mod.generate_seat_folder(
+            name="demo", provider="cursor", project="recipes",
+            repository=str(repo), base=str(tmp_path),
+        )
+
+
+def test_generate_seat_folder_regenerate_backs_up_and_keeps_held(tmp_path):
+    repo = _seat_base(tmp_path)
+    hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path), held=True,
+    )
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path), regenerate=True,
+    )
+    assert result["regenerated"] is True
+    backup = result["backup"]
+    assert os.path.isdir(backup)
+    assert os.path.isfile(os.path.join(backup, "CONTRACT.md"))
+    seat_dir = tmp_path / "local" / "worker-config" / "demo"
+    assert (seat_dir / "CONTRACT.md").is_file()
+    er = load(result["roster_path"], base=str(tmp_path))
+    # regenerate keeps the row's held state (schedule stays cleared)
+    assert er.workers["demo"].schedule == ""
