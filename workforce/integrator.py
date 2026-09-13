@@ -23,6 +23,7 @@ dispatch or merge that fires merely by importing this module.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -295,7 +296,20 @@ def reviewer_ledger_offset(local_root: str, reviewer: str) -> int:
         return 0
 
 
-def latest_reviewer_terminal_event(local_root: str, reviewer: str, since_offset: int) -> Optional[str]:
+_LEDGER_KV_RE = re.compile(r'(\w+)=("(?:[^"]*)"|\S+)')
+
+
+def _ledger_row_kv(rest: str) -> Dict[str, str]:
+    return {m.group(1): m.group(2).strip('"') for m in _LEDGER_KV_RE.finditer(rest)}
+
+
+def latest_reviewer_terminal_event(
+    local_root: str,
+    reviewer: str,
+    since_offset: int,
+    *,
+    expected_prompt_sha: Optional[str] = None,
+) -> Optional[str]:
     """``"DONE"``/``"ERROR"``/``"SKIP"``/``None`` from the ledger rows appended after *since_offset*.
 
     ``since_offset`` must be the ledger's size at dispatch time (from
@@ -308,15 +322,24 @@ def latest_reviewer_terminal_event(local_root: str, reviewer: str, since_offset:
     end-of-shift marker, so a trailing ``STOP`` after a ``DONE`` must never
     be read as a failure. ``ERROR`` anywhere fails the wait immediately.
 
-    A ``DONE`` only counts once this reviewer's own ``START`` row has also
-    appeared after the offset — the engine writes ``SKIP`` (lock held by
-    another concurrently running shift of the same reviewer) and returns
-    without ever reaching ``START`` when it does not actually run; without
-    this check a ``DONE`` written by that *other* shift (already in flight
-    before this dispatch, terminating after our offset) would be misread as
-    this dispatch's own completed review. A ``SKIP`` with no ``START`` after
-    it means this dispatch did not run at all — return ``"SKIP"`` so the
-    caller retries later rather than reading a stranger's review or a stale
+    A ``DONE`` only counts once this dispatch's own ``START`` row has also
+    appeared after the offset. When *expected_prompt_sha* is given, "this
+    dispatch's own START" means specifically the row whose ``prompt_sha``
+    kv equals it (the engine records ``prompt_sha`` off the exact prompt
+    file content it read) — a concurrently running shift of the same
+    reviewer that started before this dispatch and finishes after our
+    offset writes its own ``START``/``DONE`` pair that must never be
+    misread as this dispatch's completed review just because both rows
+    landed after the offset. A ``START`` for a *different* prompt_sha
+    resets "own start" back to not-seen, so a ``SKIP`` that follows it
+    (this dispatch's own attempt hitting the reviewer's lock, or another
+    shift's SKIP) is correctly read as this dispatch never having run,
+    regardless of a DONE for that other shift's START appearing later in
+    the tail. When *expected_prompt_sha* is omitted, any ``START`` counts
+    (legacy behaviour, kept so callers that do not track a prompt_sha are
+    unaffected). A ``SKIP`` seen before this dispatch's own start means
+    this dispatch did not run at all — return ``"SKIP"`` so the caller
+    retries later rather than reading a stranger's review or a stale
     failure. Anything else (including a lone ``STOP`` with no ``DONE`` yet)
     means ``None`` — still running, keep waiting.
     """
@@ -327,24 +350,31 @@ def latest_reviewer_terminal_event(local_root: str, reviewer: str, since_offset:
             tail = fh.read()
     except OSError:
         return None
-    saw_start = False
-    saw_done = False
-    saw_skip = False
+    own_start_seen = False
+    own_done_seen = False
+    saw_skip_not_ours = False
     for line in tail.splitlines():
         parts = line.strip().split(" ", 2)
         if len(parts) < 2 or parts[1] not in ("START", "DONE", "ERROR", "STOP", "SKIP"):
             continue
-        if parts[1] == "ERROR":
+        event = parts[1]
+        if event == "ERROR":
             return "ERROR"
-        if parts[1] == "START":
-            saw_start = True
-        elif parts[1] == "DONE":
-            saw_done = True
-        elif parts[1] == "SKIP":
-            saw_skip = True
-    if saw_done and saw_start:
+        if event == "START":
+            if expected_prompt_sha is None:
+                own_start_seen = True
+            else:
+                kv = _ledger_row_kv(parts[2]) if len(parts) > 2 else {}
+                own_start_seen = kv.get("prompt_sha") == expected_prompt_sha
+        elif event == "DONE":
+            if own_start_seen:
+                own_done_seen = True
+        elif event == "SKIP":
+            if not own_start_seen:
+                saw_skip_not_ours = True
+    if own_start_seen and own_done_seen:
         return "DONE"
-    if saw_skip and not saw_start:
+    if saw_skip_not_ours:
         return "SKIP"
     return None
 
@@ -358,6 +388,7 @@ def wait_for_reviewer_ledger(
     poll_interval_secs: int = 5,
     now_fn: Callable[[], float] = time.time,
     sleep_fn: Callable[[float], None] = time.sleep,
+    expected_prompt_sha: Optional[str] = None,
 ) -> Optional[str]:
     """Poll the reviewer's ledger for a terminal row until *timeout_secs*.
 
@@ -367,7 +398,9 @@ def wait_for_reviewer_ledger(
     """
     deadline = now_fn() + timeout_secs
     while True:
-        event = latest_reviewer_terminal_event(local_root, reviewer, since_offset)
+        event = latest_reviewer_terminal_event(
+            local_root, reviewer, since_offset, expected_prompt_sha=expected_prompt_sha,
+        )
         if event is not None:
             return event
         if now_fn() >= deadline:
@@ -442,16 +475,19 @@ def workdir_from_comments(
                 workdir = candidate
     if workdir is None or task_id is None:
         return workdir
+    if branch_template and seat is not None:
+        expected_branch = branch_template.format(worker=seat, task_id=task_id)
+        branch_verified = _git_worktree_head_branch(workdir) == expected_branch
+    else:
+        branch_verified = False
     if checkout_template and seat is not None:
         expansion = os.path.join(
             workspace_root or "", checkout_template.format(worker=seat, task_id=task_id),
         )
-        if workdir == expansion:
+        if workdir == expansion and branch_verified:
             return workdir
-    if workdir.endswith("/%s/checkout" % task_id) and branch_template and seat is not None:
-        expected_branch = branch_template.format(worker=seat, task_id=task_id)
-        if _git_worktree_head_branch(workdir) == expected_branch:
-            return workdir
+    if workdir.endswith("/%s/checkout" % task_id) and branch_verified:
+        return workdir
     return None
 
 
@@ -1240,9 +1276,17 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
         if "--file" not in argv:
             argv = argv + ["--file", config["roster_path"]]
 
+        # A dispatch nonce makes the prompt file content unique per dispatch
+        # even when the underlying scope/diff is byte-identical to a prior
+        # dispatch of the same reviewer — without it two dispatches with the
+        # same prompt text would compute the same prompt_sha and a stale
+        # START row from the earlier one could satisfy this dispatch's wait.
+        prompt_with_nonce = "<!-- integrator-dispatch: %s -->\n%s" % (uuid.uuid4().hex, prompt)
+        expected_prompt_sha = hashlib.sha256(prompt_with_nonce.encode("utf-8")).hexdigest()[:16]
+
         os.makedirs(os.path.dirname(prompt_path), exist_ok=True)
         with open(prompt_path, "w", encoding="utf-8") as fh:
-            fh.write(prompt)
+            fh.write(prompt_with_nonce)
         copy_dir = os.path.join(
             config["local_root"], "reports", "integrator", config["project"], "reviewer-prompts",
         )
@@ -1251,6 +1295,16 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
             prompt_path,
             os.path.join(copy_dir, "%s-%s.md" % (reviewer, _utc_iso_z().replace(":", ""))),
         )
+
+        # Record the output file's size/mtime before dispatch so a reviewer
+        # that never actually writes (crashes, or its own DONE races a
+        # concurrent shift's write) can never be read through a leftover
+        # file from an earlier, unrelated dispatch.
+        try:
+            pre_stat = os.stat(output_path)
+            pre_size, pre_mtime = pre_stat.st_size, pre_stat.st_mtime
+        except OSError:
+            pre_size, pre_mtime = -1, -1.0
 
         since_offset = reviewer_ledger_offset(config["local_root"], reviewer)
         r = _run(argv, env=env)
@@ -1262,7 +1316,9 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
             # engine's SKIP path) — that shift is not this dispatch's review
             # and must never be read as one; retry this dispatch later.
             return {"ok": False, "retry": True, "output": "reviewer dispatch skipped: %s" % r["output"]}
-        event = wait_for_reviewer_ledger(config["local_root"], reviewer, since_offset)
+        event = wait_for_reviewer_ledger(
+            config["local_root"], reviewer, since_offset, expected_prompt_sha=expected_prompt_sha,
+        )
         if event == "SKIP":
             return {"ok": False, "retry": True, "output": "reviewer dispatch skipped (lock held)"}
         if event != "DONE":
@@ -1270,6 +1326,16 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
         content = _read_stable_file(output_path)
         if content is None:
             return {"ok": False, "output": "could not read reviewer output %s" % output_path}
+        try:
+            post_stat = os.stat(output_path)
+            post_size, post_mtime = post_stat.st_size, post_stat.st_mtime
+        except OSError:
+            post_size, post_mtime = -1, -1.0
+        if post_size == pre_size and post_mtime == pre_mtime:
+            return {
+                "ok": False, "stale": True,
+                "output": "reviewer output %s unchanged after DONE (stale)" % output_path,
+            }
         if not content.strip():
             return {"ok": False, "empty": True, "output": "reviewer output %s was empty after DONE" % output_path}
         return {"ok": True, "output": content}
@@ -1617,6 +1683,18 @@ def run_one(
         ops["post_comment"](task_id, stopped_comment_body(reason))
         append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
         result["outcome"] = "review_empty"
+        result["reason"] = reason
+        write_receipt(config["local_root"], project, result)
+        return result
+
+    if review.get("stale"):
+        # The output file was never rewritten after DONE — whatever it
+        # contains is leftover from an earlier, unrelated dispatch and must
+        # never be parsed as this dispatch's findings or merged on.
+        reason = review.get("output") or "reviewer output was unchanged after DONE (stale)"
+        ops["post_comment"](task_id, stopped_comment_body(reason))
+        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        result["outcome"] = "review_stale"
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
         return result
