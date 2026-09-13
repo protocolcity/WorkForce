@@ -154,6 +154,31 @@ list other backlog this attempt is not touching; dispatch refuses before
 START (ERROR, no ledger writes) if the receipt is unreadable or resolves
 outside the worker's configured `state_dir`.
 
+## Generating a seat from a provider adapter
+
+`workforce hire <name> --provider {claude,cursor,grok,codex} --project <slug>
+--repository /absolute/path [--remote <url>] [--model <pin>] [--held]
+[--dry-run]` writes the whole seat folder under the worker-config root —
+`runner.json`, `launch.py`, `mcp.json`, `CONTRACT.md`, `prompt.md` — from the
+named adapter, plus the roster row. Each adapter's command is checked against
+its own `bypass_flags` list and refuses to generate one (`AdapterError`); no
+generated command carries `--dangerously-skip-permissions`, `--force`/`--yolo`,
+or an equivalent tool-permission bypass. The cursor adapter does emit `--trust`
+— that flag only dismisses cursor-agent's interactive "trust this workspace?"
+prompt, which is required for headless dispatch; it is never emitted without
+`--sandbox enabled` immediately alongside it, which is the actual safety
+boundary, so `--trust` is not in `cursor`'s `bypass_flags` list. `--dry-run`
+prints the five file paths, the command, and the allow list without writing
+anything or touching the roster.
+`--held` clears the row's schedule so the desk shows the seat OFF (a bare
+hire without `--held` gets a normal cron schedule); `fire_now`/manual dispatch
+still work on a held seat. `--regenerate` rewrites an existing seat's folder,
+moving the previous one aside to `<seat>.backup-<timestamp>` first, and keeps
+the row's prior held state unless `--held`/`--no-held` is passed explicitly.
+The model pin is validated against the current `CANONICAL_MODEL_IDS`
+registry exactly as `workforce hire --workdir` does; shorthand ids are
+rejected.
+
 ## Bounded AI supervisory pass
 
 `python -m workforce.supervisor --config /absolute/path/supervisor.json` is a

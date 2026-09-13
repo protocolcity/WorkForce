@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
 from ._utils import _atomic_write_json, desk_base_url
+from .adapters import AdapterError, SeatContext, get_adapter
+from . import seat_templates
 from .roster import (
     DEFAULT_ROSTER_PATHS,
     WORKER_TYPES,
@@ -32,10 +34,19 @@ _BAD_WORKER_PARAM = re.compile(r"[?&]worker=")
 
 # Full payroll model pins known to the city (capacity rails + roster conventions).
 # Shorthands like "claude-sonnet" are intentionally absent — hire must reject them
-# so pin-pair matching and capacity policy stay exact-id.
+# so pin-pair matching and capacity policy stay exact-id. Historical pins are kept
+# alongside current ones (AGENT_ADOPTION D13) so existing roster rows stay valid —
+# hire only needs to *accept* current pins, not evict rows already pinned to an
+# older one.
 CANONICAL_MODEL_IDS = frozenset({
-    "claude-sonnet-4-6",
+    # current (AGENT_ADOPTION D12/D13, 2026-09-13)
+    "claude-sonnet-5",
     "claude-haiku-4-5-20251001",
+    "composer-2.5",
+    "grok-4.6",
+    "gpt-6-astra",  # codex pin — "per host policy" (D12); example current pin
+    # historical — still valid on rows hired before the D13 refresh
+    "claude-sonnet-4-6",
     "grok-4.5",
     "cursor-grok-4.5-low",
 })
@@ -843,4 +854,301 @@ def hire(
         _atomic_write_json(path, raw)
         raise
     result["msg"] = "hired %s into %s" % (slug, os.path.basename(workdir))
+    return result
+
+
+def _default_worker_config_root(base: str) -> str:
+    return os.path.join(base, "local", "worker-config")
+
+
+def _default_state_dir(base: str) -> str:
+    return os.path.join(base, "local", "task-runs")
+
+
+def _default_worklane_python(base: str) -> str:
+    return os.path.join(base, "local", "worklane", "current", "venv", "bin", "python")
+
+
+def _default_worklane_runtime_dir(base: str) -> str:
+    return os.path.join(base, "worklane", "worklane", "local")
+
+
+def _backup_seat_dir(seat_dir: str) -> str:
+    """Move an existing generated seat folder aside before --regenerate."""
+    import datetime
+
+    stamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    backup = "%s.backup-%s" % (seat_dir, stamp)
+    suffix = 2
+    while os.path.exists(backup):
+        # Two regenerates within the same wall-clock second — keep both.
+        backup = "%s.backup-%s-%d" % (seat_dir, stamp, suffix)
+        suffix += 1
+    os.rename(seat_dir, backup)
+    return backup
+
+
+def generate_seat_folder(
+    *,
+    name: str,
+    provider: str,
+    project: str,
+    repository: str,
+    remote: str = "",
+    identity: str = "",
+    model: str = "",
+    max_turns: int = 60,
+    desk_url: str = "",
+    required_label: str = "execution:bounded",
+    base_ref: str = "origin/main",
+    test_commands: str = "",
+    worker_config_root: Optional[str] = None,
+    state_dir: Optional[str] = None,
+    worklane_python: Optional[str] = None,
+    worklane_runtime_dir: Optional[str] = None,
+    authority_chain: Optional[List[str]] = None,
+    held: Optional[bool] = None,
+    regenerate: bool = False,
+    dry_run: bool = False,
+    base: Optional[str] = None,
+    roster_path: Optional[str] = None,
+    budget_secs: int = 1500,
+    keychain_service: str = "",
+    keychain_env: str = "",
+    scope_home: str = "",
+    perimeter_grants: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Generate the D13 seat shape (5 files) + roster row from a provider adapter.
+
+    Unlike :func:`hire`, this always produces the whole seat folder under the
+    host's worker-config root — runner.json, launch.py, mcp.json, CONTRACT.md,
+    prompt.md — instead of planting bare papers under the project ``workdir``.
+    ``--regenerate`` rewrites an existing seat's folder from the adapter,
+    backing up the previous folder first and keeping identity/budget/held.
+    """
+    base = os.path.abspath(base or os.getcwd())
+    adapter = get_adapter(provider)
+    slug = slugify(name)
+    if not slug:
+        raise RosterError("hire needs a persona name (slug empty)")
+    if slug in FORBIDDEN_HIRE_NAMES or name.strip().lower() in FORBIDDEN_HIRE_NAMES:
+        raise RosterError("cannot hire %r — permanent synthetic citizen seat" % name)
+    if not project:
+        raise RosterError("generate_seat_folder needs a project store slug")
+    if not repository or not os.path.isdir(repository):
+        raise RosterError("repository does not exist: %r" % repository)
+
+    path = _resolve_roster_path(roster_path, base)
+    model = validate_model_pin(
+        model,
+        roster_path=path if os.path.isfile(path) else None,
+        base=base,
+    )
+
+    raw = _read_raw(path)
+    workers = raw.setdefault("workers", {})
+    was_present = slug in workers
+    prior_spec = workers.get(slug) or {}
+    if was_present and not regenerate and not dry_run:
+        raise RosterError(
+            "worker %r already on the roster — pass regenerate=true to "
+            "rewrite its seat folder" % slug
+        )
+
+    # --regenerate keeps the prior row's identity unless the caller explicitly
+    # passes --identity; a brand-new hire defaults identity to the slug.
+    identity = (
+        slugify(identity) if identity
+        else (prior_spec.get("identity") if regenerate and prior_spec else "") or slug
+    )
+    if identity in FORBIDDEN_HIRE_NAMES:
+        raise RosterError("identity %r is reserved (synthetic citizen)" % identity)
+    if not was_present and not dry_run:
+        for existing_name, spec in workers.items():
+            if isinstance(spec, dict) and spec.get("identity") == identity:
+                raise RosterError(
+                    "identity %r already used by %r" % (identity, existing_name)
+                )
+
+    # held has no dedicated roster field — an empty schedule means the daemon
+    # never auto-fires the seat, so that's what "held" resolves to on a prior
+    # row. --regenerate keeps that state unless the caller explicitly passes
+    # --held/--no-held; a brand-new hire defaults to not held (active cron).
+    prior_held = bool(prior_spec) and (prior_spec.get("schedule") or "") == ""
+    held = held if held is not None else (prior_held if regenerate else False)
+
+    worker_config_root = worker_config_root or _default_worker_config_root(base)
+    seat_dir = os.path.join(worker_config_root, slug)
+    exists = os.path.isdir(seat_dir)
+    if exists and not regenerate and not dry_run:
+        raise RosterError(
+            "seat folder already exists at %s — pass regenerate=true to "
+            "rewrite it (a backup of the previous folder is kept)" % seat_dir
+        )
+
+    state_dir = state_dir or _default_state_dir(base)
+    worklane_python = worklane_python or _default_worklane_python(base)
+    worklane_runtime_dir = worklane_runtime_dir or _default_worklane_runtime_dir(base)
+    desk_url = desk_url or desk_base_url()
+    contract_path = os.path.join(seat_dir, "CONTRACT.md")
+    prompt_path = os.path.join(seat_dir, "prompt.md")
+    mcp_path = os.path.join(seat_dir, "mcp.json")
+    runner_path = os.path.join(seat_dir, "runner.json")
+    launch_path = os.path.join(seat_dir, "launch.py")
+    authority_chain = list(authority_chain or [
+        os.path.join(base, "AGENTS.md"),
+        contract_path,
+    ])
+
+    ctx = SeatContext(
+        slug=slug,
+        identity=identity,
+        model=model,
+        repository=os.path.abspath(repository),
+        remote=remote,
+        project=project,
+        mcp_config_path=mcp_path,
+        worklane_python=worklane_python,
+        worklane_runtime_dir=worklane_runtime_dir,
+        max_turns=int(max_turns),
+    )
+    command = adapter.command(ctx)  # raises AdapterError on a bypass flag
+    auth_check = adapter.auth_check()
+    allow_list = adapter.allow_list(ctx)
+
+    remote_status = git_remote_status(repository)
+    land_it = _land_it_contract_text(slug, remote_status)
+    land_it_prompt = _land_it_prompt_text(slug, remote_status)
+
+    files = {
+        "runner.json": json.dumps({
+            "project": project,
+            "worker": slug,
+            "desk_url": desk_url,
+            "required_label": required_label,
+            "repository": os.path.abspath(repository),
+            "expected_remote": remote,
+            "base_ref": base_ref,
+            "state_dir": state_dir,
+            "prompt_template": prompt_path,
+            "authority_chain": authority_chain,
+            "auth_check": auth_check,
+            "command": command,
+        }, indent=2) + "\n",
+        "launch.py": seat_templates.render_launch_py(),
+        "mcp.json": seat_templates.render_mcp_json_text(
+            identity=identity,
+            worklane_python=worklane_python,
+            worklane_runtime_dir=worklane_runtime_dir,
+        ),
+        "CONTRACT.md": seat_templates.render_contract(
+            slug=slug, identity=identity, provider=provider, model=model,
+            project=project, test_commands=test_commands, land_it=land_it,
+        ),
+        "prompt.md": seat_templates.render_prompt(
+            slug=slug, identity=identity, project=project,
+            contract_path=contract_path, test_commands=test_commands,
+            land_it_prompt=land_it_prompt,
+        ),
+    }
+
+    queue_url = (
+        "%s/api/admin/tasks/ready?product=%s&label=worker:%s"
+        % (desk_url.rstrip("/"), project, slug)
+    )
+    _check_queue_url(queue_url, slug)
+
+    result = {
+        "ok": True,
+        "provider": provider,
+        "armed": not dry_run,
+        "dry_run": dry_run,
+        "regenerated": exists and regenerate,
+        "seat_dir": seat_dir,
+        "files": {name: os.path.join(seat_dir, name) for name in files},
+        "file_bodies": files,
+        "command": command,
+        "auth_check": auth_check,
+        "allow_list": allow_list,
+        "adapter_doc": adapter.doc,
+        "worker": {
+            "name": slug,
+            "identity": identity,
+            "provider": provider,
+            "model": model,
+            "project": project,
+            "queue_url": queue_url,
+            "held": bool(held),
+        },
+    }
+
+    if dry_run:
+        result["msg"] = "dry_run — %d seat files generated, nothing written" % len(files)
+        return result
+
+    backup = None
+    if exists and regenerate:
+        backup = _backup_seat_dir(seat_dir)
+        result["backup"] = backup
+    os.makedirs(seat_dir, exist_ok=True)
+    for filename, body in files.items():
+        with open(os.path.join(seat_dir, filename), "w", encoding="utf-8") as fh:
+            fh.write(body)
+
+    prior_budget = int(prior_spec.get("budget_secs") or budget_secs)
+    prior_max_passes = prior_spec.get("max_passes")
+    # --regenerate keeps the prior row's actual cron unless held overrides it;
+    # a brand-new hire (or a regenerate with no prior row) gets the default.
+    if regenerate and prior_spec and not held:
+        schedule = prior_spec.get("schedule") or "*/30 * * * *"
+    else:
+        schedule = "" if held else "*/30 * * * *"
+
+    w = Worker(
+        name=slug,
+        workdir=os.path.abspath(repository),
+        contract=contract_path,
+        prompt=prompt_path,
+        identity=identity,
+        command=[
+            "python3", str(launch_path), "--config", str(runner_path),
+        ],
+        kind="lane",
+        model=model,
+        budget_secs=prior_budget,
+        max_passes=int(prior_max_passes) if prior_max_passes is not None else 0,
+        # held (D12/D15 desk OFF): no cron field means the daemon never
+        # auto-fires this seat — fire_now still works for a manual dispatch.
+        schedule=schedule,
+        queue_url=queue_url,
+        keychain_service=keychain_service,
+        keychain_env=keychain_env,
+        display=name.strip() or slug,
+        scope_home=scope_home,
+        perimeter_grants=list(perimeter_grants or []),
+        authority_chain=authority_chain,
+        shift_worktree=True,
+    )
+    w.validate()
+
+    workers[slug] = worker_to_spec(w)
+    for _f in ("workdir", "contract", "prompt"):
+        if workers[slug].get(_f):
+            workers[slug][_f] = os.path.relpath(workers[slug][_f], base)
+    _atomic_write_json(path, raw)
+    try:
+        load(path=path, base=base)
+    except RosterError:
+        if was_present:
+            workers[slug] = prior_spec
+        else:
+            workers.pop(slug, None)
+        _atomic_write_json(path, raw)
+        raise
+
+    result["roster_path"] = path
+    result["msg"] = "%s %s (%s) into %s" % (
+        "regenerated" if (exists and regenerate) else "generated",
+        slug, provider, project,
+    )
     return result
