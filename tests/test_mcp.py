@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,6 +18,22 @@ from workforce.mcp.server import MCPServer
 
 
 class McpHandlersTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Host environments (e.g. this very workspace) may export
+        # WORKFORCE_DATA_DIR/WORKFORCE_ROSTER; isolate path-resolution
+        # tests from that ambient state.
+        self._saved_env = {
+            k: os.environ.pop(k, None)
+            for k in ("WORKFORCE_DATA_DIR", "WORKFORCE_ROSTER")
+        }
+
+    def tearDown(self) -> None:
+        for k, v in self._saved_env.items():
+            if v is not None:
+                os.environ[k] = v
+            else:
+                os.environ.pop(k, None)
+
     def test_tool_names(self) -> None:
         names = {t["name"] for t in build_tool_definitions()}
         self.assertEqual(
@@ -48,6 +65,134 @@ class McpHandlersTests(unittest.TestCase):
                 Path(p["roster_path"]).resolve(), roster.resolve()
             )
             self.assertTrue(Path(p["local_root"]).name == "local")
+
+    def test_resolve_paths_explicit_data_dir_wins_over_roster_location(
+        self,
+    ) -> None:
+        """wf-248: explicit data_dir must own local_root even when the
+        roster lives in an independent location."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            roster_root = root / "roster_store" / "local"
+            roster_root.mkdir(parents=True)
+            roster = roster_root / "roster.json"
+            roster.write_text(json.dumps({"workers": {}}), encoding="utf-8")
+
+            runtime_root = root / "runtime"
+            runtime_root.mkdir()
+
+            p = resolve_paths(str(roster), str(runtime_root))
+            self.assertEqual(
+                Path(p["roster_path"]).resolve(), roster.resolve()
+            )
+            self.assertEqual(
+                Path(p["local_root"]).resolve(),
+                (runtime_root / "local").resolve(),
+            )
+
+    def test_resolve_paths_env_data_dir_wins_over_roster_location(
+        self,
+    ) -> None:
+        """wf-248: WORKFORCE_DATA_DIR takes the same precedence as the
+        explicit data_dir argument."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            roster_root = root / "roster_store" / "local"
+            roster_root.mkdir(parents=True)
+            roster = roster_root / "roster.json"
+            roster.write_text(json.dumps({"workers": {}}), encoding="utf-8")
+
+            runtime_root = root / "runtime"
+            runtime_root.mkdir()
+
+            os.environ["WORKFORCE_DATA_DIR"] = str(runtime_root)
+            p = resolve_paths(str(roster), None)
+
+            self.assertEqual(
+                Path(p["roster_path"]).resolve(), roster.resolve()
+            )
+            self.assertEqual(
+                Path(p["local_root"]).resolve(),
+                (runtime_root / "local").resolve(),
+            )
+
+    def test_resolve_paths_roster_only_still_uses_roster_local_root(
+        self,
+    ) -> None:
+        """wf-248: legacy roster-only resolution is unaffected."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            local = root / "local"
+            local.mkdir()
+            roster = local / "roster.json"
+            roster.write_text(json.dumps({"workers": {}}), encoding="utf-8")
+
+            p = resolve_paths(str(roster), None)
+            self.assertEqual(
+                Path(p["local_root"]).resolve(), local.resolve()
+            )
+            self.assertEqual(
+                Path(p["data_dir"]).resolve(), root.resolve()
+            )
+
+    def test_wf_show_reads_runtime_ledger_not_roster_ledger(self) -> None:
+        """wf-248: wf_show against split runtime/roster must read the
+        runtime ledger, not a historical ledger next to the roster."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+
+            contract = root / "contract.md"
+            contract.write_text("contract", encoding="utf-8")
+            prompt = root / "prompt.md"
+            prompt.write_text("prompt", encoding="utf-8")
+
+            roster_root = root / "roster_store" / "local"
+            roster_root.mkdir(parents=True)
+            roster = roster_root / "roster.json"
+            roster.write_text(
+                json.dumps(
+                    {
+                        "workers": {
+                            "alice": {
+                                "kind": "lane",
+                                "workdir": str(root),
+                                "contract": str(contract),
+                                "prompt": str(prompt),
+                                "identity": "alice",
+                                "command": ["true"],
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stale_ledger_dir = roster_root / "ledger"
+            stale_ledger_dir.mkdir()
+            (stale_ledger_dir / "alice.log").write_text(
+                "2020-01-01T00:00:00Z START order=stale\n", encoding="utf-8"
+            )
+
+            runtime_root = root / "runtime"
+            fresh_ledger_dir = runtime_root / "local" / "ledger"
+            fresh_ledger_dir.mkdir(parents=True)
+            (fresh_ledger_dir / "alice.log").write_text(
+                "2026-01-01T00:00:00Z START order=fresh\n", encoding="utf-8"
+            )
+
+            h = WFHandlers(author="test")
+            out = dispatch_tool(
+                h,
+                "wf_show",
+                {
+                    "name": "alice",
+                    "roster": str(roster),
+                    "data_dir": str(runtime_root),
+                },
+            )
+            self.assertTrue(out.get("ok"))
+            tail_lines = [e.get("raw", "") for e in out.get("ledger_tail", [])]
+            self.assertTrue(any("order=fresh" in line for line in tail_lines))
+            self.assertFalse(any("order=stale" in line for line in tail_lines))
 
     def test_status_empty_roster(self) -> None:
         with tempfile.TemporaryDirectory() as td:
