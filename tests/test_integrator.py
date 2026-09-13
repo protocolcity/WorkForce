@@ -215,7 +215,7 @@ def test_load_config_defaults(tmp_path):
     roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
     cfg = make_config(tmp_path, roster_path)
     assert cfg["max_recovery_rounds"] == 2
-    assert cfg["coordinator_lock_ttl_secs"] == 900
+    assert cfg["coordinator_lock_ttl_secs"] == 2400
     assert cfg["coordinator_lock_path"] == os.path.join(cfg["local_root"], "COORDINATOR.lock")
     assert cfg["reviewer_by_provider"]["cursor"] == "workflow-reviewer"
 
@@ -311,10 +311,18 @@ class FakeOps:
         self._version_path = str(version_path)
         self.suite_rc = overrides.get("suite_rc", 0)
         self.review_findings = overrides.get("review_findings", [])
+        self.review_output = overrides.get("review_output")
         self.ci_status = overrides.get("ci_status", "success")
         self.checkout_clean = overrides.get("checkout_clean_val", True)
+        self.merge_rc = overrides.get("merge_rc", 0)
+        self.pre_merge_sha = overrides.get("pre_merge_sha", "sha-main")
+        self.merge_parent_sha = overrides.get("merge_parent_sha", "sha-main")
         self.stage_rc = overrides.get("stage_rc", 0)
         self.activate_rc = overrides.get("activate_rc", 0)
+        self.verify_ok = overrides.get("verify_ok", True)
+        self.verify_observed = overrides.get("verify_observed", "")
+        self.seat_in_flight_val = overrides.get("seat_in_flight_val", False)
+        self.recovery_calls = []
 
     def _record(self, name, *a, **kw):
         self.calls.append(name)
@@ -345,11 +353,27 @@ class FakeOps:
 
     def dispatch_reviewer(self, reviewer, prompt):
         self._record("dispatch_reviewer")
-        return {"ok": True, "output": json.dumps({"findings": self.review_findings})}
+        output = self.review_output
+        if output is None:
+            output = json.dumps({"findings": self.review_findings})
+        return {"ok": True, "output": output}
 
     def merge_pr(self, checkout, pr_number):
         self._record("merge_pr")
-        return {"rc": 0, "output": ""}
+        return {"rc": self.merge_rc, "output": ""}
+
+    def remote_head_sha(self, checkout, branch):
+        self._record("remote_head_sha")
+        return self.pre_merge_sha
+
+    def merge_commit_parent_sha(self, checkout, branch):
+        self._record("merge_commit_parent_sha")
+        return self.merge_parent_sha
+
+    def dispatch_recovery(self, worker, preparation_path, reason):
+        self._record("dispatch_recovery")
+        self.recovery_calls.append((worker, preparation_path, reason))
+        return {"ok": True, "output": ""}
 
     def read_version(self, checkout):
         self._record("read_version")
@@ -371,7 +395,7 @@ class FakeOps:
 
     def verify_installed_version(self, expected):
         self._record("verify_installed_version")
-        return True
+        return {"ok": self.verify_ok, "observed": self.verify_observed or expected}
 
     def capture_screenshots(self):
         self._record("capture_screenshots")
@@ -399,6 +423,9 @@ class FakeOps:
             "ci_status": self.ci_status_fn,
             "dispatch_reviewer": self.dispatch_reviewer,
             "merge_pr": self.merge_pr,
+            "remote_head_sha": self.remote_head_sha,
+            "merge_commit_parent_sha": self.merge_commit_parent_sha,
+            "dispatch_recovery": self.dispatch_recovery,
             "read_version": self.read_version,
             "write_version": self.write_version,
             "run_stage": self.run_stage,
@@ -523,3 +550,265 @@ def test_run_one_stage_failure_stops_before_activate(tmp_path):
     assert result["outcome"] == "stage_failed"
     assert "run_activate" not in ops.calls
     assert "close_order" not in ops.calls
+
+
+# --------------------------------------------------------------------------
+# wf-265 review recovery — close-only-on-verified-install (finding 1)
+# --------------------------------------------------------------------------
+
+
+def test_run_one_does_not_close_when_install_verification_fails(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, verify_ok=False, verify_observed="1.0.0")
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "install_not_verified"
+    assert "close_order" not in ops.calls
+    assert "post_comment" in ops.calls
+
+
+# --------------------------------------------------------------------------
+# wf-265 review recovery — merge gate re-checked and merge_pr rc honoured
+# (finding 2)
+# --------------------------------------------------------------------------
+
+
+def test_run_one_failed_merge_pr_does_not_bump_or_stage(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, merge_rc=1)
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "merge_failed"
+    assert "write_version" not in ops.calls
+    assert "run_stage" not in ops.calls
+    assert "close_order" not in ops.calls
+    log_path = os.path.join(cfg["local_root"], "ledger", "integrator-workforce.log")
+    with open(log_path) as fh:
+        log = fh.read()
+    assert " MERGE " not in log
+
+
+# --------------------------------------------------------------------------
+# wf-265 review recovery — findings parser (finding 3)
+# --------------------------------------------------------------------------
+
+_UPLIFT_DIR = "/Users/example_user/OneSeo/local/reports/parallel-plan-pass/uplift"
+_uplift_available = os.path.isdir(_UPLIFT_DIR)
+
+
+def _read_uplift(name):
+    with open(os.path.join(_UPLIFT_DIR, name), encoding="utf-8") as fh:
+        return fh.read()
+
+
+@pytest.mark.skipif(not _uplift_available, reason="host-local reviewer transcripts not present")
+def test_parse_reviewer_findings_real_cursor_pc_1485_three_items():
+    findings = integrator.parse_reviewer_findings(_read_uplift("cursor-reviewer.out.pc-1485"))
+    assert len(findings) == 3
+    assert all("what looks correct" not in f.lower() for f in findings)
+
+
+@pytest.mark.skipif(not _uplift_available, reason="host-local reviewer transcripts not present")
+def test_parse_reviewer_findings_real_grok_workflow_pc_1484_three_items():
+    findings = integrator.parse_reviewer_findings(_read_uplift("workflow-reviewer.out.pc-1484"))
+    assert len(findings) == 3
+    # Grok's NDJSON text events must be concatenated, not left as one blob
+    # per streamed fragment.
+    assert all(f.strip().startswith(("1.", "2.", "3.", "**1.", "**2.", "**3.")) for f in findings)
+
+
+@pytest.mark.skipif(not _uplift_available, reason="host-local reviewer transcripts not present")
+def test_parse_reviewer_findings_real_cursor_pc_1494_strips_trailing_checked_section():
+    findings = integrator.parse_reviewer_findings(_read_uplift("cursor-reviewer.out.pc-1494"))
+    assert len(findings) == 3
+    joined = " ".join(findings).lower()
+    assert "other acceptance items" not in joined
+    assert "cleared inbox-report not read" not in joined
+
+
+def test_parse_reviewer_findings_none_with_trailing_what_looks_correct_section():
+    text = (
+        "Findings: none\n\n"
+        "What looks correct:\n"
+        "- suites wiring matches the configured test_cmd\n"
+        "- reviewer routing follows the provider table\n"
+    )
+    assert integrator.parse_reviewer_findings(text) == []
+
+
+def test_parse_reviewer_findings_splits_numbered_grok_blob():
+    text = "1. run_one closes on failed verify\n2. merge rc ignored\n3. parser mishandles prose"
+    findings = integrator.parse_reviewer_findings(text)
+    assert findings == [
+        "1. run_one closes on failed verify",
+        "2. merge rc ignored",
+        "3. parser mishandles prose",
+    ]
+
+
+def test_parse_reviewer_findings_concatenates_grok_ndjson_text_events():
+    events = [
+        {"type": "thought", "data": "thinking, not a finding"},
+        {"type": "text", "data": "1. "},
+        {"type": "text", "data": "first issue\n"},
+        {"type": "text", "data": "2. second issue"},
+    ]
+    text = "--- pass 1 ---\n" + "\n".join(json.dumps(e) for e in events)
+    assert integrator.parse_reviewer_findings(text) == ["1. first issue", "2. second issue"]
+
+
+# --------------------------------------------------------------------------
+# wf-265 review recovery — lock freshness from updated_at (finding 4)
+# --------------------------------------------------------------------------
+
+
+def test_coordinator_lock_is_fresh_reads_updated_at_json_field(tmp_path):
+    lock = tmp_path / "COORDINATOR.lock"
+    now = time.time()
+    stale_mtime_but_fresh_updated_at = integrator._utc_iso_z(
+        integrator._utcnow()
+    )
+    lock.write_text(json.dumps({
+        "coordinator": "test", "pid": 1, "updated_at": stale_mtime_but_fresh_updated_at,
+    }))
+    # Backdate the file's mtime far past the TTL — only the JSON field
+    # should decide freshness now, not the filesystem mtime.
+    old = now - 10000
+    os.utime(str(lock), (old, old))
+    assert integrator.coordinator_lock_is_fresh(str(lock), 2400, now=now) is True
+
+
+def test_coordinator_lock_is_fresh_expired_updated_at_field(tmp_path):
+    lock = tmp_path / "COORDINATOR.lock"
+    now = time.time()
+    stale = integrator._utc_iso_z(
+        integrator._utcnow() - __import__("datetime").timedelta(seconds=5000)
+    )
+    lock.write_text(json.dumps({"coordinator": "test", "pid": 1, "updated_at": stale}))
+    assert integrator.coordinator_lock_is_fresh(str(lock), 2400, now=now) is False
+
+
+def test_coordinator_lock_is_fresh_falls_back_to_mtime_without_updated_at(tmp_path):
+    lock = tmp_path / "COORDINATOR.lock"
+    lock.write_text("not json")
+    now = os.path.getmtime(str(lock))
+    assert integrator.coordinator_lock_is_fresh(str(lock), 2400, now=now + 10) is True
+    assert integrator.coordinator_lock_is_fresh(str(lock), 2400, now=now + 10000) is False
+
+
+def test_default_coordinator_lock_ttl_is_40_minutes():
+    assert integrator._DEFAULT_COORDINATOR_LOCK_TTL_SECS == 2400
+
+
+# --------------------------------------------------------------------------
+# wf-265 review recovery — skip activate while a seat is in flight (finding 5)
+# --------------------------------------------------------------------------
+
+
+def _write_live_lock(local_root, worker):
+    # engine.lock_inspect expects a lock *directory* containing a "pid" file
+    # naming a live process — not a JSON file.
+    lock_dir = os.path.join(local_root, "locks", "%s.lock" % worker)
+    os.makedirs(lock_dir, exist_ok=True)
+    with open(os.path.join(lock_dir, "pid"), "w") as fh:
+        fh.write(str(os.getpid()))
+
+
+def test_seat_in_flight_true_for_live_lock(tmp_path):
+    local_root = str(tmp_path / "local")
+    _write_live_lock(local_root, "some-seat")
+    assert integrator.seat_in_flight(local_root) is True
+
+
+def test_seat_in_flight_true_for_open_ledger_shift(tmp_path):
+    local_root = str(tmp_path / "local")
+    ledger_dir = os.path.join(local_root, "ledger")
+    os.makedirs(ledger_dir, exist_ok=True)
+    with open(os.path.join(ledger_dir, "some-seat.log"), "w") as fh:
+        fh.write("%s START queue=ready budget_secs=600\n" % integrator._utc_iso_z())
+    assert integrator.seat_in_flight(local_root) is True
+
+
+def test_seat_in_flight_false_when_no_locks_or_open_shifts(tmp_path):
+    assert integrator.seat_in_flight(str(tmp_path / "local")) is False
+
+
+def test_run_one_skips_activate_when_seat_in_flight(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    _write_live_lock(cfg["local_root"], "other-seat")
+    ops = FakeOps(tmp_path)
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "activate_skipped"
+    assert "run_activate" not in ops.calls
+    assert "close_order" not in ops.calls
+    # merge/version/stage already happened this pass
+    assert "write_version" in ops.calls
+    assert "run_stage" in ops.calls
+
+
+# --------------------------------------------------------------------------
+# wf-265 review recovery — refuse the version bump when main moved
+# (finding 6)
+# --------------------------------------------------------------------------
+
+
+def test_run_one_refuses_bump_when_origin_main_moved_during_merge(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, pre_merge_sha="sha-before", merge_parent_sha="sha-after-someone-else-merged")
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "main_moved"
+    assert "write_version" not in ops.calls
+    assert "run_stage" not in ops.calls
+    assert "close_order" not in ops.calls
+
+
+def test_run_one_bumps_when_origin_main_did_not_move(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, pre_merge_sha="sha-main", merge_parent_sha="sha-main")
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "closed"
+    assert "write_version" in ops.calls
+
+
+# --------------------------------------------------------------------------
+# wf-265 review recovery — dispatch engine recovery after findings/suite
+# failure (finding 7)
+# --------------------------------------------------------------------------
+
+
+def test_run_one_suite_failure_dispatches_engine_recovery(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, suite_rc=1)
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "recovering"
+    assert "dispatch_recovery" in ops.calls
+    worker, preparation_path, reason = ops.recovery_calls[0]
+    assert worker == "tester"
+    assert os.path.isabs(preparation_path)
+    assert preparation_path.endswith("preparation.json")
+    assert reason
+
+
+def test_run_one_findings_recovery_dispatches_engine_recovery(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, review_findings=["fix the thing"])
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "recovering"
+    assert "dispatch_recovery" in ops.calls
+    worker, preparation_path, reason = ops.recovery_calls[0]
+    assert worker == "tester"
+    assert os.path.isabs(preparation_path)
+
+
+def test_run_one_clean_pass_does_not_dispatch_recovery(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path)
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "closed"
+    assert "dispatch_recovery" not in ops.calls
