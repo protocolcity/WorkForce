@@ -1,5 +1,6 @@
 """Read-only supervisor pass evidence API (wf-254)."""
 
+import datetime
 import json
 import os
 import sys
@@ -13,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from workforce import board  # noqa: E402
 from workforce import reports  # noqa: E402
 import workforce.api.roster as _api_roster  # noqa: E402
+import workforce.api.roster.models as _roster_models  # noqa: E402
 from workforce.roster import Roster, Worker  # noqa: E402
 
 
@@ -164,6 +166,71 @@ def test_report_model_includes_supervisor_section(tmp_path, monkeypatch):
     assert sup["passes_in_window"] == 1
     assert sup["last_pass"]["evidence_file"] == "recent.json"
     assert sup["unreadable"] == 1
+
+
+def _freeze_utcnow(monkeypatch, when):
+    monkeypatch.setattr(reports, "_utcnow", lambda: when)
+
+
+def test_supervisor_report_section_days_none_matches_report_default(tmp_path, monkeypatch):
+    now = datetime.datetime(2026, 9, 12, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    _freeze_utcnow(monkeypatch, now)
+    local = _local(tmp_path)
+    _write_evidence(
+        local,
+        "three_days_ago.json",
+        generated_at="2026-09-09T10:00:00Z",
+    )
+
+    section = reports.supervisor_report_section(str(local), days=None)
+    assert section["passes_in_window"] == 1
+    assert section["last_pass"]["evidence_file"] == "three_days_ago.json"
+
+    narrow = reports.supervisor_report_section(str(local), days=1)
+    assert narrow["passes_in_window"] == 0
+    assert narrow["last_pass"] is None
+
+
+def test_report_model_supervisor_window_aligns_when_days_none(tmp_path, monkeypatch):
+    now = datetime.datetime(2026, 9, 12, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    _freeze_utcnow(monkeypatch, now)
+    monkeypatch.setattr(_roster_models, "_utcnow", lambda: now)
+    local = _local(tmp_path)
+    w = _worker(tmp_path, "lane", "hood")
+    _patch_roster(monkeypatch, Roster(workers={"lane": w}, path="t"))
+    _write_evidence(
+        local,
+        "three_days_ago.json",
+        generated_at="2026-09-09T10:00:00Z",
+    )
+
+    report = board.report_model(str(local), days=None)
+    assert report["window_days"] == 7
+    assert report["supervisor"]["passes_in_window"] == 1
+
+
+def test_unparseable_generated_at_counted_unreadable(tmp_path):
+    local = _local(tmp_path)
+    _write_evidence(local, "bad-date.json", generated_at="not-a-date")
+
+    model = reports.supervisor_api_model(str(local))
+    assert model["unreadable"] == 1
+    assert model["passes"] == []
+
+
+def test_malformed_proposals_counted_unreadable(tmp_path):
+    local = _local(tmp_path)
+    _write_evidence(
+        local,
+        "bad-proposals.json",
+        proposals=[1, "x", {"valid": True}],
+    )
+    _write_evidence(local, "good.json", generated_at="2026-09-12T10:00:00Z")
+
+    model = reports.supervisor_api_model(str(local))
+    assert model["unreadable"] == 1
+    assert len(model["passes"]) == 1
+    assert model["passes"][0]["evidence_file"] == "good.json"
 
 
 def test_limit_param_parses_and_survives_junk():
