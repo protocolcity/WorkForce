@@ -39,7 +39,7 @@ from ..._utils import (  # noqa: F401
     _utcnow,
     desk_base_url,
 )
-from ...ledger import Ledger, open_claims, parse_shifts  # noqa: F401
+from ...ledger import Ledger, open_candidates, open_claims, parse_shifts  # noqa: F401
 from ...roster import Roster, RosterError, Worker  # noqa: F401
 from ...schedule import calendar_intervals_to_cron, maybe_cron, next_fire_utc  # noqa: F401
 from ... import roster as roster_mod  # noqa: F401
@@ -72,10 +72,13 @@ from .constants import (  # noqa: F401
 from .desk import (  # noqa: F401
     _desk_json,
     _desk_owner_of,
+    _holding_evidence,
+    _holding_not_queried,
     _is_connection_exc,
     _queue_human_link,
     _worker_flags,
     _worker_holdings,
+    _worker_holdings_evidence,
     _worker_queue,
     _worker_ready_teaser,
 )
@@ -95,7 +98,8 @@ from .law import (  # noqa: F401
     _worker_health,
 )
 from .models import (  # noqa: F401
-    _ledger_holdings,
+    _holding_fields,
+    _ledger_candidates,
     _worker_full_data,
     report_model,
     scene_model,
@@ -143,7 +147,8 @@ _ADOPT_NAMES = (
     "_queue_human_link",
     "_is_connection_exc",
     "_worker_queue",
-    "_ledger_holdings",
+    "_holding_fields",
+    "_ledger_candidates",
     "_worker_full_data",
     "_platforms",
     "_load_roster",
@@ -157,6 +162,9 @@ _ADOPT_NAMES = (
     "_desk_owner_of",
     "_worker_identity_aliases",
     "_worker_holdings",
+    "_worker_holdings_evidence",
+    "_holding_evidence",
+    "_holding_not_queried",
     "_worker_ready_teaser",
     "_worker_flags",
     "worker_model",

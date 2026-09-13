@@ -9,7 +9,7 @@ import workforce.api.roster as _api_roster  # noqa: E402
 from workforce.board import (  # noqa: E402
     _contract_rules, _law_stack, _worker_flags, _worker_queue, worker_model,
 )
-from workforce.ledger import open_claims, parse_shifts  # noqa: E402
+from workforce.ledger import open_candidates, open_claims, parse_shifts  # noqa: E402
 from workforce.roster import Roster, Worker  # noqa: E402
 
 LEDGER = """\
@@ -50,7 +50,7 @@ def test_parse_shifts_dry_run_closes_at_done():
     assert s["outcome"] == "ok" and s["dry_run"] and s["reason"] == "dry-run"
 
 
-def test_open_claims_empty_when_no_open_shift():
+def test_open_claims_empty_for_dispatch_input_rows():
     assert open_claims(LEDGER) == []
     text = ("2026-07-14T04:00:00Z START identity=x kind=lane queue=1 dry_run=0\n"
             "2026-07-14T04:00:01Z CLAIM ticket=wf-1 title=hello product=workforce\n"
@@ -59,50 +59,54 @@ def test_open_claims_empty_when_no_open_shift():
     assert open_claims(text) == []
 
 
-def test_open_claims_tracks_running_shift_and_clears_on_error():
+def test_open_candidates_tracks_running_shift_and_clears_on_error():
     import datetime
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     open_text = (
         "%s START identity=x kind=lane queue=2 dry_run=0\n"
-        "%s CLAIM ticket=wf-158 title=\"Engine claim\" product=workforce priority=3\n"
-        "%s CLAIM ticket=wf-159 title=other product=workforce\n"
+        "%s CLAIM ticket=wf-158 title=\"Legacy dispatch input\" product=workforce priority=3\n"
+        "%s CANDIDATE ticket=wf-159 title=other product=workforce\n"
     ) % (now, now, now)
-    held = open_claims(open_text)
+    held = open_candidates(open_text)
     assert [c["ticket"] for c in held] == ["wf-158", "wf-159"]
-    assert held[0]["title"] == "Engine claim"
+    assert held[0]["title"] == "Legacy dispatch input"
     assert held[0]["product"] == "workforce"
+    assert held[0]["legacy_claim"] == "1"
+    assert "legacy_claim" not in held[1]
+    assert open_claims(open_text) == []
     # multi-pass DONE does not clear
     mid = open_text + "%s DONE rc=0 on_pass=1\n" % now
-    assert len(open_claims(mid)) == 2
+    assert len(open_candidates(mid)) == 2
     # ERROR closes the window
     closed = mid + "%s ERROR reason=\"killed at budget\"\n" % now
-    assert open_claims(closed) == []
+    assert open_candidates(closed) == []
 
 
-def test_open_claims_clears_on_dry_run_done():
+def test_open_candidates_clears_on_dry_run_done():
     text = ("2026-07-14T04:00:00Z START identity=x kind=lane queue=1 dry_run=1\n"
-            "2026-07-14T04:00:00Z CLAIM ticket=wf-1 title=t product=workforce\n"
+            "2026-07-14T04:00:00Z CANDIDATE ticket=wf-1 title=t product=workforce\n"
             "2026-07-14T04:00:00Z DONE dry_run=1 argv_head=cli argv_len=3\n")
+    assert open_candidates(text) == []
     assert open_claims(text) == []
 
 
-def test_ledger_holdings_maps_open_claims(tmp_path):
+def test_ledger_candidates_maps_open_candidates(tmp_path):
     import datetime
     local = tmp_path / "local"
     (local / "ledger").mkdir(parents=True)
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     (local / "ledger" / "kai.log").write_text(
         "%s START identity=kai kind=lane queue=1 dry_run=0\n"
-        "%s CLAIM ticket=wf-158 title=\"Engine-owned claim\" product=workforce priority=3\n"
+        "%s CANDIDATE ticket=wf-158 title=\"Dispatch candidate\" product=workforce priority=3\n"
         % (now, now)
     )
-    held = _api_roster._ledger_holdings(str(local), "kai", owner="kai")
+    held = _api_roster._ledger_candidates(str(local), "kai")
     assert len(held) == 1
     assert held[0]["id"] == "wf-158"
-    assert held[0]["title"] == "Engine-owned claim"
+    assert held[0]["title"] == "Dispatch candidate"
     assert held[0]["product"] == "workforce"
     assert held[0]["priority"] == 3
-    assert held[0]["owner"] == "kai"
+    assert held[0]["status"] == "candidate"
     assert held[0]["source"] == "ledger"
     assert "open=wf-158" in held[0]["href"]
 
@@ -418,7 +422,13 @@ def test_worker_model_includes_flags(tmp_path, monkeypatch):
         "queue_url": "http://127.0.0.1:9999/api?product=workforce&label=worker:x",
     }}}))
 
-    monkeypatch.setattr(_api_roster, "_worker_holdings", lambda _w: [])
+    monkeypatch.setattr(
+        _api_roster, "_worker_holdings_evidence",
+        lambda _w, statuses=None: {
+            "state": "empty", "source": "desk", "items": [],
+            "error": "", "partial": False,
+        },
+    )
     monkeypatch.setattr(_api_roster, "_worker_ready_teaser", lambda _w, **_kw: [])
     monkeypatch.setattr(_api_roster, "_worker_flags",
                         lambda _w: [{"id": "wf-60", "title": "flags row",
@@ -525,8 +535,87 @@ def test_api_workers_no_light_parallel_queue_values(tmp_path, monkeypatch):
 # ── wf-147: scene latency bounds + client-gone write ──────────────────────
 
 
-def test_worker_holdings_uses_label_filter_skips_owner_walk(tmp_path, monkeypatch):
-    """Labeled queue_url → one list GET per status; no Owner: detail walks."""
+def test_worker_holdings_unavailable_vs_verified_empty(tmp_path, monkeypatch):
+    """wf-250: desk failure → unavailable; empty tasks list → empty state."""
+    from workforce.api import roster as roster_mod
+
+    w = make_worker(tmp_path)
+    w.queue_url = "http://127.0.0.1:8799/api/admin/tasks/ready?product=workforce"
+
+    def desk_down(_path, timeout=5.0):
+        return None
+
+    monkeypatch.setattr(roster_mod, "_desk_json", desk_down)
+    down = roster_mod._worker_holdings_evidence(w, ("in_progress",))
+    assert down["state"] == "unavailable"
+    assert roster_mod._worker_holdings(w, ("in_progress",)) == []
+    assert down["error"]
+
+    def desk_empty(_path, timeout=5.0):
+        return {"tasks": []}
+
+    monkeypatch.setattr(roster_mod, "_desk_json", desk_empty)
+    empty = roster_mod._worker_holdings_evidence(w, ("in_progress",))
+    assert empty["state"] == "empty"
+    assert roster_mod._worker_holdings(w, ("in_progress",)) == []
+    assert empty["error"] == ""
+
+
+def test_worker_holdings_list_ok_detail_fail_is_partial_not_empty(tmp_path, monkeypatch):
+    """wf-250: list succeeds but Owner detail fails → partial, not verified empty."""
+    from workforce.api import roster as roster_mod
+
+    w = make_worker(tmp_path)
+    w.name = "salem"
+    w.identity = "salem"
+    w.queue_url = "http://127.0.0.1:8799/api/admin/tasks/ready?product=workforce"
+
+    monkeypatch.setattr(
+        roster_mod, "_desk_json",
+        lambda path, timeout=5.0: (
+            {"tasks": [{"id": "wf-9", "title": "needs owner", "status": "in_progress"}]}
+            if "status=in_progress" in path else {"tasks": []}
+        ),
+    )
+    monkeypatch.setattr(
+        roster_mod, "_desk_owner_of",
+        lambda tid, product="": ("", False, "detail unreachable"),
+    )
+    ev = roster_mod._worker_holdings_evidence(w, ("in_progress",))
+    assert ev["state"] == "partial"
+    assert ev["partial"] is True
+    assert ev["items"] == []
+    assert roster_mod._worker_holdings(w, ("in_progress",)) == []
+    assert "detail unreachable" in ev["error"]
+
+
+def test_desk_owner_of_bare_id_requires_project(tmp_path, monkeypatch):
+    """wf-250: bare numeric ids must pass explicit project= on detail fetch."""
+    from workforce.api import roster as roster_mod
+
+    calls = []
+
+    def fake_desk(path, timeout=5.0):
+        calls.append(path)
+        return {
+            "task": {
+                "id": "250",
+                "comments": [{"body": "Owner: salem\nWorkdir: /tmp"}],
+            },
+        }
+
+    monkeypatch.setattr(roster_mod, "_desk_json", fake_desk)
+    blocked = roster_mod._desk_owner_of("250", "")
+    assert blocked == ("", False, "bare task id requires project")
+    assert calls == []
+
+    owner, ok, err = roster_mod._desk_owner_of("250", "workforce")
+    assert ok is True and err == "" and owner == "salem"
+    assert calls == ["/api/admin/tasks/250?project=workforce"]
+
+
+def test_worker_holdings_requires_owner_not_label(tmp_path, monkeypatch):
+    """wf-250: routing label match without signed Owner is not a hold."""
     from workforce.api import roster as roster_mod
 
     w = make_worker(tmp_path)
@@ -536,28 +625,55 @@ def test_worker_holdings_uses_label_filter_skips_owner_walk(tmp_path, monkeypatc
         "http://127.0.0.1:8799/api/admin/tasks/ready"
         "?product=workforce&label=worker:salem"
     )
-    calls = []
+    owner_calls = []
 
     def fake_desk(path, timeout=5.0):
-        calls.append(path)
         if "status=in_progress" in path and "label=" in path:
             return {"tasks": [
-                {"id": "wf-147", "title": "scene latency", "status": "in_progress",
-                 "priority": 2, "updated_at": "2026-08-03T16:00:00Z"},
+                {"id": "wf-147", "title": "label only", "status": "in_progress"},
+                {"id": "wf-148", "title": "signed hold", "status": "in_progress"},
             ]}
         return {"tasks": []}
 
+    def fake_owner(tid, product=""):
+        owner_calls.append((tid, product))
+        return ("salem", True, "") if tid == "wf-148" else ("you", True, "")
+
     monkeypatch.setattr(roster_mod, "_desk_json", fake_desk)
+    monkeypatch.setattr(roster_mod, "_desk_owner_of", fake_owner)
+    ev = roster_mod._worker_holdings_evidence(w, ("in_progress",))
+    held = roster_mod._worker_holdings(w, ("in_progress",))
+    assert ev["state"] == "available"
+    assert [h["id"] for h in held] == ["wf-148"]
+    assert held[0]["owner"] == "salem"
+    assert held[0]["owner_verified"] is True
+    assert set(owner_calls) == {("wf-147", "workforce"), ("wf-148", "workforce")}
 
-    def boom_owner(_tid):
-        raise AssertionError("Owner walk must not run for labeled lanes")
 
-    monkeypatch.setattr(roster_mod, "_desk_owner_of", boom_owner)
-    held = roster_mod._worker_holdings(w)
-    assert [h["id"] for h in held] == ["wf-147"]
-    assert all("label=worker%3Asalem" in c or "label=worker:salem" in c
-               for c in calls if "status=" in c)
-    assert not any("/api/admin/tasks/wf-" in c for c in calls)
+def test_worker_holdings_partial_when_owner_cap_hit(tmp_path, monkeypatch):
+    """wf-250: bounded Owner lookups report partial when capped."""
+    from workforce.api import roster as roster_mod
+
+    w = make_worker(tmp_path)
+    w.name = "salem"
+    w.identity = "salem"
+    w.queue_url = "http://127.0.0.1:8799/api/admin/tasks/ready?product=workforce"
+    tasks = [{"id": "wf-%d" % i, "title": "t", "status": "in_progress"}
+             for i in range(6)]
+
+    monkeypatch.setattr(
+        roster_mod, "_desk_json",
+        lambda _path, timeout=5.0: {"tasks": tasks},
+    )
+    monkeypatch.setattr(
+        roster_mod, "_desk_owner_of",
+        lambda tid, product="": ("salem", True, ""),
+    )
+    ev = roster_mod._worker_holdings_evidence(w, ("in_progress",))
+    assert ev["state"] == "partial"
+    assert ev["partial"] is True
+    assert len(ev["items"]) == 5
+    assert len(roster_mod._worker_holdings(w, ("in_progress",))) == 5
 
 
 def test_client_gone_write_swallows_broken_pipe(tmp_path):
