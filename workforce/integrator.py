@@ -23,9 +23,11 @@ dispatch or merge that fires merely by importing this module.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -46,7 +48,10 @@ _REQUIRED_CONFIG_KEYS = (
     "version_file",
     "stage_cmd",
     "activate_cmd",
+    "main_checkout",
 )
+
+_VERSION_BUMP_RULES = ("major", "minor", "patch", "local-suffix")
 
 # Providers stay replaceable: which reviewer covers which implementation
 # provider is data, not a hard-coded branch per vendor name.
@@ -100,6 +105,14 @@ def _str_list(value: Any, field: str) -> List[str]:
     return list(value)
 
 
+def _abs_path_map(value: Any, field: str) -> Dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or not all(isinstance(k, str) and k for k in value):
+        raise IntegratorError("%s must be a string-keyed object of absolute paths" % field)
+    return {k: _abs_path(v, "%s[%s]" % (field, k)) for k, v in value.items()}
+
+
 def _positive_int(value: Any, field: str, default: int) -> int:
     if value is None:
         return default
@@ -133,11 +146,14 @@ def load_config(path: str) -> Dict[str, Any]:
     test_cmd = _str_list(raw["test_cmd"], "test_cmd")
     pr_base = _nonempty_str(raw["pr_base"], "pr_base")
     version_bump = _nonempty_str(raw["version_bump"], "version_bump")
-    if version_bump not in ("major", "minor", "patch"):
-        raise IntegratorError("version_bump must be one of major/minor/patch")
+    if version_bump not in _VERSION_BUMP_RULES:
+        raise IntegratorError(
+            "version_bump must be one of %s" % "/".join(_VERSION_BUMP_RULES)
+        )
     version_file = _nonempty_str(raw["version_file"], "version_file")
     stage_cmd = _str_list(raw["stage_cmd"], "stage_cmd")
     activate_cmd = _str_list(raw["activate_cmd"], "activate_cmd")
+    main_checkout = _abs_path(raw["main_checkout"], "main_checkout")
 
     reviewer_dispatch_cmd = raw.get("reviewer_dispatch_cmd")
     if reviewer_dispatch_cmd is not None:
@@ -150,6 +166,12 @@ def load_config(path: str) -> Dict[str, Any]:
     verify_cmd = raw.get("verify_cmd")
     if verify_cmd is not None:
         verify_cmd = _str_list(verify_cmd, "verify_cmd")
+
+    reviewer_prompt_paths = _abs_path_map(raw.get("reviewer_prompt_paths"), "reviewer_prompt_paths")
+    reviewer_output_paths = _abs_path_map(raw.get("reviewer_output_paths"), "reviewer_output_paths")
+    release_root = raw.get("release_root")
+    if release_root is not None:
+        release_root = _abs_path(release_root, "release_root")
 
     reviewer_by_provider = dict(DEFAULT_REVIEWER_BY_PROVIDER)
     override = raw.get("reviewer_by_provider")
@@ -178,9 +200,13 @@ def load_config(path: str) -> Dict[str, Any]:
         "version_bump": version_bump,
         "version_file": version_file,
         "version_key": version_key,
+        "main_checkout": main_checkout,
+        "release_root": release_root or os.path.join(local_root, "releases"),
         "stage_cmd": stage_cmd,
         "activate_cmd": activate_cmd,
         "reviewer_dispatch_cmd": reviewer_dispatch_cmd,
+        "reviewer_prompt_paths": reviewer_prompt_paths,
+        "reviewer_output_paths": reviewer_output_paths,
         "reviewer_by_provider": reviewer_by_provider,
         "screenshot_cmd": screenshot_cmd,
         "verify_cmd": verify_cmd,
@@ -252,6 +278,268 @@ def coordinator_lock_is_fresh(
     return (now - updated_at_secs) < ttl_secs
 
 
+def _reviewer_ledger_path(local_root: str, reviewer: str) -> str:
+    return os.path.join(local_root, "ledger", "%s.log" % reviewer)
+
+
+def reviewer_ledger_offset(local_root: str, reviewer: str) -> int:
+    """The reviewer ledger's current byte size, or 0 if it does not exist yet.
+
+    Captured immediately before dispatch so a terminal row from an earlier
+    run — even one stamped in the same second as the new dispatch — can
+    never satisfy the wait: only bytes appended after this offset count.
+    """
+    path = _reviewer_ledger_path(local_root, reviewer)
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+_LEDGER_KV_RE = re.compile(r'(\w+)=("(?:[^"]*)"|\S+)')
+
+
+def _ledger_row_kv(rest: str) -> Dict[str, str]:
+    return {m.group(1): m.group(2).strip('"') for m in _LEDGER_KV_RE.finditer(rest)}
+
+
+def latest_reviewer_terminal_event(
+    local_root: str,
+    reviewer: str,
+    since_offset: int,
+    *,
+    expected_prompt_sha: Optional[str] = None,
+) -> Optional[str]:
+    """``"DONE"``/``"ERROR"``/``"SKIP"``/``None`` from the ledger rows appended after *since_offset*.
+
+    ``since_offset`` must be the ledger's size at dispatch time (from
+    :func:`reviewer_ledger_offset`) — rows entirely within the first
+    *since_offset* bytes are pre-existing and never satisfy the wait, even
+    when their timestamp equals or exceeds the dispatch time.
+
+    Scans the appended rows in order (not newest-first): a real engine shift
+    with ``max_passes 1`` appends ``DONE`` and then ``STOP`` as its normal
+    end-of-shift marker, so a trailing ``STOP`` after a ``DONE`` must never
+    be read as a failure. ``ERROR`` anywhere fails the wait immediately.
+
+    A ``DONE`` only counts once this dispatch's own ``START`` row has also
+    appeared after the offset. When *expected_prompt_sha* is given, "this
+    dispatch's own START" means specifically the row whose ``prompt_sha``
+    kv equals it (the engine records ``prompt_sha`` off the exact prompt
+    file content it read) — a concurrently running shift of the same
+    reviewer that started before this dispatch and finishes after our
+    offset writes its own ``START``/``DONE`` pair that must never be
+    misread as this dispatch's completed review just because both rows
+    landed after the offset. A ``START`` for a *different* prompt_sha
+    resets "own start" back to not-seen, so a ``SKIP`` that follows it
+    (this dispatch's own attempt hitting the reviewer's lock, or another
+    shift's SKIP) is correctly read as this dispatch never having run,
+    regardless of a DONE for that other shift's START appearing later in
+    the tail. When *expected_prompt_sha* is omitted, any ``START`` counts
+    (legacy behaviour, kept so callers that do not track a prompt_sha are
+    unaffected). A ``SKIP`` seen before this dispatch's own start means
+    this dispatch did not run at all — return ``"SKIP"`` so the caller
+    retries later rather than reading a stranger's review or a stale
+    failure. Anything else (including a lone ``STOP`` with no ``DONE`` yet)
+    means ``None`` — still running, keep waiting.
+    """
+    path = _reviewer_ledger_path(local_root, reviewer)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            fh.seek(since_offset)
+            tail = fh.read()
+    except OSError:
+        return None
+    own_start_seen = False
+    own_done_seen = False
+    saw_skip_not_ours = False
+    for line in tail.splitlines():
+        parts = line.strip().split(" ", 2)
+        if len(parts) < 2 or parts[1] not in ("START", "DONE", "ERROR", "STOP", "SKIP"):
+            continue
+        event = parts[1]
+        if event == "ERROR":
+            return "ERROR"
+        if event == "START":
+            if expected_prompt_sha is None:
+                own_start_seen = True
+            else:
+                kv = _ledger_row_kv(parts[2]) if len(parts) > 2 else {}
+                own_start_seen = kv.get("prompt_sha") == expected_prompt_sha
+        elif event == "DONE":
+            if own_start_seen:
+                own_done_seen = True
+        elif event == "SKIP":
+            if not own_start_seen:
+                saw_skip_not_ours = True
+    if own_start_seen and own_done_seen:
+        return "DONE"
+    if saw_skip_not_ours:
+        return "SKIP"
+    return None
+
+
+def wait_for_reviewer_ledger(
+    local_root: str,
+    reviewer: str,
+    since_offset: int,
+    *,
+    timeout_secs: int = 1800,
+    poll_interval_secs: int = 5,
+    now_fn: Callable[[], float] = time.time,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    expected_prompt_sha: Optional[str] = None,
+) -> Optional[str]:
+    """Poll the reviewer's ledger for a terminal row until *timeout_secs*.
+
+    Returns ``"DONE"``/``"ERROR"``/``"SKIP"``/``None`` (timeout or still
+    running) — the caller treats anything but ``"DONE"`` as a failed or
+    not-yet-completed review, never as a clean pass.
+    """
+    deadline = now_fn() + timeout_secs
+    while True:
+        event = latest_reviewer_terminal_event(
+            local_root, reviewer, since_offset, expected_prompt_sha=expected_prompt_sha,
+        )
+        if event is not None:
+            return event
+        if now_fn() >= deadline:
+            return None
+        sleep_fn(poll_interval_secs)
+
+
+_WORKDIR_MARKER_RE = re.compile(r"(?m)^Workdir:\s*(\S+)")
+
+
+def _git_worktree_head_branch(path: str) -> Optional[str]:
+    """The checked-out branch at *path*, or ``None`` if it is not a usable git worktree."""
+    if not os.path.isdir(os.path.join(path, ".git")) and not os.path.isfile(os.path.join(path, ".git")):
+        return None
+    r = _run(["git", "symbolic-ref", "--short", "HEAD"], cwd=path)
+    if r["rc"] != 0:
+        return None
+    branch = r["output"].strip()
+    return branch or None
+
+
+def workdir_from_comments(
+    comments: Optional[Sequence[Dict[str, Any]]],
+    seat: Optional[str] = None,
+    *,
+    task_id: Optional[str] = None,
+    checkout_template: Optional[str] = None,
+    workspace_root: Optional[str] = None,
+    branch_template: Optional[str] = None,
+) -> Optional[str]:
+    """The seat's latest ``Owner:`` claim comment's ``Workdir:`` line, or ``None``.
+
+    Mirrors :func:`workforce._utils.latest_owner_id`'s "latest wins" reading
+    of PROCESS §5 claim markers, scoped to the ``Workdir:`` line a claim
+    records alongside ``Owner:``. Only honours a claim comment authored by
+    *seat* itself (when given) — another seat's stale or spoofed Owner
+    comment on the same order must never redirect this seat's checkout — and
+    only an absolute path, never a relative one that could resolve outside
+    the intended workspace.
+
+    When *task_id* is also given, the claimed path is only accepted when
+    either:
+
+    - it equals *checkout_template*'s expansion for *seat*/*task_id* (the
+      strongest signal — this is exactly where the host would have put it),
+      or
+    - it ends with ``/<task_id>/checkout`` *and* the directory exists as a
+      git worktree whose checked-out branch equals *branch_template*'s
+      expansion for *seat*/*task_id*.
+
+    A bare ``/<task_id>/checkout`` suffix is not enough on its own: a stale
+    directory left over from an earlier recovery attempt on the same task id
+    (a different tree entirely, e.g. reused after a prior checkout was torn
+    down and rebuilt elsewhere) would otherwise redirect this order's
+    suites, PR, review, or merge to the wrong tree just because its path
+    happens to end the same way. Returns ``None`` on a mismatch so the
+    caller falls back to the template and can record it.
+    """
+    workdir: Optional[str] = None
+    for c in comments or []:
+        if not isinstance(c, dict):
+            continue
+        if seat is not None and str(c.get("author") or "") != seat:
+            continue
+        body = str(c.get("body") or "")
+        if not body.lstrip().startswith("Owner:"):
+            continue
+        m = _WORKDIR_MARKER_RE.search(body)
+        if m:
+            candidate = m.group(1).strip()
+            if os.path.isabs(candidate):
+                workdir = candidate
+    if workdir is None or task_id is None:
+        return workdir
+    if branch_template and seat is not None:
+        expected_branch = branch_template.format(worker=seat, task_id=task_id)
+        branch_verified = _git_worktree_head_branch(workdir) == expected_branch
+    else:
+        branch_verified = False
+    if checkout_template and seat is not None:
+        expansion = os.path.join(
+            workspace_root or "", checkout_template.format(worker=seat, task_id=task_id),
+        )
+        if workdir == expansion and branch_verified:
+            return workdir
+    if workdir.endswith("/%s/checkout" % task_id) and branch_verified:
+        return workdir
+    return None
+
+
+def _read_stable_file(
+    path: str,
+    *,
+    timeout_secs: int = 30,
+    poll_interval_secs: float = 1.0,
+    now_fn: Callable[[], float] = time.time,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> Optional[str]:
+    """Read *path* once its size stops changing across two consecutive reads.
+
+    A reviewer job's writer may still be flushing its output file when the
+    ledger's terminal row lands; reading a half-written file would parse
+    truncated findings as clean. Returns ``None`` if the file never becomes
+    readable/stable within *timeout_secs*.
+    """
+    deadline = now_fn() + timeout_secs
+    last_size = None
+    while True:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = None
+        if size is not None and size == last_size:
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    return fh.read()
+            except OSError:
+                return None
+        last_size = size
+        if now_fn() >= deadline:
+            return None
+        sleep_fn(poll_interval_secs)
+
+
+def substitute_placeholders(argv: Sequence[str], **values: str) -> List[str]:
+    """Replace ``{name}`` placeholders in each *argv* entry from *values*.
+
+    Plain ``str.replace`` per placeholder (not ``str.format``) so an argv
+    entry with unrelated braces (a JSON literal, a shell glob) is never
+    misparsed as a format field.
+    """
+    out = []
+    for arg in argv:
+        for name, value in values.items():
+            arg = arg.replace("{%s}" % name, "" if value is None else str(value))
+        out.append(arg)
+    return out
+
+
 def decide_after_suites(
     rc: int, recovery_rounds_used: int, max_recovery_rounds: int,
 ) -> Dict[str, str]:
@@ -304,15 +592,37 @@ def decide_merge_ready(
     return True, "CI green, no findings, clean checkout"
 
 
+_LOCAL_SUFFIX_VERSION_RE = re.compile(
+    r"^(?P<base>[0-9]+\.[0-9]+\.[0-9]+)\+(?P<tag>.+)\.(?P<n>[0-9]+)$"
+)
+
+
 def bump_version(current: str, rule: str) -> str:
-    """MAJOR.MINOR.PATCH bump per *rule* (major|minor|patch)."""
-    parts = (current or "").split(".")
+    """Version bump per *rule* (major|minor|patch|local-suffix).
+
+    ``local-suffix`` covers the real host versions this job actually bumps —
+    ``0.1.47+consolidation.56`` (BluePrint), ``0.1.9+consolidation.13``
+    (WorkForce) — which are not bare MAJOR.MINOR.PATCH. It increments the
+    trailing integer of the ``+<tag>.<n>`` local suffix and leaves the
+    MAJOR.MINOR.PATCH base and the tag untouched.
+    """
+    rule = (rule or "").strip().lower()
+    current = current or ""
+    if rule == "local-suffix":
+        m = _LOCAL_SUFFIX_VERSION_RE.match(current)
+        if not m:
+            raise IntegratorError(
+                "current version %r has no MAJOR.MINOR.PATCH+<tag>.<n> local suffix"
+                % current
+            )
+        return "%s+%s.%d" % (m.group("base"), m.group("tag"), int(m.group("n")) + 1)
+
+    parts = current.split(".")
     if len(parts) != 3 or not all(p.isdigit() for p in parts):
         raise IntegratorError(
             "current version %r is not MAJOR.MINOR.PATCH" % current
         )
     major, minor, patch = (int(p) for p in parts)
-    rule = (rule or "").strip().lower()
     if rule == "major":
         major, minor, patch = major + 1, 0, 0
     elif rule == "minor":
@@ -788,11 +1098,25 @@ def discover_candidates(
         tid = str(t.get("id") or "").strip()
         if not tid:
             continue
+        comments = t.get("comments")
+        raw_workdir = workdir_from_comments(comments, seat=seat)
+        checkout_override = workdir_from_comments(
+            comments, seat=seat, task_id=tid,
+            checkout_template=config["checkout_template"],
+            workspace_root=config["workspace_root"],
+            branch_template=config["branch_template"],
+        )
+        if raw_workdir is not None and checkout_override is None:
+            append_ledger_row(
+                config["local_root"], config["project"], "DISCOVER",
+                ticket=tid, worker=seat, workdir_mismatch=raw_workdir,
+            )
         candidates.append({
             "task_id": tid,
             "worker": seat,
             "provider": provider,
             "title": str(t.get("title") or ""),
+            "checkout_override": checkout_override,
         })
     candidates.sort(key=lambda c: c["task_id"])
     return candidates[:headroom] if headroom < len(candidates) else candidates
@@ -803,20 +1127,35 @@ def discover_candidates(
 # --------------------------------------------------------------------------
 
 
-def _run(argv: Sequence[str], cwd: Optional[str] = None, input_text: Optional[str] = None) -> Dict[str, Any]:
+def _run(
+    argv: Sequence[str],
+    cwd: Optional[str] = None,
+    input_text: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     proc = subprocess.run(
-        list(argv), cwd=cwd, input=input_text, capture_output=True, text=True,
+        list(argv), cwd=cwd, input=input_text, capture_output=True, text=True, env=env,
     )
     return {"rc": proc.returncode, "output": (proc.stdout or "") + (proc.stderr or "")}
 
 
 def _checkout_path(config: Dict[str, Any], order: Dict[str, Any]) -> str:
+    override = order.get("checkout_override")
+    if override:
+        return override
     rel = config["checkout_template"].format(worker=order["worker"], task_id=order["task_id"])
     return os.path.join(config["workspace_root"], rel)
 
 
 def _branch_name(config: Dict[str, Any], order: Dict[str, Any]) -> str:
     return config["branch_template"].format(worker=order["worker"], task_id=order["task_id"])
+
+
+# Matches a MAJOR.MINOR.PATCH version with an optional "+<tag>.<n>" local
+# suffix (e.g. "0.1.9" or "0.1.9+consolidation.13") — the same shape
+# bump_version's "local-suffix" rule produces, so a file this job just wrote
+# is always readable on the next pass.
+_VERSION_LINE_VALUE_RE = r"[0-9]+\.[0-9]+\.[0-9]+(?:\+[^\"'\s]+\.[0-9]+)?"
 
 
 def _read_version(config: Dict[str, Any], checkout: str) -> str:
@@ -828,7 +1167,7 @@ def _read_version(config: Dict[str, Any], checkout: str) -> str:
                 data = data[key]
             return str(data)
         text = fh.read()
-    m = re.search(r'"?version"?\s*[:=]\s*"([0-9]+\.[0-9]+\.[0-9]+)"', text)
+    m = re.search(r'"?version"?\s*[:=]\s*"(%s)"' % _VERSION_LINE_VALUE_RE, text)
     if not m:
         raise IntegratorError("could not find a version in %s" % path)
     return m.group(1)
@@ -847,12 +1186,14 @@ def _write_version(config: Dict[str, Any], checkout: str, new_version: str) -> N
         node[parts[-1]] = new_version
         raw = json.dumps(data, indent=2) + "\n"
     else:
-        raw = re.sub(
-            r'("?version"?\s*[:=]\s*")[0-9]+\.[0-9]+\.[0-9]+(")',
-            r"\g<1>%s\g<2>" % new_version,
+        raw, count = re.subn(
+            r'(?m)^(.*?"?version"?\s*[:=]\s*")%s(".*)$' % _VERSION_LINE_VALUE_RE,
+            lambda mo: mo.group(1) + new_version + mo.group(2),
             raw,
             count=1,
         )
+        if count != 1:
+            raise IntegratorError("could not find a version line to replace in %s" % path)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(raw)
 
@@ -916,9 +1257,88 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
     def dispatch_reviewer(reviewer: str, prompt: str) -> Dict[str, Any]:
         if not config.get("reviewer_dispatch_cmd"):
             raise IntegratorError("reviewer_dispatch_cmd not configured")
+        prompt_path = (config.get("reviewer_prompt_paths") or {}).get(reviewer)
+        output_path = (config.get("reviewer_output_paths") or {}).get(reviewer)
+        if not prompt_path or not output_path:
+            # The registered reviewer jobs load their prompt from their own
+            # worker-config file and write their transcript to their own
+            # output file — with no mapping for this reviewer there is
+            # nowhere correct to write the prompt or read the review from,
+            # so an unattended merge must never rest on whatever static
+            # prompt happened to be on disk already.
+            raise IntegratorError(
+                "no reviewer_prompt_paths/reviewer_output_paths mapping for reviewer %r"
+                % reviewer
+            )
         argv = [a.replace("{reviewer}", reviewer) for a in config["reviewer_dispatch_cmd"]]
-        r = _run(argv, input_text=prompt)
-        return {"ok": r["rc"] == 0, "output": r["output"]}
+        env = dict(os.environ)
+        env["WORKFORCE_DATA_DIR"] = str(Path(config["local_root"]).parent)
+        if "--file" not in argv:
+            argv = argv + ["--file", config["roster_path"]]
+
+        # A dispatch nonce makes the prompt file content unique per dispatch
+        # even when the underlying scope/diff is byte-identical to a prior
+        # dispatch of the same reviewer — without it two dispatches with the
+        # same prompt text would compute the same prompt_sha and a stale
+        # START row from the earlier one could satisfy this dispatch's wait.
+        prompt_with_nonce = "<!-- integrator-dispatch: %s -->\n%s" % (uuid.uuid4().hex, prompt)
+        expected_prompt_sha = hashlib.sha256(prompt_with_nonce.encode("utf-8")).hexdigest()[:16]
+
+        os.makedirs(os.path.dirname(prompt_path), exist_ok=True)
+        with open(prompt_path, "w", encoding="utf-8") as fh:
+            fh.write(prompt_with_nonce)
+        copy_dir = os.path.join(
+            config["local_root"], "reports", "integrator", config["project"], "reviewer-prompts",
+        )
+        os.makedirs(copy_dir, exist_ok=True)
+        shutil.copy(
+            prompt_path,
+            os.path.join(copy_dir, "%s-%s.md" % (reviewer, _utc_iso_z().replace(":", ""))),
+        )
+
+        # Record the output file's size/mtime before dispatch so a reviewer
+        # that never actually writes (crashes, or its own DONE races a
+        # concurrent shift's write) can never be read through a leftover
+        # file from an earlier, unrelated dispatch.
+        try:
+            pre_stat = os.stat(output_path)
+            pre_size, pre_mtime = pre_stat.st_size, pre_stat.st_mtime
+        except OSError:
+            pre_size, pre_mtime = -1, -1.0
+
+        since_offset = reviewer_ledger_offset(config["local_root"], reviewer)
+        r = _run(argv, env=env)
+        if r["rc"] != 0:
+            return {"ok": False, "output": r["output"]}
+        if "lock held" in (r["output"] or "").lower():
+            # The dispatch command exits 0 even when it found the reviewer's
+            # own lock held by another concurrently running shift (the
+            # engine's SKIP path) — that shift is not this dispatch's review
+            # and must never be read as one; retry this dispatch later.
+            return {"ok": False, "retry": True, "output": "reviewer dispatch skipped: %s" % r["output"]}
+        event = wait_for_reviewer_ledger(
+            config["local_root"], reviewer, since_offset, expected_prompt_sha=expected_prompt_sha,
+        )
+        if event == "SKIP":
+            return {"ok": False, "retry": True, "output": "reviewer dispatch skipped (lock held)"}
+        if event != "DONE":
+            return {"ok": False, "output": "reviewer ledger terminal event: %s" % (event or "timeout")}
+        content = _read_stable_file(output_path)
+        if content is None:
+            return {"ok": False, "output": "could not read reviewer output %s" % output_path}
+        try:
+            post_stat = os.stat(output_path)
+            post_size, post_mtime = post_stat.st_size, post_stat.st_mtime
+        except OSError:
+            post_size, post_mtime = -1, -1.0
+        if post_size == pre_size and post_mtime == pre_mtime:
+            return {
+                "ok": False, "stale": True,
+                "output": "reviewer output %s unchanged after DONE (stale)" % output_path,
+            }
+        if not content.strip():
+            return {"ok": False, "empty": True, "output": "reviewer output %s was empty after DONE" % output_path}
+        return {"ok": True, "output": content}
 
     def merge_pr(checkout: str, pr_number: Any) -> Dict[str, Any]:
         return _run(
@@ -936,12 +1356,47 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
         r = _run(["git", "rev-parse", "origin/%s^1" % branch], cwd=checkout)
         return r["output"].strip() if r["rc"] == 0 else ""
 
+    def sync_main_checkout(main_checkout: str, branch: str) -> Dict[str, Any]:
+        """Fetch+reset the configured host checkout to ``origin/<branch>``.
+
+        Any of fetch/checkout/reset failing (stale network, dirty tree,
+        unknown ref) means the checkout cannot be trusted to build a version
+        bump on — return an empty sha so the caller stops with
+        ``main_unverified`` instead of bumping from a stale base.
+        """
+        fetch = _run(["git", "fetch", "origin", branch], cwd=main_checkout)
+        if fetch["rc"] != 0:
+            return {"rc": fetch["rc"], "sha": "", "output": fetch["output"]}
+        checkout = _run(["git", "checkout", branch], cwd=main_checkout)
+        if checkout["rc"] != 0:
+            return {"rc": checkout["rc"], "sha": "", "output": checkout["output"]}
+        reset = _run(["git", "reset", "--hard", "origin/%s" % branch], cwd=main_checkout)
+        if reset["rc"] != 0:
+            return {"rc": reset["rc"], "sha": "", "output": reset["output"]}
+        sha = _run(["git", "rev-parse", "HEAD"], cwd=main_checkout)
+        return {"rc": sha["rc"], "sha": sha["output"].strip() if sha["rc"] == 0 else ""}
+
+    def commit_and_push_version(main_checkout: str, branch: str, new_version: str) -> Dict[str, Any]:
+        _run(["git", "add", config["version_file"]], cwd=main_checkout)
+        commit = _run(
+            ["git", "commit", "-m", "Version %s as %s" % (config["project"], new_version)],
+            cwd=main_checkout,
+        )
+        if commit["rc"] != 0:
+            return {"rc": commit["rc"], "sha": ""}
+        push = _run(["git", "push", "origin", "HEAD:%s" % branch], cwd=main_checkout)
+        sha = _run(["git", "rev-parse", "HEAD"], cwd=main_checkout)
+        return {"rc": push["rc"], "sha": sha["output"].strip() if sha["rc"] == 0 else ""}
+
     def dispatch_recovery(worker: str, preparation_path: str, reason: str) -> Dict[str, Any]:
         argv = [
-            sys.executable, "-m", "workforce", "dispatch", worker,
+            sys.executable, "-m", "workforce", "--file", config["roster_path"],
+            "dispatch", worker,
             "--recover-receipt", preparation_path, "--recovery-reason", reason,
         ]
-        r = _run(argv)
+        env = dict(os.environ)
+        env["WORKFORCE_DATA_DIR"] = str(Path(config["local_root"]).parent)
+        r = _run(argv, env=env)
         return {"ok": r["rc"] == 0, "output": r["output"]}
 
     def read_version(checkout: str) -> str:
@@ -950,23 +1405,45 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
     def write_version(checkout: str, new_version: str) -> None:
         _write_version(config, checkout, new_version)
 
-    def run_stage() -> Dict[str, Any]:
-        return _run(config["stage_cmd"])
+    def _release_root(version: str) -> str:
+        return os.path.join(config["release_root"], version)
 
-    def run_activate() -> Dict[str, Any]:
-        return _run(config["activate_cmd"])
+    def run_stage(ctx: Dict[str, str]) -> Dict[str, Any]:
+        argv = substitute_placeholders(
+            config["stage_cmd"], version=ctx["version"],
+            release_root=_release_root(ctx["version"]), checkout=ctx["checkout"],
+        )
+        return _run(argv)
 
-    def verify_installed_version(expected: str) -> Dict[str, Any]:
+    def run_activate(ctx: Dict[str, str]) -> Dict[str, Any]:
+        argv = substitute_placeholders(
+            config["activate_cmd"], version=ctx["version"],
+            release_root=_release_root(ctx["version"]), checkout=ctx["checkout"],
+        )
+        return _run(argv)
+
+    def verify_installed_version(expected: str, ctx: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         if not config.get("verify_cmd"):
             return {"ok": True, "observed": expected}
-        r = _run(config["verify_cmd"])
+        ctx = ctx or {}
+        argv = substitute_placeholders(
+            config["verify_cmd"], version=expected,
+            release_root=_release_root(expected), checkout=ctx.get("checkout", ""),
+        )
+        r = _run(argv)
         observed = (r["output"] or "").strip()
         return {"ok": r["rc"] == 0 and expected in r["output"], "observed": observed}
 
-    def capture_screenshots() -> List[str]:
+    def capture_screenshots(ctx: Optional[Dict[str, str]] = None) -> List[str]:
         if not config.get("screenshot_cmd"):
             return []
-        r = _run(config["screenshot_cmd"])
+        ctx = ctx or {}
+        version = ctx.get("version", "")
+        argv = substitute_placeholders(
+            config["screenshot_cmd"], version=version,
+            release_root=_release_root(version), checkout=ctx.get("checkout", ""),
+        )
+        r = _run(argv)
         if r["rc"] != 0:
             return []
         return [line.strip() for line in r["output"].splitlines() if line.strip()]
@@ -1000,6 +1477,8 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
         "merge_pr": merge_pr,
         "remote_head_sha": remote_head_sha,
         "merge_commit_parent_sha": merge_commit_parent_sha,
+        "sync_main_checkout": sync_main_checkout,
+        "commit_and_push_version": commit_and_push_version,
         "dispatch_recovery": dispatch_recovery,
         "read_version": read_version,
         "write_version": write_version,
@@ -1049,6 +1528,7 @@ def _finish_after_stage(
     current_version = post_merge["version"]["from"]
     new_version = post_merge["version"]["to"]
     result["version"] = {"from": current_version, "to": new_version}
+    ctx = {"version": new_version, "checkout": config["main_checkout"]}
 
     if seat_in_flight(config["local_root"]):
         append_ledger_row(config["local_root"], project, "SKIP", ticket=task_id, reason="seat_in_flight")
@@ -1057,7 +1537,7 @@ def _finish_after_stage(
         write_receipt(config["local_root"], project, result)
         return result
 
-    activate = ops["run_activate"]()
+    activate = ops["run_activate"](ctx)
     append_ledger_row(config["local_root"], project, "ACTIVATE", ticket=task_id, rc=activate["rc"])
     if activate["rc"] != 0:
         result["outcome"] = "activate_failed"
@@ -1065,8 +1545,8 @@ def _finish_after_stage(
         write_receipt(config["local_root"], project, result)
         return result
 
-    verified = ops["verify_installed_version"](new_version)
-    screenshots = ops["capture_screenshots"]()
+    verified = ops["verify_installed_version"](new_version, ctx)
+    screenshots = ops["capture_screenshots"](ctx)
     result["installed_verified"] = verified.get("ok")
     result["screenshots"] = screenshots
 
@@ -1185,6 +1665,40 @@ def run_one(
     prompt = build_reviewer_prompt(order, diff)
     review = ops["dispatch_reviewer"](reviewer, prompt)
     append_ledger_row(config["local_root"], project, "REVIEW", ticket=task_id, reviewer=reviewer, ok=review.get("ok"))
+
+    if review.get("retry"):
+        # The reviewer's own lock was held by another concurrently running
+        # shift of the same reviewer — this dispatch never actually ran, so
+        # there is no review to act on. Never charge this against the
+        # recovery-round budget or read a stranger's in-flight review as
+        # ours; just retry the whole review step on the next pass.
+        append_ledger_row(config["local_root"], project, "SKIP", ticket=task_id, reason="reviewer lock held")
+        result["outcome"] = "review_retry"
+        result["reason"] = review.get("output") or "reviewer dispatch skipped; retry next pass"
+        write_receipt(config["local_root"], project, result)
+        return result
+
+    if review.get("empty"):
+        reason = review.get("output") or "reviewer output was empty after DONE"
+        ops["post_comment"](task_id, stopped_comment_body(reason))
+        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        result["outcome"] = "review_empty"
+        result["reason"] = reason
+        write_receipt(config["local_root"], project, result)
+        return result
+
+    if review.get("stale"):
+        # The output file was never rewritten after DONE — whatever it
+        # contains is leftover from an earlier, unrelated dispatch and must
+        # never be parsed as this dispatch's findings or merged on.
+        reason = review.get("output") or "reviewer output was unchanged after DONE (stale)"
+        ops["post_comment"](task_id, stopped_comment_body(reason))
+        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        result["outcome"] = "review_stale"
+        result["reason"] = reason
+        write_receipt(config["local_root"], project, result)
+        return result
+
     findings = parse_reviewer_findings(review.get("output", "")) if review.get("ok") else [
         "reviewer dispatch failed"
     ]
@@ -1266,11 +1780,50 @@ def run_one(
         write_receipt(config["local_root"], project, result)
         return result
 
-    current_version = ops["read_version"](checkout)
-    new_version = bump_version(current_version, config["version_bump"])
-    ops["write_version"](checkout, new_version)
+    # The bump must land on main, not the seat's task checkout — fetch the
+    # configured host checkout to what we just merged before writing there.
+    main_checkout = config["main_checkout"]
+    sync = ops["sync_main_checkout"](main_checkout, config["pr_base"])
+    if not sync.get("sha"):
+        reason = "could not sync main_checkout to origin/%s; not bumping" % config["pr_base"]
+        ops["post_comment"](task_id, stopped_comment_body(reason))
+        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        result["outcome"] = "main_unverified"
+        result["reason"] = reason
+        write_receipt(config["local_root"], project, result)
+        return result
 
-    stage = ops["run_stage"]()
+    current_version = ops["read_version"](main_checkout)
+    new_version = bump_version(current_version, config["version_bump"])
+    ops["write_version"](main_checkout, new_version)
+
+    push = ops["commit_and_push_version"](main_checkout, config["pr_base"], new_version)
+    if push.get("rc") != 0:
+        reason = "version bump commit/push to origin/%s failed (rc=%s)" % (config["pr_base"], push.get("rc"))
+        ops["post_comment"](task_id, stopped_comment_body(reason))
+        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        result["outcome"] = "main_unverified"
+        result["reason"] = reason
+        write_receipt(config["local_root"], project, result)
+        return result
+
+    # Re-evaluate main_moved against the version-bump push itself — a
+    # concurrent push landing on origin between our commit and this check
+    # must stop the order rather than stage a release built on a base that
+    # no longer matches origin.
+    pushed_sha = push.get("sha") or ""
+    post_push_sha = ops["remote_head_sha"](main_checkout, config["pr_base"])
+    if not pushed_sha or not post_push_sha or pushed_sha != post_push_sha:
+        reason = "origin/%s moved during the version bump push; not staging" % config["pr_base"]
+        ops["post_comment"](task_id, stopped_comment_body(reason))
+        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        result["outcome"] = "main_moved"
+        result["reason"] = reason
+        write_receipt(config["local_root"], project, result)
+        return result
+
+    stage_ctx = {"version": new_version, "checkout": main_checkout}
+    stage = ops["run_stage"](stage_ctx)
     append_ledger_row(config["local_root"], project, "STAGE", ticket=task_id, rc=stage["rc"])
     if stage["rc"] != 0:
         result["outcome"] = "stage_failed"
