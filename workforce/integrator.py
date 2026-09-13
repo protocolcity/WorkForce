@@ -162,7 +162,9 @@ def load_config(path: str) -> Dict[str, Any]:
         )
     screenshot_cmd = raw.get("screenshot_cmd")
     if screenshot_cmd is not None:
-        screenshot_cmd = _str_list(screenshot_cmd, "screenshot_cmd")
+        # An empty list means "no screenshots" (the shipped example uses it);
+        # only a non-list or non-string entry is a configuration error.
+        screenshot_cmd = _str_list(screenshot_cmd, "screenshot_cmd") if screenshot_cmd else None
     verify_cmd = raw.get("verify_cmd")
     if verify_cmd is not None:
         verify_cmd = _str_list(verify_cmd, "verify_cmd")
@@ -222,6 +224,7 @@ def load_config(path: str) -> Dict[str, Any]:
         ),
         "checkout_template": raw.get("checkout_template", _DEFAULT_CHECKOUT_TEMPLATE),
         "branch_template": raw.get("branch_template", _DEFAULT_BRANCH_TEMPLATE),
+        "active_implementation_cap": raw.get("active_implementation_cap"),
         "workspace_root": raw.get("workspace_root") or str(Path(local_root).parent),
     }
 
@@ -805,6 +808,20 @@ def parse_reviewer_findings(output_text: str) -> List[str]:
         data = None
     if isinstance(data, dict) and isinstance(data.get("findings"), list):
         return [str(f).strip() for f in data["findings"] if str(f).strip()]
+    # A reviewer that answers the structured prompt with prose followed by a
+    # {"findings": [...]} object on its own line (the pc-1492 rehearsal) must
+    # yield one finding per entry; the transcript collapse below would drop
+    # an untyped JSON line.
+    for line in text.splitlines():
+        candidate = line.strip()
+        if not candidate.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(candidate)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(parsed, dict) and isinstance(parsed.get("findings"), list):
+            return [str(f).strip() for f in parsed["findings"] if str(f).strip()]
 
     body = _reviewer_transcript_body(text).strip()
     if not body:
@@ -820,9 +837,32 @@ def parse_reviewer_findings(output_text: str) -> List[str]:
     if items:
         return items
 
+    json_items = _json_findings_array(body)
+    if json_items is not None:
+        return json_items
+
     if _is_empty_findings_body(body):
         return []
     return [body]
+
+
+def _json_findings_array(body: str) -> Optional[List[str]]:
+    """A reviewer that answers a structured prompt with ``{"findings": [...]}``
+    (possibly after a line of prose) yields one finding per array entry; any
+    other shape returns None so the text path decides."""
+    start = body.find("{")
+    if start < 0:
+        return None
+    try:
+        data = json.loads(body[start:])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    found = data.get("findings")
+    if not isinstance(found, list):
+        return None
+    return [str(item).strip() for item in found if str(item).strip()]
 
 
 # --------------------------------------------------------------------------
