@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -46,7 +47,10 @@ _REQUIRED_CONFIG_KEYS = (
     "version_file",
     "stage_cmd",
     "activate_cmd",
+    "main_checkout",
 )
+
+_VERSION_BUMP_RULES = ("major", "minor", "patch", "local-suffix")
 
 # Providers stay replaceable: which reviewer covers which implementation
 # provider is data, not a hard-coded branch per vendor name.
@@ -133,11 +137,14 @@ def load_config(path: str) -> Dict[str, Any]:
     test_cmd = _str_list(raw["test_cmd"], "test_cmd")
     pr_base = _nonempty_str(raw["pr_base"], "pr_base")
     version_bump = _nonempty_str(raw["version_bump"], "version_bump")
-    if version_bump not in ("major", "minor", "patch"):
-        raise IntegratorError("version_bump must be one of major/minor/patch")
+    if version_bump not in _VERSION_BUMP_RULES:
+        raise IntegratorError(
+            "version_bump must be one of %s" % "/".join(_VERSION_BUMP_RULES)
+        )
     version_file = _nonempty_str(raw["version_file"], "version_file")
     stage_cmd = _str_list(raw["stage_cmd"], "stage_cmd")
     activate_cmd = _str_list(raw["activate_cmd"], "activate_cmd")
+    main_checkout = _abs_path(raw["main_checkout"], "main_checkout")
 
     reviewer_dispatch_cmd = raw.get("reviewer_dispatch_cmd")
     if reviewer_dispatch_cmd is not None:
@@ -150,6 +157,16 @@ def load_config(path: str) -> Dict[str, Any]:
     verify_cmd = raw.get("verify_cmd")
     if verify_cmd is not None:
         verify_cmd = _str_list(verify_cmd, "verify_cmd")
+
+    reviewer_prompt_path = raw.get("reviewer_prompt_path")
+    if reviewer_prompt_path is not None:
+        reviewer_prompt_path = _nonempty_str(reviewer_prompt_path, "reviewer_prompt_path")
+    reviewer_output_path = raw.get("reviewer_output_path")
+    if reviewer_output_path is not None:
+        reviewer_output_path = _nonempty_str(reviewer_output_path, "reviewer_output_path")
+    release_root = raw.get("release_root")
+    if release_root is not None:
+        release_root = _abs_path(release_root, "release_root")
 
     reviewer_by_provider = dict(DEFAULT_REVIEWER_BY_PROVIDER)
     override = raw.get("reviewer_by_provider")
@@ -178,9 +195,13 @@ def load_config(path: str) -> Dict[str, Any]:
         "version_bump": version_bump,
         "version_file": version_file,
         "version_key": version_key,
+        "main_checkout": main_checkout,
+        "release_root": release_root or os.path.join(local_root, "releases"),
         "stage_cmd": stage_cmd,
         "activate_cmd": activate_cmd,
         "reviewer_dispatch_cmd": reviewer_dispatch_cmd,
+        "reviewer_prompt_path": reviewer_prompt_path,
+        "reviewer_output_path": reviewer_output_path,
         "reviewer_by_provider": reviewer_by_provider,
         "screenshot_cmd": screenshot_cmd,
         "verify_cmd": verify_cmd,
@@ -252,6 +273,97 @@ def coordinator_lock_is_fresh(
     return (now - updated_at_secs) < ttl_secs
 
 
+def _reviewer_ledger_path(local_root: str, reviewer: str) -> str:
+    return os.path.join(local_root, "ledger", "%s.log" % reviewer)
+
+
+def latest_reviewer_terminal_event(local_root: str, reviewer: str, since: str) -> Optional[str]:
+    """The reviewer job's DONE/ERROR/STOP row at or after *since* (a ``_utc_iso_z`` string).
+
+    ``since`` is compared as a string — safe because ``_utc_iso_z`` always
+    produces the same fixed-width, lexicographically-ordered format. ``None``
+    when no terminal row has landed yet (or the ledger predates *since*).
+    """
+    path = _reviewer_ledger_path(local_root, reviewer)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        parts = line.strip().split(" ", 2)
+        if len(parts) < 2 or parts[1] not in ("DONE", "ERROR", "STOP"):
+            continue
+        if parts[0] < since:
+            return None
+        return parts[1]
+    return None
+
+
+def wait_for_reviewer_ledger(
+    local_root: str,
+    reviewer: str,
+    since: str,
+    *,
+    timeout_secs: int = 1800,
+    poll_interval_secs: int = 5,
+    now_fn: Callable[[], float] = time.time,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> Optional[str]:
+    """Poll the reviewer's ledger for a terminal row until *timeout_secs*.
+
+    Returns the terminal event name (``DONE``/``ERROR``/``STOP``) or
+    ``None`` on timeout — the caller treats anything but ``DONE`` as a
+    failed review, never as a clean pass.
+    """
+    deadline = now_fn() + timeout_secs
+    while True:
+        event = latest_reviewer_terminal_event(local_root, reviewer, since)
+        if event is not None:
+            return event
+        if now_fn() >= deadline:
+            return None
+        sleep_fn(poll_interval_secs)
+
+
+_WORKDIR_MARKER_RE = re.compile(r"(?m)^Workdir:\s*(\S+)")
+
+
+def workdir_from_comments(comments: Optional[Sequence[Dict[str, Any]]]) -> Optional[str]:
+    """The latest ``Owner:`` claim comment's ``Workdir:`` line, or ``None``.
+
+    Mirrors :func:`workforce._utils.latest_owner_id`'s "latest wins" reading
+    of PROCESS §5 claim markers, scoped to the ``Workdir:`` line a claim
+    records alongside ``Owner:``.
+    """
+    workdir: Optional[str] = None
+    for c in comments or []:
+        if not isinstance(c, dict):
+            continue
+        body = str(c.get("body") or "")
+        if not body.lstrip().startswith("Owner:"):
+            continue
+        m = _WORKDIR_MARKER_RE.search(body)
+        if m:
+            workdir = m.group(1).strip()
+    return workdir
+
+
+def substitute_placeholders(argv: Sequence[str], **values: str) -> List[str]:
+    """Replace ``{name}`` placeholders in each *argv* entry from *values*.
+
+    Plain ``str.replace`` per placeholder (not ``str.format``) so an argv
+    entry with unrelated braces (a JSON literal, a shell glob) is never
+    misparsed as a format field.
+    """
+    out = []
+    for arg in argv:
+        for name, value in values.items():
+            arg = arg.replace("{%s}" % name, "" if value is None else str(value))
+        out.append(arg)
+    return out
+
+
 def decide_after_suites(
     rc: int, recovery_rounds_used: int, max_recovery_rounds: int,
 ) -> Dict[str, str]:
@@ -304,15 +416,37 @@ def decide_merge_ready(
     return True, "CI green, no findings, clean checkout"
 
 
+_LOCAL_SUFFIX_VERSION_RE = re.compile(
+    r"^(?P<base>[0-9]+\.[0-9]+\.[0-9]+)\+(?P<tag>.+)\.(?P<n>[0-9]+)$"
+)
+
+
 def bump_version(current: str, rule: str) -> str:
-    """MAJOR.MINOR.PATCH bump per *rule* (major|minor|patch)."""
-    parts = (current or "").split(".")
+    """Version bump per *rule* (major|minor|patch|local-suffix).
+
+    ``local-suffix`` covers the real host versions this job actually bumps —
+    ``0.1.47+consolidation.56`` (BluePrint), ``0.1.9+consolidation.13``
+    (WorkForce) — which are not bare MAJOR.MINOR.PATCH. It increments the
+    trailing integer of the ``+<tag>.<n>`` local suffix and leaves the
+    MAJOR.MINOR.PATCH base and the tag untouched.
+    """
+    rule = (rule or "").strip().lower()
+    current = current or ""
+    if rule == "local-suffix":
+        m = _LOCAL_SUFFIX_VERSION_RE.match(current)
+        if not m:
+            raise IntegratorError(
+                "current version %r has no MAJOR.MINOR.PATCH+<tag>.<n> local suffix"
+                % current
+            )
+        return "%s+%s.%d" % (m.group("base"), m.group("tag"), int(m.group("n")) + 1)
+
+    parts = current.split(".")
     if len(parts) != 3 or not all(p.isdigit() for p in parts):
         raise IntegratorError(
             "current version %r is not MAJOR.MINOR.PATCH" % current
         )
     major, minor, patch = (int(p) for p in parts)
-    rule = (rule or "").strip().lower()
     if rule == "major":
         major, minor, patch = major + 1, 0, 0
     elif rule == "minor":
@@ -793,6 +927,7 @@ def discover_candidates(
             "worker": seat,
             "provider": provider,
             "title": str(t.get("title") or ""),
+            "checkout_override": workdir_from_comments(t.get("comments")),
         })
     candidates.sort(key=lambda c: c["task_id"])
     return candidates[:headroom] if headroom < len(candidates) else candidates
@@ -803,14 +938,22 @@ def discover_candidates(
 # --------------------------------------------------------------------------
 
 
-def _run(argv: Sequence[str], cwd: Optional[str] = None, input_text: Optional[str] = None) -> Dict[str, Any]:
+def _run(
+    argv: Sequence[str],
+    cwd: Optional[str] = None,
+    input_text: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     proc = subprocess.run(
-        list(argv), cwd=cwd, input=input_text, capture_output=True, text=True,
+        list(argv), cwd=cwd, input=input_text, capture_output=True, text=True, env=env,
     )
     return {"rc": proc.returncode, "output": (proc.stdout or "") + (proc.stderr or "")}
 
 
 def _checkout_path(config: Dict[str, Any], order: Dict[str, Any]) -> str:
+    override = order.get("checkout_override")
+    if override:
+        return override
     rel = config["checkout_template"].format(worker=order["worker"], task_id=order["task_id"])
     return os.path.join(config["workspace_root"], rel)
 
@@ -917,8 +1060,39 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
         if not config.get("reviewer_dispatch_cmd"):
             raise IntegratorError("reviewer_dispatch_cmd not configured")
         argv = [a.replace("{reviewer}", reviewer) for a in config["reviewer_dispatch_cmd"]]
-        r = _run(argv, input_text=prompt)
-        return {"ok": r["rc"] == 0, "output": r["output"]}
+
+        prompt_tpl = config.get("reviewer_prompt_path")
+        output_tpl = config.get("reviewer_output_path")
+        if not (prompt_tpl and output_tpl):
+            r = _run(argv, input_text=prompt)
+            return {"ok": r["rc"] == 0, "output": r["output"]}
+
+        prompt_path = prompt_tpl.format(reviewer=reviewer)
+        output_path = output_tpl.format(reviewer=reviewer)
+        os.makedirs(os.path.dirname(prompt_path), exist_ok=True)
+        with open(prompt_path, "w", encoding="utf-8") as fh:
+            fh.write(prompt)
+        copy_dir = os.path.join(
+            config["local_root"], "reports", "integrator", config["project"], "reviewer-prompts",
+        )
+        os.makedirs(copy_dir, exist_ok=True)
+        shutil.copy(
+            prompt_path,
+            os.path.join(copy_dir, "%s-%s.md" % (reviewer, _utc_iso_z().replace(":", ""))),
+        )
+
+        since = _utc_iso_z()
+        r = _run(argv)
+        if r["rc"] != 0:
+            return {"ok": False, "output": r["output"]}
+        event = wait_for_reviewer_ledger(config["local_root"], reviewer, since)
+        if event != "DONE":
+            return {"ok": False, "output": "reviewer ledger terminal event: %s" % (event or "timeout")}
+        try:
+            with open(output_path, "r", encoding="utf-8") as fh:
+                return {"ok": True, "output": fh.read()}
+        except OSError as exc:
+            return {"ok": False, "output": "could not read reviewer output %s: %s" % (output_path, exc)}
 
     def merge_pr(checkout: str, pr_number: Any) -> Dict[str, Any]:
         return _run(
@@ -936,12 +1110,35 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
         r = _run(["git", "rev-parse", "origin/%s^1" % branch], cwd=checkout)
         return r["output"].strip() if r["rc"] == 0 else ""
 
+    def sync_main_checkout(main_checkout: str, branch: str) -> Dict[str, Any]:
+        """Fetch+reset the configured host checkout to ``origin/<branch>``."""
+        _run(["git", "fetch", "origin", branch], cwd=main_checkout)
+        _run(["git", "checkout", branch], cwd=main_checkout)
+        reset = _run(["git", "reset", "--hard", "origin/%s" % branch], cwd=main_checkout)
+        sha = _run(["git", "rev-parse", "HEAD"], cwd=main_checkout)
+        return {"rc": reset["rc"], "sha": sha["output"].strip() if sha["rc"] == 0 else ""}
+
+    def commit_and_push_version(main_checkout: str, branch: str, new_version: str) -> Dict[str, Any]:
+        _run(["git", "add", config["version_file"]], cwd=main_checkout)
+        commit = _run(
+            ["git", "commit", "-m", "Version %s as %s" % (config["project"], new_version)],
+            cwd=main_checkout,
+        )
+        if commit["rc"] != 0:
+            return {"rc": commit["rc"], "sha": ""}
+        push = _run(["git", "push", "origin", "HEAD:%s" % branch], cwd=main_checkout)
+        sha = _run(["git", "rev-parse", "HEAD"], cwd=main_checkout)
+        return {"rc": push["rc"], "sha": sha["output"].strip() if sha["rc"] == 0 else ""}
+
     def dispatch_recovery(worker: str, preparation_path: str, reason: str) -> Dict[str, Any]:
         argv = [
-            sys.executable, "-m", "workforce", "dispatch", worker,
+            sys.executable, "-m", "workforce", "--file", config["roster_path"],
+            "dispatch", worker,
             "--recover-receipt", preparation_path, "--recovery-reason", reason,
         ]
-        r = _run(argv)
+        env = dict(os.environ)
+        env["WORKFORCE_DATA_DIR"] = str(Path(config["local_root"]).parent)
+        r = _run(argv, env=env)
         return {"ok": r["rc"] == 0, "output": r["output"]}
 
     def read_version(checkout: str) -> str:
@@ -950,23 +1147,45 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
     def write_version(checkout: str, new_version: str) -> None:
         _write_version(config, checkout, new_version)
 
-    def run_stage() -> Dict[str, Any]:
-        return _run(config["stage_cmd"])
+    def _release_root(version: str) -> str:
+        return os.path.join(config["release_root"], version)
 
-    def run_activate() -> Dict[str, Any]:
-        return _run(config["activate_cmd"])
+    def run_stage(ctx: Dict[str, str]) -> Dict[str, Any]:
+        argv = substitute_placeholders(
+            config["stage_cmd"], version=ctx["version"],
+            release_root=_release_root(ctx["version"]), checkout=ctx["checkout"],
+        )
+        return _run(argv)
 
-    def verify_installed_version(expected: str) -> Dict[str, Any]:
+    def run_activate(ctx: Dict[str, str]) -> Dict[str, Any]:
+        argv = substitute_placeholders(
+            config["activate_cmd"], version=ctx["version"],
+            release_root=_release_root(ctx["version"]), checkout=ctx["checkout"],
+        )
+        return _run(argv)
+
+    def verify_installed_version(expected: str, ctx: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         if not config.get("verify_cmd"):
             return {"ok": True, "observed": expected}
-        r = _run(config["verify_cmd"])
+        ctx = ctx or {}
+        argv = substitute_placeholders(
+            config["verify_cmd"], version=expected,
+            release_root=_release_root(expected), checkout=ctx.get("checkout", ""),
+        )
+        r = _run(argv)
         observed = (r["output"] or "").strip()
         return {"ok": r["rc"] == 0 and expected in r["output"], "observed": observed}
 
-    def capture_screenshots() -> List[str]:
+    def capture_screenshots(ctx: Optional[Dict[str, str]] = None) -> List[str]:
         if not config.get("screenshot_cmd"):
             return []
-        r = _run(config["screenshot_cmd"])
+        ctx = ctx or {}
+        version = ctx.get("version", "")
+        argv = substitute_placeholders(
+            config["screenshot_cmd"], version=version,
+            release_root=_release_root(version), checkout=ctx.get("checkout", ""),
+        )
+        r = _run(argv)
         if r["rc"] != 0:
             return []
         return [line.strip() for line in r["output"].splitlines() if line.strip()]
@@ -1000,6 +1219,8 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
         "merge_pr": merge_pr,
         "remote_head_sha": remote_head_sha,
         "merge_commit_parent_sha": merge_commit_parent_sha,
+        "sync_main_checkout": sync_main_checkout,
+        "commit_and_push_version": commit_and_push_version,
         "dispatch_recovery": dispatch_recovery,
         "read_version": read_version,
         "write_version": write_version,
@@ -1049,6 +1270,7 @@ def _finish_after_stage(
     current_version = post_merge["version"]["from"]
     new_version = post_merge["version"]["to"]
     result["version"] = {"from": current_version, "to": new_version}
+    ctx = {"version": new_version, "checkout": config["main_checkout"]}
 
     if seat_in_flight(config["local_root"]):
         append_ledger_row(config["local_root"], project, "SKIP", ticket=task_id, reason="seat_in_flight")
@@ -1057,7 +1279,7 @@ def _finish_after_stage(
         write_receipt(config["local_root"], project, result)
         return result
 
-    activate = ops["run_activate"]()
+    activate = ops["run_activate"](ctx)
     append_ledger_row(config["local_root"], project, "ACTIVATE", ticket=task_id, rc=activate["rc"])
     if activate["rc"] != 0:
         result["outcome"] = "activate_failed"
@@ -1065,8 +1287,8 @@ def _finish_after_stage(
         write_receipt(config["local_root"], project, result)
         return result
 
-    verified = ops["verify_installed_version"](new_version)
-    screenshots = ops["capture_screenshots"]()
+    verified = ops["verify_installed_version"](new_version, ctx)
+    screenshots = ops["capture_screenshots"](ctx)
     result["installed_verified"] = verified.get("ok")
     result["screenshots"] = screenshots
 
@@ -1266,11 +1488,50 @@ def run_one(
         write_receipt(config["local_root"], project, result)
         return result
 
-    current_version = ops["read_version"](checkout)
-    new_version = bump_version(current_version, config["version_bump"])
-    ops["write_version"](checkout, new_version)
+    # The bump must land on main, not the seat's task checkout — fetch the
+    # configured host checkout to what we just merged before writing there.
+    main_checkout = config["main_checkout"]
+    sync = ops["sync_main_checkout"](main_checkout, config["pr_base"])
+    if not sync.get("sha"):
+        reason = "could not sync main_checkout to origin/%s; not bumping" % config["pr_base"]
+        ops["post_comment"](task_id, stopped_comment_body(reason))
+        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        result["outcome"] = "main_unverified"
+        result["reason"] = reason
+        write_receipt(config["local_root"], project, result)
+        return result
 
-    stage = ops["run_stage"]()
+    current_version = ops["read_version"](main_checkout)
+    new_version = bump_version(current_version, config["version_bump"])
+    ops["write_version"](main_checkout, new_version)
+
+    push = ops["commit_and_push_version"](main_checkout, config["pr_base"], new_version)
+    if push.get("rc") != 0:
+        reason = "version bump commit/push to origin/%s failed (rc=%s)" % (config["pr_base"], push.get("rc"))
+        ops["post_comment"](task_id, stopped_comment_body(reason))
+        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        result["outcome"] = "main_unverified"
+        result["reason"] = reason
+        write_receipt(config["local_root"], project, result)
+        return result
+
+    # Re-evaluate main_moved against the version-bump push itself — a
+    # concurrent push landing on origin between our commit and this check
+    # must stop the order rather than stage a release built on a base that
+    # no longer matches origin.
+    pushed_sha = push.get("sha") or ""
+    post_push_sha = ops["remote_head_sha"](main_checkout, config["pr_base"])
+    if not pushed_sha or not post_push_sha or pushed_sha != post_push_sha:
+        reason = "origin/%s moved during the version bump push; not staging" % config["pr_base"]
+        ops["post_comment"](task_id, stopped_comment_body(reason))
+        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        result["outcome"] = "main_moved"
+        result["reason"] = reason
+        write_receipt(config["local_root"], project, result)
+        return result
+
+    stage_ctx = {"version": new_version, "checkout": main_checkout}
+    stage = ops["run_stage"](stage_ctx)
     append_ledger_row(config["local_root"], project, "STAGE", ticket=task_id, rc=stage["rc"])
     if stage["rc"] != 0:
         result["outcome"] = "stage_failed"

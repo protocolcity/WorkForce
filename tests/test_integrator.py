@@ -5,6 +5,7 @@ import os
 import shutil
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -21,6 +22,8 @@ from workforce.roster import Worker  # noqa: E402
 
 
 def make_config(tmp_path, roster_path, **over):
+    main_checkout = tmp_path / "main_checkout"
+    main_checkout.mkdir(exist_ok=True)
     cfg_raw = dict(
         local_root=str(tmp_path / "local"),
         roster_path=roster_path,
@@ -31,6 +34,7 @@ def make_config(tmp_path, roster_path, **over):
         version_file="VERSION.json",
         stage_cmd=["/bin/sh", "-c", "exit 0"],
         activate_cmd=["/bin/sh", "-c", "exit 0"],
+        main_checkout=str(main_checkout),
     )
     cfg_raw.update(over)
     path = tmp_path / "integration_config.json"
@@ -323,7 +327,16 @@ class FakeOps:
         self.verify_ok = overrides.get("verify_ok", True)
         self.verify_observed = overrides.get("verify_observed", "")
         self.seat_in_flight_val = overrides.get("seat_in_flight_val", False)
+        self.sync_sha = overrides.get("sync_sha", "sha-main")
+        self.push_rc = overrides.get("push_rc", 0)
+        self.push_sha = overrides.get("push_sha", self.sync_sha)
+        self.post_push_remote_sha = overrides.get("post_push_remote_sha", self.push_sha)
+        self._remote_head_sha_calls = 0
         self.recovery_calls = []
+        self.stage_ctx = None
+        self.activate_ctx = None
+        self.verify_ctx = None
+        self.screenshot_ctx = None
 
     def _record(self, name, *a, **kw):
         self.calls.append(name)
@@ -365,11 +378,22 @@ class FakeOps:
 
     def remote_head_sha(self, checkout, branch):
         self._record("remote_head_sha")
-        return self.pre_merge_sha
+        self._remote_head_sha_calls += 1
+        if self._remote_head_sha_calls == 1:
+            return self.pre_merge_sha
+        return self.post_push_remote_sha
 
     def merge_commit_parent_sha(self, checkout, branch):
         self._record("merge_commit_parent_sha")
         return self.merge_parent_sha
+
+    def sync_main_checkout(self, main_checkout, branch):
+        self._record("sync_main_checkout")
+        return {"rc": 0 if self.sync_sha else 1, "sha": self.sync_sha}
+
+    def commit_and_push_version(self, main_checkout, branch, new_version):
+        self._record("commit_and_push_version")
+        return {"rc": self.push_rc, "sha": self.push_sha if self.push_rc == 0 else ""}
 
     def dispatch_recovery(self, worker, preparation_path, reason):
         self._record("dispatch_recovery")
@@ -386,20 +410,24 @@ class FakeOps:
         with open(self._version_path, "w") as fh:
             json.dump({"version": new_version}, fh)
 
-    def run_stage(self):
+    def run_stage(self, ctx=None):
         self._record("run_stage")
+        self.stage_ctx = ctx
         return {"rc": self.stage_rc, "output": ""}
 
-    def run_activate(self):
+    def run_activate(self, ctx=None):
         self._record("run_activate")
+        self.activate_ctx = ctx
         return {"rc": self.activate_rc, "output": ""}
 
-    def verify_installed_version(self, expected):
+    def verify_installed_version(self, expected, ctx=None):
         self._record("verify_installed_version")
+        self.verify_ctx = ctx
         return {"ok": self.verify_ok, "observed": self.verify_observed or expected}
 
-    def capture_screenshots(self):
+    def capture_screenshots(self, ctx=None):
         self._record("capture_screenshots")
+        self.screenshot_ctx = ctx
         return ["shot1.png"]
 
     def post_comment(self, task_id, body):
@@ -426,6 +454,8 @@ class FakeOps:
             "merge_pr": self.merge_pr,
             "remote_head_sha": self.remote_head_sha,
             "merge_commit_parent_sha": self.merge_commit_parent_sha,
+            "sync_main_checkout": self.sync_main_checkout,
+            "commit_and_push_version": self.commit_and_push_version,
             "dispatch_recovery": self.dispatch_recovery,
             "read_version": self.read_version,
             "write_version": self.write_version,
@@ -885,3 +915,304 @@ def test_run_one_clean_pass_does_not_dispatch_recovery(tmp_path):
     result = integrator.run_one(make_order(), cfg, ops.as_dict())
     assert result["outcome"] == "closed"
     assert "dispatch_recovery" not in ops.calls
+
+
+# --------------------------------------------------------------------------
+# wf-265 recovery 3, finding 1 — bump_version local-suffix rule
+# --------------------------------------------------------------------------
+
+
+def test_bump_version_local_suffix_increments_trailing_integer():
+    assert (
+        integrator.bump_version("0.1.47+consolidation.56", "local-suffix")
+        == "0.1.47+consolidation.57"
+    )
+    assert (
+        integrator.bump_version("0.1.9+consolidation.13", "local-suffix")
+        == "0.1.9+consolidation.14"
+    )
+
+
+def test_bump_version_local_suffix_rejects_bare_semver():
+    with pytest.raises(integrator.IntegratorError):
+        integrator.bump_version("1.2.3", "local-suffix")
+
+
+def test_load_config_accepts_local_suffix_version_bump(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, version_bump="local-suffix")
+    assert cfg["version_bump"] == "local-suffix"
+
+
+# --------------------------------------------------------------------------
+# wf-265 recovery 3, finding 2 — version bump lands on a configured
+# main_checkout, committed and pushed, with main_moved re-checked
+# --------------------------------------------------------------------------
+
+
+def test_run_one_bumps_version_on_main_checkout_not_seat_checkout(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path)
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "closed"
+    assert "sync_main_checkout" in ops.calls
+    assert "commit_and_push_version" in ops.calls
+    assert ops.stage_ctx["checkout"] == cfg["main_checkout"]
+    assert ops.activate_ctx["checkout"] == cfg["main_checkout"]
+
+
+def test_run_one_stops_main_unverified_when_sync_main_checkout_fails(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, sync_sha="")
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "main_unverified"
+    assert "write_version" not in ops.calls
+    assert "run_stage" not in ops.calls
+
+
+def test_run_one_stops_main_unverified_when_version_push_fails(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, push_rc=1)
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "main_unverified"
+    assert "run_stage" not in ops.calls
+    assert "close_order" not in ops.calls
+
+
+def test_run_one_stops_main_moved_when_push_races_origin(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, push_sha="sha-ours", post_push_remote_sha="sha-someone-else-pushed")
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "main_moved"
+    assert "run_stage" not in ops.calls
+    assert "close_order" not in ops.calls
+
+
+# --------------------------------------------------------------------------
+# wf-265 recovery 3, finding 3 — reviewer prompt/output via files, waiting
+# for the reviewer's own ledger DONE/ERROR/STOP row
+# --------------------------------------------------------------------------
+
+
+def test_default_ops_dispatch_reviewer_writes_prompt_file_and_reads_output_file(tmp_path, monkeypatch):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    local_root = str(tmp_path / "local")
+    cfg = base_config(
+        tmp_path, roster_path,
+        local_root=local_root,
+        reviewer_dispatch_cmd=["/bin/sh", "-c", "exit 0"],
+        reviewer_prompt_path=str(run_dir / "{reviewer}.prompt.md"),
+        reviewer_output_path=str(run_dir / "{reviewer}.out"),
+    )
+    (run_dir / "cursor-reviewer.out").write_text('{"findings": []}')
+    ledger_dir = os.path.join(local_root, "ledger")
+    os.makedirs(ledger_dir, exist_ok=True)
+    with open(os.path.join(ledger_dir, "cursor-reviewer.log"), "w") as fh:
+        fh.write("%s DONE\n" % integrator._utc_iso_z())
+
+    ops = integrator.default_ops(cfg)
+    result = ops["dispatch_reviewer"]("cursor-reviewer", "review this diff")
+    assert result["ok"] is True
+    assert result["output"] == '{"findings": []}'
+    assert (run_dir / "cursor-reviewer.prompt.md").read_text() == "review this diff"
+    copy_dir = os.path.join(local_root, "reports", "integrator", cfg["project"], "reviewer-prompts")
+    assert os.path.isdir(copy_dir) and os.listdir(copy_dir)
+
+
+def test_default_ops_dispatch_reviewer_fails_when_ledger_terminal_event_is_not_done(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    local_root = str(tmp_path / "local")
+    cfg = base_config(
+        tmp_path, roster_path,
+        local_root=local_root,
+        reviewer_dispatch_cmd=["/bin/sh", "-c", "exit 0"],
+        reviewer_prompt_path=str(run_dir / "{reviewer}.prompt.md"),
+        reviewer_output_path=str(run_dir / "{reviewer}.out"),
+    )
+    ledger_dir = os.path.join(local_root, "ledger")
+    os.makedirs(ledger_dir, exist_ok=True)
+    with open(os.path.join(ledger_dir, "cursor-reviewer.log"), "w") as fh:
+        fh.write("%s ERROR reason=crashed\n" % integrator._utc_iso_z())
+
+    ops = integrator.default_ops(cfg)
+    result = ops["dispatch_reviewer"]("cursor-reviewer", "review this diff")
+    assert result["ok"] is False
+
+
+def test_latest_reviewer_terminal_event_ignores_rows_before_since(tmp_path):
+    local_root = str(tmp_path / "local")
+    ledger_dir = os.path.join(local_root, "ledger")
+    os.makedirs(ledger_dir, exist_ok=True)
+    with open(os.path.join(ledger_dir, "cursor-reviewer.log"), "w") as fh:
+        fh.write("2020-01-01T00:00:00Z DONE\n")
+    since = integrator._utc_iso_z()
+    assert integrator.latest_reviewer_terminal_event(local_root, "cursor-reviewer", since) is None
+
+
+def test_wait_for_reviewer_ledger_polls_until_terminal_row_or_timeout(tmp_path):
+    local_root = str(tmp_path / "local")
+    since = integrator._utc_iso_z()
+    clock = {"t": 0.0}
+    sleeps = []
+
+    def now_fn():
+        return clock["t"]
+
+    def sleep_fn(secs):
+        sleeps.append(secs)
+        clock["t"] += secs
+        if len(sleeps) == 2:
+            ledger_dir = os.path.join(local_root, "ledger")
+            os.makedirs(ledger_dir, exist_ok=True)
+            with open(os.path.join(ledger_dir, "cursor-reviewer.log"), "w") as fh:
+                fh.write("%s DONE\n" % integrator._utc_iso_z())
+
+    event = integrator.wait_for_reviewer_ledger(
+        local_root, "cursor-reviewer", since,
+        timeout_secs=100, poll_interval_secs=1, now_fn=now_fn, sleep_fn=sleep_fn,
+    )
+    assert event == "DONE"
+    assert len(sleeps) == 2
+
+
+def test_wait_for_reviewer_ledger_times_out_without_terminal_row(tmp_path):
+    local_root = str(tmp_path / "local")
+    since = integrator._utc_iso_z()
+    clock = {"t": 0.0}
+
+    def now_fn():
+        return clock["t"]
+
+    def sleep_fn(secs):
+        clock["t"] += secs
+
+    event = integrator.wait_for_reviewer_ledger(
+        local_root, "cursor-reviewer", since,
+        timeout_secs=5, poll_interval_secs=2, now_fn=now_fn, sleep_fn=sleep_fn,
+    )
+    assert event is None
+
+
+# --------------------------------------------------------------------------
+# wf-265 recovery 3, finding 4 — {version}/{release_root}/{checkout}
+# placeholders in stage/activate/verify/screenshot commands
+# --------------------------------------------------------------------------
+
+
+def test_substitute_placeholders_replaces_all_three():
+    argv = ["/bin/tool", "--version={version}", "--out={release_root}", "--src={checkout}"]
+    out = integrator.substitute_placeholders(
+        argv, version="1.2.3", release_root="/releases/1.2.3", checkout="/checkout",
+    )
+    assert out == [
+        "/bin/tool", "--version=1.2.3", "--out=/releases/1.2.3", "--src=/checkout",
+    ]
+
+
+def test_default_ops_stage_activate_verify_screenshot_receive_placeholders(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    local_root = str(tmp_path / "local")
+    main_checkout = tmp_path / "main_checkout"
+    main_checkout.mkdir(exist_ok=True)
+    cfg = base_config(
+        tmp_path, roster_path,
+        local_root=local_root,
+        main_checkout=str(main_checkout),
+        release_root=str(tmp_path / "releases"),
+        stage_cmd=["/bin/sh", "-c", 'printf "%s" "$1" > "%s/stage.txt"' % ("{version}", str(out_dir)), "_", "{version}"],
+        activate_cmd=["/bin/sh", "-c", 'printf "%s" "$1" > "%s/activate.txt"' % ("{release_root}", str(out_dir)), "_", "{release_root}"],
+        verify_cmd=["/bin/sh", "-c", "printf '%s' \"$1\"", "_", "{version}"],
+        screenshot_cmd=["/bin/sh", "-c", "printf '%s\\n' \"$1\"", "_", "{checkout}"],
+    )
+    ops = integrator.default_ops(cfg)
+    ctx = {"version": "9.9.9", "checkout": str(main_checkout)}
+
+    stage = ops["run_stage"](ctx)
+    assert stage["rc"] == 0
+    assert (out_dir / "stage.txt").read_text() == "9.9.9"
+
+    activate = ops["run_activate"](ctx)
+    assert activate["rc"] == 0
+    assert (out_dir / "activate.txt").read_text() == os.path.join(str(tmp_path / "releases"), "9.9.9")
+
+    verified = ops["verify_installed_version"]("9.9.9", ctx)
+    assert verified["ok"] is True
+
+    shots = ops["capture_screenshots"](ctx)
+    assert shots == [str(main_checkout)]
+
+
+# --------------------------------------------------------------------------
+# wf-265 recovery 3, finding 5 — dispatch_recovery passes --file roster_path
+# and WORKFORCE_DATA_DIR; checkout prefers the Workdir: line of the seat's
+# Owner claim comment over checkout_template
+# --------------------------------------------------------------------------
+
+
+def test_default_ops_dispatch_recovery_passes_file_and_data_dir_env(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    local_root = str(tmp_path / "local")
+    cfg = base_config(tmp_path, roster_path, local_root=local_root)
+    captured = {}
+
+    real_run = integrator._run
+
+    def spy_run(argv, cwd=None, input_text=None, env=None):
+        captured["argv"] = list(argv)
+        captured["env"] = env
+        return {"rc": 0, "output": ""}
+
+    import workforce.integrator as integrator_mod
+    integrator_mod._run = spy_run
+    try:
+        ops = integrator.default_ops(cfg)
+        ops["dispatch_recovery"]("tester", "/abs/preparation.json", "suites failed")
+    finally:
+        integrator_mod._run = real_run
+
+    assert "--file" in captured["argv"]
+    assert captured["argv"][captured["argv"].index("--file") + 1] == cfg["roster_path"]
+    assert captured["env"]["WORKFORCE_DATA_DIR"] == str(Path(local_root).parent)
+
+
+def test_workdir_from_comments_prefers_latest_owner_claim():
+    comments = [
+        {"body": "Intake: filed by you"},
+        {"body": "Owner: tester\nWorkdir: /old/checkout\nStart: x"},
+        {"body": "Parked: done"},
+        {"body": "Owner: tester\nWorkdir: /new/checkout\nStart: y"},
+    ]
+    assert integrator.workdir_from_comments(comments) == "/new/checkout"
+
+
+def test_workdir_from_comments_none_when_absent():
+    assert integrator.workdir_from_comments([{"body": "Intake: filed by you"}]) is None
+    assert integrator.workdir_from_comments(None) is None
+
+
+def test_discover_candidates_uses_workdir_from_owner_comment_over_template(tmp_path):
+    w1 = make_worker(tmp_path, name="tester")
+    roster_path = write_roster(tmp_path, [w1])
+    cfg = make_config(tmp_path, roster_path, active_implementation_cap=5)
+    tasks = [
+        {
+            "id": "wf-1", "labels": ["worker:tester"], "title": "one",
+            "comments": [{"body": "Owner: tester\nWorkdir: /real/checkout\nStart: x"}],
+        },
+    ]
+
+    def fake_http(method, url, body=None, timeout=15.0):
+        return {"ok": True, "tasks": tasks}
+
+    candidates = integrator.discover_candidates(cfg, http=fake_http)
+    assert candidates[0]["checkout_override"] == "/real/checkout"
