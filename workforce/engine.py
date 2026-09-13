@@ -1617,6 +1617,31 @@ def _build_argv(worker: Worker, prompt_text: str, chain_text: str = "",
     return argv
 
 
+_RECOVERY_FLAGS = ("--recover-receipt", "--recovery-reason", "--legacy-stop-evidence")
+
+
+def _strip_recovery_flags(argv: List[str]) -> List[str]:
+    """Drop any existing --recover-receipt/--recovery-reason/
+    --legacy-stop-evidence pair from argv (wf-262 review).
+
+    A continuation built during an operator-recovery dispatch would
+    otherwise append a second --recover-receipt/--recovery-reason pair
+    after the one the recovery already added; task_runner.py forwards every
+    token to argparse, whose last-wins parsing would point the continuation
+    at whichever receipt happened to be appended last rather than this
+    pass's own.
+    """
+    out: List[str] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] in _RECOVERY_FLAGS and i + 1 < len(argv):
+            i += 2
+            continue
+        out.append(argv[i])
+        i += 1
+    return out
+
+
 def _classify_exit(out_path: str) -> str:
     """Return 'vendor limit: <trigger line>' or 'agent exit' for a non-zero rc.
 
@@ -1643,14 +1668,18 @@ def _classify_exit(out_path: str) -> str:
 
 
 def _pass_result_json(out_path: str, offset: int) -> Optional[dict]:
-    """Return the first JSON object in a pass's own output slice, or None.
+    """Return the terminal JSON object in a pass's own output slice, or None.
 
-    Some CLIs (grok's ``--output-format json``) pretty-print one JSON object
-    per invocation rather than emitting compact NDJSON, so the line-by-line
-    scan ``_usage_from_output`` uses cannot see it. ``raw_decode`` from the
-    first ``{`` tolerates any stray banner text before the object and any
-    trailing bytes after it. Must never raise — a parse failure just means
-    "no result to classify", not a crash of the shift.
+    A pass's output can be one pretty-printed JSON object (grok's
+    ``--output-format json`` on a cancelled turn), or NDJSON diagnostics
+    followed by a final compact result object (a normal end_turn pass —
+    ``available_commands``, thought events, then ``{"type":"end",
+    "stopReason":"end_turn",...}``). Scan left to right for every top-level
+    JSON object in the slice (``raw_decode`` from each ``{`` consumes a full
+    object including its own nested braces, so inner objects are never
+    mistaken for a sibling), keep the last one found, and tolerate stray
+    banner text between/around them. Must never raise — a parse failure just
+    means "no result to classify", not a crash of the shift.
     """
     try:
         with open(out_path, "r", encoding="utf-8", errors="replace") as fh:
@@ -1658,14 +1687,23 @@ def _pass_result_json(out_path: str, offset: int) -> Optional[dict]:
             chunk = fh.read(2 * 1024 * 1024)
     except OSError:
         return None
-    idx = chunk.find("{")
-    if idx == -1:
-        return None
-    try:
-        obj, _ = json.JSONDecoder().raw_decode(chunk[idx:])
-    except ValueError:
-        return None
-    return obj if isinstance(obj, dict) else None
+    decoder = json.JSONDecoder()
+    pos = 0
+    last_obj: Optional[dict] = None
+    n = len(chunk)
+    while pos < n:
+        idx = chunk.find("{", pos)
+        if idx == -1:
+            break
+        try:
+            obj, end = decoder.raw_decode(chunk, idx)
+        except ValueError:
+            pos = idx + 1
+            continue
+        if isinstance(obj, dict):
+            last_obj = obj
+        pos = end
+    return last_obj
 
 
 def _classify_completion(
@@ -2132,6 +2170,15 @@ def dispatch(
             final_offset = pass_offset
             continuations = 0
             while configured and not complete:
+                if stop_value == "cancelled":
+                    # wf-262 review — a permission/user cancellation is a real
+                    # denial, not a budget or model stop; re-running the same
+                    # argv would hit the same denial, so this is terminal
+                    # regardless of continuation_attempts (never auto-retried).
+                    ledger.append("ERROR", reason="denied: cancelled",
+                                  on_pass=passes + 1, continuations=continuations,
+                                  **recovery_kv)
+                    return 1
                 if continuations >= worker.continuation_attempts:
                     ledger.append("ERROR", reason="incomplete: " + stop_value,
                                   on_pass=passes + 1, continuations=continuations,
@@ -2153,8 +2200,16 @@ def dispatch(
                 continuations += 1
                 cont_reason = ("wf-262 auto-continuation %d/%d after incomplete stop: %s"
                               % (continuations, worker.continuation_attempts, stop_value))
-                cont_argv = argv + ["--recover-receipt", receipt_path,
-                                    "--recovery-reason", cont_reason]
+                # wf-262 review — argv already carries --recover-receipt/
+                # --recovery-reason (and maybe --legacy-stop-evidence) when
+                # this whole dispatch is itself an operator recovery; strip
+                # any prior pair before appending this continuation's own,
+                # so argparse's last-wins can't point task_runner at the
+                # wrong receipt.
+                cont_argv = _strip_recovery_flags(argv) + [
+                    "--recover-receipt", receipt_path,
+                    "--recovery-reason", cont_reason,
+                ]
                 outfh.write("--- continuation %d: %s ---\n" % (continuations, stop_value))
                 outfh.flush()
                 final_offset = outfh.tell()
