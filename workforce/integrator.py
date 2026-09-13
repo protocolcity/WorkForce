@@ -384,10 +384,34 @@ _TRAILING_CORRECT_SECTION_RE = re.compile(
 
 _NUMBERED_ITEM_RE = re.compile(r"(?m)^(?:#{1,6}\s+)?\*{0,2}\s*\d+[.)]\s")
 
-_EMPTY_FINDINGS_RE = re.compile(
-    r"\b(no findings|no actionable defects|no defects|nothing to report|none|clean)\b",
+# A whole-body match (not a substring search) — a real finding that merely
+# happens to *contain* the word "none" or "clean" ("returns none on
+# validation failure", "checkout is not clean after stage") must never be
+# swallowed as a clean pass.
+_EMPTY_PHRASE_RE = re.compile(
+    r"^(?:no findings|no actionable defects|no defects|nothing to report|none|clean)[.!]?$",
     re.IGNORECASE,
 )
+
+# A reviewer sometimes leads with "Findings: none" / "No findings" as its
+# own line, ahead of an unrelated "what looks correct" recap already
+# stripped by the caller. Only the first line is checked here — this is
+# only reached once the caller has confirmed there are no numbered items
+# anywhere in the body.
+_LEADING_NONE_LINE_RE = re.compile(
+    r"^(?:findings\s*:\s*)?(?:no findings|none)[.!:]?$",
+    re.IGNORECASE,
+)
+
+
+def _is_empty_findings_body(body: str) -> bool:
+    stripped = body.strip()
+    if not stripped:
+        return True
+    if _EMPTY_PHRASE_RE.match(stripped):
+        return True
+    first_line = stripped.splitlines()[0].strip()
+    return bool(_LEADING_NONE_LINE_RE.match(first_line))
 
 
 def _reviewer_transcript_body(text: str) -> str:
@@ -486,7 +510,7 @@ def parse_reviewer_findings(output_text: str) -> List[str]:
     if items:
         return items
 
-    if _EMPTY_FINDINGS_RE.search(body):
+    if _is_empty_findings_body(body):
         return []
     return [body]
 
@@ -573,6 +597,46 @@ def write_recovery_state(local_root: str, task_id: str, state: Dict[str, Any]) -
 
 def clear_recovery_state(local_root: str, task_id: str) -> None:
     path = _state_path(local_root, task_id)
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _post_merge_state_path(local_root: str, task_id: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(task_id))
+    return os.path.join(local_root, "state", "integrator-postmerge", "%s.json" % safe)
+
+
+def read_post_merge_state(local_root: str, task_id: str) -> Optional[Dict[str, Any]]:
+    """The merged/bumped/staged state for *task_id*, or ``None`` before a merge.
+
+    Written once a pass merges, bumps, and stages this order so a later pass
+    that finds an implementation seat in flight before activation can resume
+    straight at activate instead of re-running suites/review/merge/bump/stage.
+    """
+    path = _post_merge_state_path(local_root, task_id)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_post_merge_state(local_root: str, task_id: str, state: Dict[str, Any]) -> None:
+    path = _post_merge_state_path(local_root, task_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2)
+    os.replace(tmp, path)
+
+
+def clear_post_merge_state(local_root: str, task_id: str) -> None:
+    path = _post_merge_state_path(local_root, task_id)
     try:
         os.remove(path)
     except OSError:
@@ -965,6 +1029,78 @@ def _dry_plan(order: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _finish_after_stage(
+    task_id: str,
+    project: str,
+    config: Dict[str, Any],
+    ops: Dict[str, Callable],
+    post_merge: Dict[str, Any],
+    result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Seat-in-flight check through close, resumable from a persisted merge.
+
+    *post_merge* carries everything a fresh pass needs to finish an order
+    whose merge/bump/stage already happened — the PR, reviewer, and version
+    — so a pass that finds an activation-blocking seat in flight can return
+    here directly next time without re-running suites, review, or merge_pr.
+    """
+    pr = post_merge["pr"]
+    reviewer = post_merge["reviewer"]
+    current_version = post_merge["version"]["from"]
+    new_version = post_merge["version"]["to"]
+    result["version"] = {"from": current_version, "to": new_version}
+
+    if seat_in_flight(config["local_root"]):
+        append_ledger_row(config["local_root"], project, "SKIP", ticket=task_id, reason="seat_in_flight")
+        result["outcome"] = "activate_skipped"
+        result["reason"] = "an implementation seat is in flight; retry activation next pass"
+        write_receipt(config["local_root"], project, result)
+        return result
+
+    activate = ops["run_activate"]()
+    append_ledger_row(config["local_root"], project, "ACTIVATE", ticket=task_id, rc=activate["rc"])
+    if activate["rc"] != 0:
+        result["outcome"] = "activate_failed"
+        result["reason"] = "activate command exited %d" % activate["rc"]
+        write_receipt(config["local_root"], project, result)
+        return result
+
+    verified = ops["verify_installed_version"](new_version)
+    screenshots = ops["capture_screenshots"]()
+    result["installed_verified"] = verified.get("ok")
+    result["screenshots"] = screenshots
+
+    if not verified.get("ok"):
+        body = (
+            "Blocked: installed build does not report the bumped version\n"
+            "Expected: %s\n"
+            "Observed: %s\n"
+            "Next step: a person clears this before further automated attempts."
+            % (new_version, verified.get("observed") or "(unknown)")
+        )
+        ops["post_comment"](task_id, body)
+        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason="install not verified")
+        result["outcome"] = "install_not_verified"
+        result["reason"] = "installed build does not report version %s" % new_version
+        write_receipt(config["local_root"], project, result)
+        return result
+
+    evidence = {
+        "completed": "Merged PR %s and released version %s." % (pr.get("url") or pr.get("number"), new_version),
+        "verification": "Suites green; reviewer (%s) reported no findings; CI green; installed version verified=%s."
+        % (reviewer, verified.get("ok")),
+        "links": pr.get("url") or "",
+        "follow_ups": "none",
+    }
+    ops["close_order"](task_id, evidence)
+    append_ledger_row(config["local_root"], project, "CLOSE", ticket=task_id)
+    clear_recovery_state(config["local_root"], task_id)
+    clear_post_merge_state(config["local_root"], task_id)
+    result["outcome"] = "closed"
+    write_receipt(config["local_root"], project, result)
+    return result
+
+
 def run_one(
     order: Dict[str, Any],
     config: Dict[str, Any],
@@ -1000,6 +1136,10 @@ def run_one(
         result["outcome"] = "dry_run"
         result["plan"] = _dry_plan(order, config)
         return result
+
+    post_merge = read_post_merge_state(config["local_root"], task_id)
+    if post_merge is not None:
+        return _finish_after_stage(task_id, project, config, ops, post_merge, result)
 
     checkout = _checkout_path(config, order)
     branch = _branch_name(config, order)
@@ -1084,6 +1224,15 @@ def run_one(
         return result
 
     pre_merge_sha = ops["remote_head_sha"](checkout, config["pr_base"])
+    if not pre_merge_sha:
+        reason = "could not read origin/%s before merge; not bumping" % config["pr_base"]
+        ops["post_comment"](task_id, stopped_comment_body(reason))
+        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        result["outcome"] = "main_unverified"
+        result["reason"] = reason
+        write_receipt(config["local_root"], project, result)
+        return result
+
     merge = ops["merge_pr"](checkout, pr.get("number"))
     if merge.get("rc") != 0:
         reason = "merge_pr failed (rc=%s)" % merge.get("rc")
@@ -1100,7 +1249,15 @@ def run_one(
     # checkout's stale base wrong (racing another release) — refuse and let
     # the next pass rediscover this order instead of guessing.
     merge_parent_sha = ops["merge_commit_parent_sha"](checkout, config["pr_base"])
-    if pre_merge_sha and merge_parent_sha and pre_merge_sha != merge_parent_sha:
+    if not merge_parent_sha:
+        reason = "could not read merge commit parent for origin/%s after merge; not bumping" % config["pr_base"]
+        ops["post_comment"](task_id, stopped_comment_body(reason))
+        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        result["outcome"] = "main_unverified"
+        result["reason"] = reason
+        write_receipt(config["local_root"], project, result)
+        return result
+    if pre_merge_sha != merge_parent_sha:
         reason = "origin/%s moved during merge; not bumping" % config["pr_base"]
         ops["post_comment"](task_id, stopped_comment_body(reason))
         append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
@@ -1121,56 +1278,13 @@ def run_one(
         write_receipt(config["local_root"], project, result)
         return result
 
-    if seat_in_flight(config["local_root"]):
-        append_ledger_row(config["local_root"], project, "SKIP", ticket=task_id, reason="seat_in_flight")
-        result["outcome"] = "activate_skipped"
-        result["reason"] = "an implementation seat is in flight; retry activation next pass"
-        result["version"] = {"from": current_version, "to": new_version}
-        write_receipt(config["local_root"], project, result)
-        return result
-
-    activate = ops["run_activate"]()
-    append_ledger_row(config["local_root"], project, "ACTIVATE", ticket=task_id, rc=activate["rc"])
-    if activate["rc"] != 0:
-        result["outcome"] = "activate_failed"
-        result["reason"] = "activate command exited %d" % activate["rc"]
-        write_receipt(config["local_root"], project, result)
-        return result
-
-    verified = ops["verify_installed_version"](new_version)
-    screenshots = ops["capture_screenshots"]()
-    result["version"] = {"from": current_version, "to": new_version}
-    result["installed_verified"] = verified.get("ok")
-    result["screenshots"] = screenshots
-
-    if not verified.get("ok"):
-        body = (
-            "Blocked: installed build does not report the bumped version\n"
-            "Expected: %s\n"
-            "Observed: %s\n"
-            "Next step: a person clears this before further automated attempts."
-            % (new_version, verified.get("observed") or "(unknown)")
-        )
-        ops["post_comment"](task_id, body)
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason="install not verified")
-        result["outcome"] = "install_not_verified"
-        result["reason"] = "installed build does not report version %s" % new_version
-        write_receipt(config["local_root"], project, result)
-        return result
-
-    evidence = {
-        "completed": "Merged PR %s and released version %s." % (pr.get("url") or pr.get("number"), new_version),
-        "verification": "Suites green; reviewer (%s) reported no findings; CI green; installed version verified=%s."
-        % (reviewer, verified.get("ok")),
-        "links": pr.get("url") or "",
-        "follow_ups": "none",
+    post_merge_state = {
+        "pr": pr,
+        "reviewer": reviewer,
+        "version": {"from": current_version, "to": new_version},
     }
-    ops["close_order"](task_id, evidence)
-    append_ledger_row(config["local_root"], project, "CLOSE", ticket=task_id)
-    clear_recovery_state(config["local_root"], task_id)
-    result["outcome"] = "closed"
-    write_receipt(config["local_root"], project, result)
-    return result
+    write_post_merge_state(config["local_root"], task_id, post_merge_state)
+    return _finish_after_stage(task_id, project, config, ops, post_merge_state, result)
 
 
 def run_pass(
@@ -1225,7 +1339,7 @@ def main(argv=None) -> int:
     failed = any(
         r.get("outcome") in (
             "stopped", "stage_failed", "activate_failed", "merge_failed",
-            "main_moved", "install_not_verified",
+            "main_moved", "main_unverified", "install_not_verified",
         )
         for r in results
     )
