@@ -33,7 +33,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from ._utils import _utc_iso_z, _utcnow
+from ._utils import _parse_iso_z, _utc_iso_z, _utcnow
 from .capacity import hermetic_dry_run
 
 _REQUIRED_CONFIG_KEYS = (
@@ -57,7 +57,7 @@ DEFAULT_REVIEWER_BY_PROVIDER = {
 }
 
 _DEFAULT_MAX_RECOVERY_ROUNDS = 2
-_DEFAULT_COORDINATOR_LOCK_TTL_SECS = 900
+_DEFAULT_COORDINATOR_LOCK_TTL_SECS = 2400  # 40 minutes
 _DEFAULT_CHECKOUT_TEMPLATE = "local/task-runs/{worker}/{task_id}/checkout"
 _DEFAULT_BRANCH_TEMPLATE = "workforce/task/{worker}/{task_id}"
 
@@ -222,20 +222,34 @@ def reviewer_for_provider(provider: str, reviewer_by_provider: Optional[Dict[str
 def coordinator_lock_is_fresh(
     path: str, ttl_secs: int, now: Optional[float] = None,
 ) -> bool:
-    """True when *path* exists and was written within *ttl_secs*.
+    """True when *path*'s ``updated_at`` (or mtime, absent that) is within *ttl_secs*.
 
-    A live coordinator session refreshes this file; a fresh lock means the
-    integrator must stand down for this pass rather than race a human
-    session over the same seats.
+    A live coordinator session refreshes this file with a JSON body carrying
+    ``updated_at``; reading that field (rather than the file's mtime, which a
+    copy/restore/backup tool can change without the coordinator writing
+    anything) is the freshness signal. Falls back to mtime only when the
+    field is missing or the file is not valid JSON, so a hand-written or
+    legacy lock file still works.
     """
     if not path or not os.path.exists(path):
         return False
-    try:
-        mtime = os.path.getmtime(path)
-    except OSError:
-        return False
     now = time.time() if now is None else now
-    return (now - mtime) < ttl_secs
+    updated_at_secs: Optional[float] = None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        data = None
+    if isinstance(data, dict) and isinstance(data.get("updated_at"), str):
+        dt = _parse_iso_z(data["updated_at"])
+        if dt is not None:
+            updated_at_secs = dt.timestamp()
+    if updated_at_secs is None:
+        try:
+            updated_at_secs = os.path.getmtime(path)
+        except OSError:
+            return False
+    return (now - updated_at_secs) < ttl_secs
 
 
 def decide_after_suites(
@@ -354,13 +368,99 @@ def build_reviewer_prompt(order: Dict[str, Any], diff: str) -> str:
     return "\n".join(lines)
 
 
-def parse_reviewer_findings(output_text: str) -> List[str]:
-    """Parse reviewer stdout into a findings list; empty means clean.
+# A reviewer's real reply is prose, not the documented JSON shape: cursor
+# and workflow reviewer sessions print "--- pass N ---" markers around one
+# NDJSON line per event, and the finding text itself is free-form markdown
+# (numbered items headed "1." / "### 1." / "**1.", an optional trailing
+# "What looks correct" / "Checked and not raised" section that is not
+# findings material, and a bare "none"/"no findings" reply on a clean pass).
+_TRAILING_CORRECT_SECTION_RE = re.compile(
+    r"(?im)^\s*(?:#{1,6}\s*)?\*{0,2}\s*"
+    r"(?:what looks correct"
+    r"|checked and not raised(?: as (?:a )?defects?)?"
+    r"|other acceptance items)\b.*",
+    re.DOTALL,
+)
 
-    Accepts the documented ``{"findings": [...]}`` shape. Tolerates a bare
-    "no findings"/"none"/"clean" text reply as empty. Any other unparseable,
-    non-empty text is treated as a single finding rather than silently
-    discarded — an unreviewed merge must never be the fail-open outcome.
+_NUMBERED_ITEM_RE = re.compile(r"(?m)^(?:#{1,6}\s+)?\*{0,2}\s*\d+[.)]\s")
+
+_EMPTY_FINDINGS_RE = re.compile(
+    r"\b(no findings|no actionable defects|no defects|nothing to report|none|clean)\b",
+    re.IGNORECASE,
+)
+
+
+def _reviewer_transcript_body(text: str) -> str:
+    """Collapse a reviewer job's NDJSON transcript to its prose body.
+
+    A Claude/cursor-reviewer session emits one ``{"type":"result", "result":
+    "..."}`` line with the whole reply; a Grok session streams the reply as
+    many ``{"type":"text", "data": "..."}`` fragments (interleaved with
+    ``"thought"`` events, which are not the finding text) that must be
+    concatenated in order. Lines that are not JSON (the ``--- pass N ---``
+    separators) are skipped. Falls back to *text* unchanged when no line
+    parses as one of these event shapes, so a plain non-transcript reply
+    (bare "none", a raw ``{"findings": [...]}"`` string) is untouched.
+    """
+    saw_json = False
+    result_text: Optional[str] = None
+    text_events: List[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("---"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        saw_json = True
+        kind = obj.get("type")
+        if kind == "result" and isinstance(obj.get("result"), str):
+            result_text = obj["result"]
+        elif kind == "text" and isinstance(obj.get("data"), str):
+            text_events.append(obj["data"])
+    if result_text is not None:
+        return result_text
+    if text_events:
+        return "".join(text_events)
+    if saw_json:
+        return ""
+    return text
+
+
+def _split_numbered_findings(body: str) -> Optional[List[str]]:
+    """Split a body with numbered items (``1.`` / ``### 1.`` / ``**1.``) apart.
+
+    Returns ``None`` when no numbered item marker is found — the caller then
+    falls through to the whole-body none/fail-closed handling — so prose
+    with no enumerated findings is never sliced into meaningless fragments.
+    """
+    starts = [m.start() for m in _NUMBERED_ITEM_RE.finditer(body)]
+    if not starts:
+        return None
+    items = []
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(body)
+        item = body[start:end].strip()
+        if item:
+            items.append(item)
+    return items or None
+
+
+def parse_reviewer_findings(output_text: str) -> List[str]:
+    """Parse a reviewer job's raw stdout into a findings list; empty means clean.
+
+    Accepts the documented ``{"findings": [...]}`` shape verbatim. Otherwise
+    collapses a Claude/cursor/Grok NDJSON transcript to its prose body (see
+    :func:`_reviewer_transcript_body`), strips a trailing "what looks
+    correct"/"checked and not raised" section (that is the reviewer's own
+    accounting of what it checked, not a finding), splits real numbered
+    findings into separate items, and treats a "none"/"no findings" reply
+    (with no numbered items) as empty. Any other unparseable, non-empty text
+    is treated as a single finding rather than silently discarded — an
+    unreviewed or garbled reply must never be the fail-open outcome.
     """
     text = (output_text or "").strip()
     if not text:
@@ -371,9 +471,24 @@ def parse_reviewer_findings(output_text: str) -> List[str]:
         data = None
     if isinstance(data, dict) and isinstance(data.get("findings"), list):
         return [str(f).strip() for f in data["findings"] if str(f).strip()]
-    if text.lower() in ("no findings", "none", "clean", "{}"):
+
+    body = _reviewer_transcript_body(text).strip()
+    if not body:
         return []
-    return [text]
+
+    m = _TRAILING_CORRECT_SECTION_RE.search(body)
+    if m:
+        body = body[: m.start()].strip()
+    if not body:
+        return []
+
+    items = _split_numbered_findings(body)
+    if items:
+        return items
+
+    if _EMPTY_FINDINGS_RE.search(body):
+        return []
+    return [body]
 
 
 # --------------------------------------------------------------------------
@@ -519,6 +634,44 @@ def write_receipt(local_root: str, project: str, result: Dict[str, Any]) -> str:
 # --------------------------------------------------------------------------
 # Discovery
 # --------------------------------------------------------------------------
+
+
+def _any_open_ledger_shift(local_root: str) -> bool:
+    """True when any worker's ledger has a START with no terminal event yet.
+
+    Skips the integrator's own ``integrator-<project>.log`` files — those
+    are this job's receipts, not an implementation seat's shift record.
+    """
+    from . import ledger as ledger_mod
+
+    ledger_dir = os.path.join(local_root, "ledger")
+    if not os.path.isdir(ledger_dir):
+        return False
+    for name in os.listdir(ledger_dir):
+        if not name.endswith(".log") or name.startswith("integrator-"):
+            continue
+        try:
+            with open(os.path.join(ledger_dir, name), "r", encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        shifts = ledger_mod.parse_shifts(text, limit=1)
+        if shifts and shifts[0].get("outcome") == "running":
+            return True
+    return False
+
+
+def seat_in_flight(local_root: str) -> bool:
+    """True when any implementation seat holds a live lock or an open shift.
+
+    Activation restarts the WorkForce install a live seat is running under;
+    this must never fire while a seat is mid-shift, live-locked or not.
+    """
+    from . import provider_qualification as pq_mod
+
+    if pq_mod.scan_active_locks(local_root):
+        return True
+    return _any_open_ledger_shift(local_root)
 
 
 def _worker_seat_from_labels(labels: Optional[Sequence[Any]]) -> Optional[str]:
@@ -709,6 +862,24 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
             cwd=checkout,
         )
 
+    def remote_head_sha(checkout: str, branch: str) -> str:
+        _run(["git", "fetch", "origin", branch], cwd=checkout)
+        r = _run(["git", "rev-parse", "origin/%s" % branch], cwd=checkout)
+        return r["output"].strip() if r["rc"] == 0 else ""
+
+    def merge_commit_parent_sha(checkout: str, branch: str) -> str:
+        _run(["git", "fetch", "origin", branch], cwd=checkout)
+        r = _run(["git", "rev-parse", "origin/%s^1" % branch], cwd=checkout)
+        return r["output"].strip() if r["rc"] == 0 else ""
+
+    def dispatch_recovery(worker: str, preparation_path: str, reason: str) -> Dict[str, Any]:
+        argv = [
+            sys.executable, "-m", "workforce", "dispatch", worker,
+            "--recover-receipt", preparation_path, "--recovery-reason", reason,
+        ]
+        r = _run(argv)
+        return {"ok": r["rc"] == 0, "output": r["output"]}
+
     def read_version(checkout: str) -> str:
         return _read_version(config, checkout)
 
@@ -721,11 +892,12 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
     def run_activate() -> Dict[str, Any]:
         return _run(config["activate_cmd"])
 
-    def verify_installed_version(expected: str) -> bool:
+    def verify_installed_version(expected: str) -> Dict[str, Any]:
         if not config.get("verify_cmd"):
-            return True
+            return {"ok": True, "observed": expected}
         r = _run(config["verify_cmd"])
-        return r["rc"] == 0 and expected in r["output"]
+        observed = (r["output"] or "").strip()
+        return {"ok": r["rc"] == 0 and expected in r["output"], "observed": observed}
 
     def capture_screenshots() -> List[str]:
         if not config.get("screenshot_cmd"):
@@ -762,6 +934,9 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
         "ci_status": ci_status,
         "dispatch_reviewer": dispatch_reviewer,
         "merge_pr": merge_pr,
+        "remote_head_sha": remote_head_sha,
+        "merge_commit_parent_sha": merge_commit_parent_sha,
+        "dispatch_recovery": dispatch_recovery,
         "read_version": read_version,
         "write_version": write_version,
         "run_stage": run_stage,
@@ -831,6 +1006,10 @@ def run_one(
     reviewer = reviewer_for_provider(order["provider"], config["reviewer_by_provider"])
     state = read_recovery_state(config["local_root"], task_id)
     rounds_used = int(state.get("rounds_used", 0))
+    preparation_path = os.path.join(os.path.dirname(checkout), "preparation.json")
+
+    def dispatch_seat_recovery(reason: str) -> None:
+        ops["dispatch_recovery"](order["worker"], preparation_path, reason)
 
     append_ledger_row(config["local_root"], project, "DISCOVER", ticket=task_id, worker=order["worker"])
 
@@ -850,6 +1029,7 @@ def run_one(
     if decision["action"] == "recover":
         ops["post_comment"](task_id, suite_failure_comment_body(suite["output"], rounds_used + 1, config["max_recovery_rounds"]))
         ops["release_seat"](task_id, decision["reason"])
+        dispatch_seat_recovery(decision["reason"])
         write_recovery_state(config["local_root"], task_id, {"rounds_used": rounds_used + 1})
         append_ledger_row(config["local_root"], project, "RECOVER", ticket=task_id, reason=decision["reason"])
         result["outcome"] = "recovering"
@@ -880,6 +1060,7 @@ def run_one(
             result["outcome"] = "stopped"
         else:
             ops["release_seat"](task_id, findings_decision["reason"])
+            dispatch_seat_recovery(findings_decision["reason"])
             write_recovery_state(config["local_root"], task_id, {"rounds_used": rounds_used + 1})
             append_ledger_row(config["local_root"], project, "RECOVER", ticket=task_id, reason=findings_decision["reason"])
             result["outcome"] = "recovering"
@@ -887,6 +1068,8 @@ def run_one(
         write_receipt(config["local_root"], project, result)
         return result
 
+    # Re-checked freshly, immediately before the merge call itself — this is
+    # the merge gate at merge time, not a decision made earlier in the pass.
     ci = ops["ci_status"](checkout, pr.get("number"))
     clean = ops["checkout_clean"](checkout)
     merge_ok, merge_reason = decide_merge_ready(ci_status=ci, findings=findings, checkout_clean=clean)
@@ -900,8 +1083,31 @@ def run_one(
         write_receipt(config["local_root"], project, result)
         return result
 
-    ops["merge_pr"](checkout, pr.get("number"))
+    pre_merge_sha = ops["remote_head_sha"](checkout, config["pr_base"])
+    merge = ops["merge_pr"](checkout, pr.get("number"))
+    if merge.get("rc") != 0:
+        reason = "merge_pr failed (rc=%s)" % merge.get("rc")
+        ops["post_comment"](task_id, stopped_comment_body(reason))
+        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        result["outcome"] = "merge_failed"
+        result["reason"] = reason
+        write_receipt(config["local_root"], project, result)
+        return result
     append_ledger_row(config["local_root"], project, "MERGE", ticket=task_id, pr=pr.get("number"))
+
+    # A concurrent order merging onto the same base between our pre-merge
+    # read and this merge landing would make a version bump built on this
+    # checkout's stale base wrong (racing another release) — refuse and let
+    # the next pass rediscover this order instead of guessing.
+    merge_parent_sha = ops["merge_commit_parent_sha"](checkout, config["pr_base"])
+    if pre_merge_sha and merge_parent_sha and pre_merge_sha != merge_parent_sha:
+        reason = "origin/%s moved during merge; not bumping" % config["pr_base"]
+        ops["post_comment"](task_id, stopped_comment_body(reason))
+        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        result["outcome"] = "main_moved"
+        result["reason"] = reason
+        write_receipt(config["local_root"], project, result)
+        return result
 
     current_version = ops["read_version"](checkout)
     new_version = bump_version(current_version, config["version_bump"])
@@ -912,6 +1118,14 @@ def run_one(
     if stage["rc"] != 0:
         result["outcome"] = "stage_failed"
         result["reason"] = "stage command exited %d" % stage["rc"]
+        write_receipt(config["local_root"], project, result)
+        return result
+
+    if seat_in_flight(config["local_root"]):
+        append_ledger_row(config["local_root"], project, "SKIP", ticket=task_id, reason="seat_in_flight")
+        result["outcome"] = "activate_skipped"
+        result["reason"] = "an implementation seat is in flight; retry activation next pass"
+        result["version"] = {"from": current_version, "to": new_version}
         write_receipt(config["local_root"], project, result)
         return result
 
@@ -926,13 +1140,28 @@ def run_one(
     verified = ops["verify_installed_version"](new_version)
     screenshots = ops["capture_screenshots"]()
     result["version"] = {"from": current_version, "to": new_version}
-    result["installed_verified"] = verified
+    result["installed_verified"] = verified.get("ok")
     result["screenshots"] = screenshots
+
+    if not verified.get("ok"):
+        body = (
+            "Blocked: installed build does not report the bumped version\n"
+            "Expected: %s\n"
+            "Observed: %s\n"
+            "Next step: a person clears this before further automated attempts."
+            % (new_version, verified.get("observed") or "(unknown)")
+        )
+        ops["post_comment"](task_id, body)
+        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason="install not verified")
+        result["outcome"] = "install_not_verified"
+        result["reason"] = "installed build does not report version %s" % new_version
+        write_receipt(config["local_root"], project, result)
+        return result
 
     evidence = {
         "completed": "Merged PR %s and released version %s." % (pr.get("url") or pr.get("number"), new_version),
         "verification": "Suites green; reviewer (%s) reported no findings; CI green; installed version verified=%s."
-        % (reviewer, verified),
+        % (reviewer, verified.get("ok")),
         "links": pr.get("url") or "",
         "follow_ups": "none",
     }
@@ -993,7 +1222,13 @@ def main(argv=None) -> int:
             r.get("task_id", "?"), r.get("outcome"),
             (" (%s)" % r["reason"]) if r.get("reason") else "",
         ))
-    failed = any(r.get("outcome") in ("stopped", "stage_failed", "activate_failed") for r in results)
+    failed = any(
+        r.get("outcome") in (
+            "stopped", "stage_failed", "activate_failed", "merge_failed",
+            "main_moved", "install_not_verified",
+        )
+        for r in results
+    )
     return 1 if failed else 0
 
 
