@@ -491,6 +491,17 @@ def _probe_queue(
     return count
 
 
+def _ledger_safe_text(value: str) -> str:
+    """Collapse a free-text value to one line safe for a ledger row (wf-257 review).
+
+    Ledger rows are one line per event and readers split on whitespace/quotes;
+    newlines, quotes and backslashes in operator-supplied text (e.g. a
+    recovery reason) would otherwise fracture the row or corrupt parsing.
+    """
+    text = re.sub(r"\s+", " ", value).strip()
+    return text.replace('"', "").replace("'", "").replace("\\", "")
+
+
 def _record_candidates(
     ledger: Ledger,
     tasks: List[dict],
@@ -1922,7 +1933,7 @@ def dispatch(
             candidate_extra["reason_sha"] = hashlib.sha256(
                 recovery_reason.encode("utf-8")
             ).hexdigest()[:12]
-            candidate_extra["reason"] = recovery_reason[:80]
+            candidate_extra["reason"] = _ledger_safe_text(recovery_reason)[:80]
             _record_candidates(
                 ledger, [{"id": recovery_task_id}],
                 product=product_from_queue_url(worker.queue_url) or "",

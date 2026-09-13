@@ -71,10 +71,15 @@ def _recovery_block(task_id, attempt, reason):
 
     Rendered unconditionally onto every recovered prompt regardless of
     whether the seat's own template has a {recovery_reason} slot, so an
-    existing host prompt benefits without editing (wf-257).
+    existing host prompt benefits without editing (wf-257). The reason is
+    normalized to a single whitespace-collapsed paragraph and length-capped
+    so an operator-supplied reason cannot fracture the prompt with newlines
+    or (via %-style content) trip a format operation; the full reason still
+    reaches the receipt untouched.
     """
-    return ("Recovery: this is recovery attempt %s of %s. Reason: %s. "
-            "Act on the reason before anything else.\n\n" % (attempt, task_id, reason))
+    safe_reason = re.sub(r"\s+", " ", reason).strip()[:2000]
+    return ("Recovery: this is recovery attempt " + str(attempt) + " of " + str(task_id) +
+            ". Reason: " + safe_reason + ". Act on the reason before anything else.\n\n")
 
 
 def _eligible_tasks(config, fetch):
