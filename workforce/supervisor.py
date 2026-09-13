@@ -243,28 +243,49 @@ def collect_state(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _has_eligible_ready_work(state: Dict[str, Any]) -> bool:
-    return any(row["ready_task_ids"] for row in state["workers"].values())
+    """True when at least one worker row is actually dispatchable right now.
+
+    Mirrors ``_validate_action``'s dispatch-eligibility criteria (not busy,
+    no monitoring flag, non-empty ready feed): a busy or stale-flagged
+    worker still appears in ``state["workers"]`` with its ``ready_task_ids``
+    so an operator can see it, but it can never be dispatched, so it must
+    not count toward the empty-scope skip either -- otherwise the pass would
+    launch the provider only to have every proposal rejected as invalid.
+    """
+    return any(
+        not row["busy"] and not row["monitoring_flag"] and row["ready_task_ids"]
+        for row in state["workers"].values()
+    )
 
 
-def _recent_evidence_reports(local_root: str, limit: int) -> List[Dict[str, Any]]:
-    """The newest ``limit`` evidence reports under ``local_root``, newest first.
+def _recent_provider_invoking_reports(local_root: str, limit: int) -> List[Dict[str, Any]]:
+    """The newest ``limit`` provider-invoking evidence reports, newest first.
 
     Ordering is by filename, not by parsing each report's own ``generated_at``
     -- the filename's timestamp prefix is assigned by ``_write_evidence`` at
     write time from the same source, so it sorts identically for well-formed
     reports without requiring every file to be opened just to order them, and
     it still gives a filename-based freshness ordering even when a report's
-    own content is unreadable/malformed. An unreadable/malformed report among
-    the newest ``limit`` is represented as ``provider_ok: False`` -- fail
-    closed, since a corrupt report must never silently hide a failure streak
-    from the escalation check.
+    own content is unreadable/malformed. An unreadable/malformed report is
+    represented as ``provider_ok: False`` -- fail closed, since a corrupt
+    report must never silently hide a failure streak from the escalation
+    check. Reports for a pass that never reached the provider
+    (``provider_skipped: True`` -- stopped_by_operator, no_eligible_ready_work,
+    or a prior escalated_provider_failures skip) are walked past entirely,
+    not just excluded from the count: the consecutive-failure streak is a
+    property of actual provider outcomes, so a skip in between two failures
+    must not break the streak, and an escalated skip must not silently reset
+    it either -- only a real provider success (including on an acknowledged
+    pass) ends it.
     """
     out_dir = os.path.join(local_root, "reports", "supervisor")
     if not os.path.isdir(out_dir):
         return []
     names = sorted((n for n in os.listdir(out_dir) if n.endswith(".json")), reverse=True)
     reports: List[Dict[str, Any]] = []
-    for name in names[:limit]:
+    for name in names:
+        if len(reports) >= limit:
+            break
         path = os.path.join(out_dir, name)
         try:
             with open(path, "r", encoding="utf-8") as fh:
@@ -272,18 +293,21 @@ def _recent_evidence_reports(local_root: str, limit: int) -> List[Dict[str, Any]
             if not isinstance(data, dict):
                 raise ValueError("evidence report is not a JSON object")
         except (OSError, ValueError, json.JSONDecodeError):
-            data = {"provider_ok": False}
+            reports.append({"provider_ok": False})
+            continue
+        if data.get("provider_skipped"):
+            continue
         reports.append(data)
     return reports
 
 
 def _provider_failures_escalated(local_root: str, limit: int) -> bool:
-    """True only when at least ``limit`` reports exist and every one of the
-    newest ``limit`` recorded an explicit provider failure (``provider_ok is
-    False``). Fewer than ``limit`` reports means there is not yet enough
-    history to prove a full consecutive-failure streak, so this never
-    escalates on a thin history."""
-    reports = _recent_evidence_reports(local_root, limit)
+    """True only when at least ``limit`` provider-invoking reports exist and
+    every one of the newest ``limit`` recorded an explicit provider failure
+    (``provider_ok is False``). Fewer than ``limit`` such reports means there
+    is not yet enough history to prove a full consecutive-failure streak, so
+    this never escalates on a thin history."""
+    reports = _recent_provider_invoking_reports(local_root, limit)
     if len(reports) < limit:
         return False
     return all(r.get("provider_ok") is False for r in reports)
