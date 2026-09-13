@@ -254,12 +254,19 @@ def test_validate_rejects_malformed_action_shape():
 def test_run_revalidates_against_state_collected_after_provider_not_before(tmp_path, monkeypatch):
     """A worker that only becomes ready *while the provider runs* must still be usable,
     and one that only stops being ready during that window must be rejected --
-    proving validation uses the post-provider snapshot, not the pre-provider one."""
+    proving validation uses the post-provider snapshot, not the pre-provider one.
+
+    A second, always-ready worker keeps the pass's overall scope eligible at
+    the pre-provider empty-scope check (wf-253), so the provider is actually
+    launched and this flip is observed rather than the pass being skipped."""
     w = make_worker(tmp_path)
-    roster_path = write_roster(tmp_path, [w])
+    w2 = make_worker(tmp_path, name="tester2", identity="tester2-id")
+    roster_path = write_roster(tmp_path, [w, w2])
     calls = {"n": 0}
 
     def flipping_probe(worker, *a, **kw):
+        if worker.name == "tester2":
+            return 1, [fresh_task("wf-2", worker="tester2")]  # always ready
         calls["n"] += 1
         if calls["n"] == 1:
             return 0, []  # nothing ready when the provider was invoked
@@ -267,7 +274,7 @@ def test_run_revalidates_against_state_collected_after_provider_not_before(tmp_p
 
     monkeypatch.setattr(engine, "_probe_ready", flipping_probe)
     config = make_config(
-        tmp_path, roster_path,
+        tmp_path, roster_path, workers=["tester", "tester2"],
         provider_argv=_provider_argv([{"worker": "tester", "project": "workforce"}]),
     )
     result = supervisor.run(config, mode="inspect")
@@ -772,3 +779,369 @@ def test_run_never_closes_or_writes_worklane():
     src = inspect.getsource(supervisor)
     assert "wl_close" not in src
     assert "wl_comment" not in src
+
+
+# ---------------------------------------------------------------- load_config: stop_file / escalation
+
+def test_load_config_rejects_relative_stop_file(tmp_path):
+    cfg = make_config(tmp_path, str(tmp_path / "roster.json"), stop_file="relative/stop")
+    path = tmp_path / "cfg.json"
+    path.write_text(json.dumps(cfg))
+    with pytest.raises(supervisor.SupervisorError):
+        supervisor.load_config(str(path))
+
+
+def test_load_config_accepts_absolute_stop_file(tmp_path):
+    cfg = make_config(tmp_path, str(tmp_path / "roster.json"), stop_file=str(tmp_path / "STOP"))
+    path = tmp_path / "cfg.json"
+    path.write_text(json.dumps(cfg))
+    loaded = supervisor.load_config(str(path))
+    assert loaded["stop_file"] == str(tmp_path / "STOP")
+
+
+def test_load_config_defaults_max_consecutive_provider_failures(tmp_path):
+    cfg = make_config(tmp_path, str(tmp_path / "roster.json"))
+    path = tmp_path / "cfg.json"
+    path.write_text(json.dumps(cfg))
+    loaded = supervisor.load_config(str(path))
+    assert loaded["max_consecutive_provider_failures"] == 3
+
+
+def test_load_config_rejects_non_positive_max_consecutive_provider_failures(tmp_path):
+    cfg = make_config(tmp_path, str(tmp_path / "roster.json"), max_consecutive_provider_failures=0)
+    path = tmp_path / "cfg.json"
+    path.write_text(json.dumps(cfg))
+    with pytest.raises(supervisor.SupervisorError):
+        supervisor.load_config(str(path))
+
+
+# ---------------------------------------------------------------- empty-scope skip (no provider call)
+
+def _marker_provider_argv(marker_path):
+    return [sys.executable, "-c",
+            "import sys, pathlib, json; pathlib.Path(%r).write_text('called'); "
+            "sys.stdin.read(); print(json.dumps({'actions': []}))" % str(marker_path)]
+
+
+def test_run_never_launches_provider_when_no_eligible_ready_work(tmp_path, monkeypatch):
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (0, []))
+    marker = tmp_path / "provider-called.marker"
+    config = make_config(tmp_path, roster_path, provider_argv=_marker_provider_argv(marker))
+    result = supervisor.run(config, mode="inspect")
+    assert not marker.exists()
+    assert result["pass_outcome"] == "no_eligible_ready_work"
+    assert result["provider_skipped"] is True
+    assert result["provider_ok"] is None
+    assert result["proposals"] == []
+    assert result["dispatch_attempted"] == 0
+    assert result["dispatch_completed"] == 0
+    assert result["dispatched"] == []
+    assert os.path.exists(result["evidence_path"])
+
+
+def test_run_no_eligible_ready_work_still_reports_excluded_busy_monitoring(tmp_path, monkeypatch):
+    w = make_worker(tmp_path)
+    cron_w = make_worker(tmp_path, name="cronjob", identity="cron-id", schedule="0 * * * *")
+    roster_path = write_roster(tmp_path, [w, cron_w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (0, []))
+    ledger_dir = tmp_path / "local" / "ledger"
+    ledger_dir.mkdir(parents=True)
+    (ledger_dir / "tester.log").write_text(
+        "2026-01-01T00:00:00Z START identity=tester-id\n"
+        "2026-01-01T00:00:01Z ERROR reason=boom rc=1\n"
+    )
+    config = make_config(tmp_path, roster_path, workers=["tester", "cronjob"])
+    result = supervisor.run(config, mode="inspect")
+    assert result["pass_outcome"] == "no_eligible_ready_work"
+    state = result["state_before_provider"]
+    assert state["workers"]["tester"]["monitoring_flag"] == "stale_or_failed_last_shift"
+    assert "cron-scheduled" in state["excluded_workers"]["cronjob"]
+
+
+def test_run_execute_mode_no_eligible_ready_work_never_dispatches(tmp_path, monkeypatch):
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (0, []))
+    dispatched = []
+    monkeypatch.setattr(engine, "dispatch", lambda *a, **kw: dispatched.append(1) or 0)
+    config = make_config(tmp_path, roster_path)
+    result = supervisor.run(config, mode="execute")
+    assert dispatched == []
+    assert result["pass_outcome"] == "no_eligible_ready_work"
+
+
+def test_run_with_eligible_work_still_calls_provider_and_dispatches(tmp_path, monkeypatch):
+    """Sanity: the new pre-checks must not affect a normal pass with real work."""
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [fresh_task()]))
+    marker = tmp_path / "provider-called.marker"
+
+    def fake_dispatch(worker, local_root, dry_run=False):
+        ledger_dir = os.path.join(local_root, "ledger")
+        os.makedirs(ledger_dir, exist_ok=True)
+        with open(os.path.join(ledger_dir, "%s.log" % worker.name), "a") as fh:
+            fh.write("2026-01-01T00:00:00Z START identity=x\n")
+            fh.write("2026-01-01T00:00:01Z STOP reason=ok\n")
+        return 0
+
+    monkeypatch.setattr(engine, "dispatch", fake_dispatch)
+    config = make_config(
+        tmp_path, roster_path,
+        provider_argv=_provider_argv([{"worker": "tester", "project": "workforce"}]),
+    )
+    result = supervisor.run(config, mode="execute")
+    assert result["pass_outcome"] == "dispatched"
+    assert result["provider_ok"] is True
+    assert result["dispatch_completed"] == 1
+
+
+# ---------------------------------------------------------------- operator stop_file
+
+def test_run_stop_file_halts_before_provider_in_inspect_mode(tmp_path, monkeypatch):
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [fresh_task()]))
+    stop_file = tmp_path / "STOP"
+    stop_file.write_text("halt")
+    marker = tmp_path / "provider-called.marker"
+    config = make_config(tmp_path, roster_path, provider_argv=_marker_provider_argv(marker),
+                          stop_file=str(stop_file))
+    result = supervisor.run(config, mode="inspect")
+    assert not marker.exists()
+    assert result["pass_outcome"] == "stopped_by_operator"
+    assert result["provider_ok"] is None
+    assert result["proposals"] == []
+
+
+def test_run_stop_file_halts_before_dispatch_in_execute_mode(tmp_path, monkeypatch):
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [fresh_task()]))
+    dispatched = []
+    monkeypatch.setattr(engine, "dispatch", lambda *a, **kw: dispatched.append(1) or 0)
+    stop_file = tmp_path / "STOP"
+    stop_file.write_text("halt")
+    marker = tmp_path / "provider-called.marker"
+    config = make_config(tmp_path, roster_path, provider_argv=_marker_provider_argv(marker),
+                          stop_file=str(stop_file))
+    result = supervisor.run(config, mode="execute")
+    assert not marker.exists()
+    assert dispatched == []
+    assert result["pass_outcome"] == "stopped_by_operator"
+    assert result["dispatched"] == []
+
+
+def test_run_missing_stop_file_key_means_no_check(tmp_path, monkeypatch):
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [fresh_task()]))
+    config = make_config(
+        tmp_path, roster_path,
+        provider_argv=_provider_argv([{"worker": "tester", "project": "workforce"}]),
+    )
+    assert "stop_file" not in config
+    result = supervisor.run(config, mode="inspect")
+    assert result["pass_outcome"] == "proposed"
+
+
+def test_run_stop_file_configured_but_absent_does_not_halt(tmp_path, monkeypatch):
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [fresh_task()]))
+    config = make_config(
+        tmp_path, roster_path, stop_file=str(tmp_path / "never-written-STOP"),
+        provider_argv=_provider_argv([{"worker": "tester", "project": "workforce"}]),
+    )
+    result = supervisor.run(config, mode="inspect")
+    assert result["pass_outcome"] == "proposed"
+
+
+def test_main_stop_file_returns_zero(tmp_path, monkeypatch):
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [fresh_task()]))
+    stop_file = tmp_path / "STOP"
+    stop_file.write_text("halt")
+    config = make_config(
+        tmp_path, roster_path, stop_file=str(stop_file),
+        provider_argv=_provider_argv([{"worker": "tester", "project": "workforce"}]),
+    )
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps({**config, "projects": list(config["projects"]),
+                                     "workers": list(config["workers"])}))
+    rc = supervisor.main(["--config", str(cfg_path)])
+    assert rc == 0
+
+
+# ---------------------------------------------------------------- consecutive provider-failure escalation
+
+def _seed_evidence_reports(local_root, entries):
+    for entry in entries:
+        supervisor._write_evidence(local_root, dict(entry))
+
+
+def test_run_escalates_after_max_consecutive_provider_failures(tmp_path, monkeypatch):
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [fresh_task()]))
+    local_root = str(tmp_path / "local")
+    _seed_evidence_reports(local_root, [
+        {"generated_at": "2026-01-01T00:00:0%dZ" % i, "provider_ok": False} for i in range(3)
+    ])
+    marker = tmp_path / "provider-called.marker"
+    config = make_config(tmp_path, roster_path, provider_argv=_marker_provider_argv(marker),
+                          max_consecutive_provider_failures=3)
+    result = supervisor.run(config, mode="inspect")
+    assert not marker.exists()
+    assert result["pass_outcome"] == "escalated_provider_failures"
+    assert result["provider_ok"] is None
+
+
+def test_run_does_not_escalate_with_fewer_than_threshold_reports(tmp_path, monkeypatch):
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [fresh_task()]))
+    local_root = str(tmp_path / "local")
+    _seed_evidence_reports(local_root, [
+        {"generated_at": "2026-01-01T00:00:0%dZ" % i, "provider_ok": False} for i in range(2)
+    ])
+    config = make_config(
+        tmp_path, roster_path, max_consecutive_provider_failures=3,
+        provider_argv=_provider_argv([{"worker": "tester", "project": "workforce"}]),
+    )
+    result = supervisor.run(config, mode="inspect")
+    assert result["pass_outcome"] != "escalated_provider_failures"
+
+
+def test_run_does_not_escalate_when_a_recent_report_succeeded(tmp_path, monkeypatch):
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [fresh_task()]))
+    local_root = str(tmp_path / "local")
+    _seed_evidence_reports(local_root, [
+        {"generated_at": "2026-01-01T00:00:00Z", "provider_ok": False},
+        {"generated_at": "2026-01-01T00:00:01Z", "provider_ok": True},
+        {"generated_at": "2026-01-01T00:00:02Z", "provider_ok": False},
+    ])
+    config = make_config(
+        tmp_path, roster_path, max_consecutive_provider_failures=3,
+        provider_argv=_provider_argv([{"worker": "tester", "project": "workforce"}]),
+    )
+    result = supervisor.run(config, mode="inspect")
+    assert result["pass_outcome"] != "escalated_provider_failures"
+
+
+def test_run_escalation_treats_malformed_recent_report_as_failure(tmp_path, monkeypatch):
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [fresh_task()]))
+    local_root = str(tmp_path / "local")
+    _seed_evidence_reports(local_root, [
+        {"generated_at": "2026-01-01T00:00:00Z", "provider_ok": False},
+        {"generated_at": "2026-01-01T00:00:01Z", "provider_ok": False},
+    ])
+    out_dir = os.path.join(local_root, "reports", "supervisor")
+    # Newest report by filename -- deliberately corrupt, not valid JSON at all.
+    with open(os.path.join(out_dir, "20260101T000002Z-deadbeefcafe.json"), "w") as fh:
+        fh.write("{not valid json")
+    marker = tmp_path / "provider-called.marker"
+    config = make_config(tmp_path, roster_path, provider_argv=_marker_provider_argv(marker),
+                          max_consecutive_provider_failures=3)
+    result = supervisor.run(config, mode="inspect")
+    assert not marker.exists()
+    assert result["pass_outcome"] == "escalated_provider_failures"
+
+
+def test_run_acknowledge_provider_failures_lifts_escalation_for_one_pass(tmp_path, monkeypatch):
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [fresh_task()]))
+    local_root = str(tmp_path / "local")
+    _seed_evidence_reports(local_root, [
+        {"generated_at": "2026-01-01T00:00:0%dZ" % i, "provider_ok": False} for i in range(3)
+    ])
+    config = make_config(
+        tmp_path, roster_path, max_consecutive_provider_failures=3,
+        provider_argv=_provider_argv([{"worker": "tester", "project": "workforce"}]),
+    )
+    result = supervisor.run(config, mode="inspect", acknowledge_provider_failures="operator says go")
+    assert result["pass_outcome"] == "proposed"
+    assert result["provider_ok"] is True
+    assert result["provider_failure_acknowledgement"] == "operator says go"
+
+
+def test_run_acknowledgement_does_not_reset_streak_for_next_pass(tmp_path, monkeypatch):
+    """The ack lifts the refusal for exactly one pass -- a following pass with no new
+    successful evidence must escalate again since there is still no automatic reset."""
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [fresh_task()]))
+    local_root = str(tmp_path / "local")
+    _seed_evidence_reports(local_root, [
+        {"generated_at": "2026-01-01T00:00:0%dZ" % i, "provider_ok": False} for i in range(3)
+    ])
+    config = make_config(
+        tmp_path, roster_path, max_consecutive_provider_failures=3,
+        provider_argv=[sys.executable, "-c", "print('not json')"],  # still fails
+    )
+    acked = supervisor.run(config, mode="inspect", acknowledge_provider_failures="go")
+    assert acked["pass_outcome"] == "provider_failed"
+    again = supervisor.run(config, mode="inspect")
+    assert again["pass_outcome"] == "escalated_provider_failures"
+
+
+def test_main_escalated_provider_failures_returns_nonzero(tmp_path, monkeypatch, capsys):
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [fresh_task()]))
+    local_root = str(tmp_path / "local")
+    _seed_evidence_reports(local_root, [
+        {"generated_at": "2026-01-01T00:00:0%dZ" % i, "provider_ok": False} for i in range(3)
+    ])
+    config = make_config(
+        tmp_path, roster_path, max_consecutive_provider_failures=3,
+        provider_argv=_provider_argv([{"worker": "tester", "project": "workforce"}]),
+    )
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps({**config, "projects": list(config["projects"]),
+                                     "workers": list(config["workers"])}))
+    rc = supervisor.main(["--config", str(cfg_path)])
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "consecutive provider failures" in captured.err
+
+
+def test_main_acknowledge_provider_failures_flag_lifts_escalation(tmp_path, monkeypatch):
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [fresh_task()]))
+    local_root = str(tmp_path / "local")
+    _seed_evidence_reports(local_root, [
+        {"generated_at": "2026-01-01T00:00:0%dZ" % i, "provider_ok": False} for i in range(3)
+    ])
+    config = make_config(
+        tmp_path, roster_path, max_consecutive_provider_failures=3,
+        provider_argv=_provider_argv([{"worker": "tester", "project": "workforce"}]),
+    )
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps({**config, "projects": list(config["projects"]),
+                                     "workers": list(config["workers"])}))
+    rc = supervisor.main(["--config", str(cfg_path), "--acknowledge-provider-failures", "reviewed, go"])
+    assert rc == 0
+
+
+# ---------------------------------------------------------------- pass_outcome on existing flows
+
+def test_run_pass_outcome_provider_failed(tmp_path, monkeypatch):
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [fresh_task()]))
+    config = make_config(
+        tmp_path, roster_path,
+        provider_argv=[sys.executable, "-c", "print('not json')"],
+    )
+    result = supervisor.run(config, mode="inspect")
+    assert result["pass_outcome"] == "provider_failed"
