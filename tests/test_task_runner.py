@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import time
 
 import pytest
 
@@ -282,3 +283,94 @@ def test_lock_available_again_once_holder_releases(setup):
     second_fd = _acquire_lock(prepared["lock"])
     fcntl.flock(second_fd, fcntl.LOCK_UN)
     os.close(second_fd)
+
+
+def test_recover_of_nested_attempt_receipt_resolves_canonical_anchor(setup):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    first = recover(config, prepared["receipt"], "first crash", feed(task))
+
+    second = recover(config, first["receipt"], "second crash, pointed at nested receipt", feed(task))
+
+    assert second["lock"] == prepared["lock"] == first["lock"]
+    receipt = json.loads(Path(second["receipt"]).read_text())
+    assert receipt["recovery_of"] == prepared["receipt"]  # canonical original, not the nested one
+    assert receipt["recovery_source_receipt"] == first["receipt"]
+    # Both attempts still live flat under the one reservation, never nested under each other.
+    assert Path(second["receipt"]).parent.parent == Path(first["receipt"]).parent.parent
+
+
+def test_nested_receipt_recovery_is_excluded_by_the_same_lock_as_original(setup):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    first = recover(config, prepared["receipt"], "first crash", feed(task))
+    second = recover(config, first["receipt"], "second crash", feed(task))
+
+    fd = _acquire_lock(prepared["lock"])
+    try:
+        with pytest.raises(PreparationError, match="active"):
+            _acquire_lock(second["lock"])
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _make_legacy(receipt_path):
+    """Simulate a receipt written before the lock protocol existed."""
+    data = json.loads(receipt_path.read_text())
+    del data["lock_protocol"]
+    receipt_path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def test_legacy_receipt_refuses_recovery_without_explicit_acknowledgement(setup):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    _make_legacy(Path(prepared["receipt"]))
+    with pytest.raises(PreparationError, match="legacy|lock protocol"):
+        recover(config, prepared["receipt"], "resume after crash", feed(task))
+    with pytest.raises(PreparationError, match="legacy|lock protocol"):
+        recover(config, prepared["receipt"], "resume after crash", feed(task), legacy_stop_evidence="   ")
+
+
+def test_legacy_receipt_recovers_with_explicit_acknowledgement_and_evidence(setup):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    _make_legacy(Path(prepared["receipt"]))
+    evidence = "Operator confirmed via `ps -p 4821` that the prior provider process no longer exists (2026-09-13)."
+
+    result = recover(config, prepared["receipt"], "resume after crash", feed(task),
+                      legacy_stop_evidence=evidence)
+
+    receipt = json.loads(Path(result["receipt"]).read_text())
+    assert receipt["legacy_stop_acknowledged"] is True
+    assert receipt["legacy_stop_evidence"] == evidence
+    # The canonical original receipt itself is never rewritten by recovery.
+    assert "legacy_stop_acknowledged" not in json.loads(Path(prepared["receipt"]).read_text())
+
+
+def test_exec_retains_lock_and_releases_only_after_child_process_exits(setup):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    lock_path = prepared["lock"]
+
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover -- child branch, exercised but not measured
+        try:
+            fd = _acquire_lock(lock_path)
+            os.set_inheritable(fd, True)
+            os.execvp("sleep", ["sleep", "0.5"])
+        except Exception:
+            os._exit(1)
+        os._exit(0)
+
+    try:
+        time.sleep(0.15)
+        with pytest.raises(PreparationError, match="active"):
+            _acquire_lock(lock_path)
+    finally:
+        _, status = os.waitpid(pid, 0)
+        assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+
+    fd = _acquire_lock(lock_path)
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)

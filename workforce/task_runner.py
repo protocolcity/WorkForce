@@ -7,7 +7,6 @@ failed or repeated dispatch cannot overwrite earlier work or silently retry it.
 """
 
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -18,9 +17,22 @@ import sys
 from urllib.parse import urlencode, urlsplit
 from urllib.request import urlopen
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover -- exercised only on non-POSIX platforms
+    fcntl = None
+
 
 class PreparationError(RuntimeError):
     pass
+
+
+# Bumped whenever a receipt's meaning under the reservation lock changes.
+# Receipts written before this existed (or with an older value) cannot be
+# trusted to prove their tracked process ever held -- or would have released
+# -- the reservation lock, so an absent/unlocked lock file alone never proves
+# they stopped; recovery requires an explicit operator acknowledgement instead.
+LOCK_PROTOCOL_VERSION = 1
 
 
 def _git(repo, *args):
@@ -146,7 +158,8 @@ def prepare(config, fetch=_fetch):
     branch = "workforce/task/" + worker + "/" + task_id
     receipt = {"project": project, "worker": worker, "task_id": task_id,
                "branch": branch, "base": base, "checkout": str(checkout),
-               "state": "reserved", "claimed": False}
+               "state": "reserved", "claimed": False,
+               "lock_protocol": LOCK_PROTOCOL_VERSION}
     receipt_path = reservation / "preparation.json"
     receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
     try:
@@ -185,16 +198,41 @@ def _find_worktree(repo, checkout, branch):
     return False
 
 
-def recover(config, receipt_path, reason, fetch=_fetch):
+def _canonical_reservation(receipt_path):
+    """Resolve any receipt -- original or nested attempts/N -- to one reservation root.
+
+    A caller could point --recover-receipt at an earlier attempt's own
+    preparation.json instead of the original. If that were allowed to define
+    its own lock/attempts scope, two recoveries anchored on different
+    receipts of the same reservation could take different locks and overlap.
+    Every receipt under a reservation always resolves to the same root here.
+    """
+    path = receipt_path.parent
+    while path.name.isdigit() and path.parent.name == "attempts":
+        path = path.parent.parent
+    return path
+
+
+def recover(config, receipt_path, reason, fetch=_fetch, legacy_stop_evidence=None):
     """Explicitly resume a preserved reservation; never create or reset a checkout.
 
-    Requires an operator-supplied receipt path and recovery reason. The
+    Requires an operator-supplied receipt path and recovery reason. Whichever
+    receipt is supplied (the original or a nested attempt), recovery always
+    anchors on the one canonical original receipt at the reservation root, so
+    every attempt and every worker shares the same reservation lock. The
     reservation's evidence (prompt/result/receipt) is preserved untouched; a
     new, uniquely numbered attempt directory holds this recovery's own prompt,
     result path and receipt. The task must currently be ready-eligible for the
     configured worker in WorkLane -- an operator must release or reassign the
     task there first. Different-worker recovery is a legitimate handoff as
     long as the ready feed already reflects that reassignment.
+
+    A canonical receipt written before LOCK_PROTOCOL_VERSION existed never
+    held the reservation lock in the first place, so an absent or unlocked
+    lock file proves nothing about whether its process is still running.
+    Recovering such a receipt requires `legacy_stop_evidence`: an explicit,
+    retained operator statement of how they confirmed the prior process
+    stopped. That statement is recorded on the new attempt's receipt.
     """
     if not isinstance(reason, str) or not reason.strip():
         raise PreparationError("An explicit operator recovery reason is required")
@@ -206,10 +244,20 @@ def recover(config, receipt_path, reason, fetch=_fetch):
         raise PreparationError("Recovery receipt must be inside the configured state directory")
     if not receipt_path.is_file():
         raise PreparationError("Recovery receipt does not exist")
-    old = json.loads(receipt_path.read_text())
+    reservation = _canonical_reservation(receipt_path)
+    canonical_receipt_path = reservation / "preparation.json"
+    if not canonical_receipt_path.is_file():
+        raise PreparationError("Canonical original receipt is missing; cannot resolve a single reservation anchor")
+    old = json.loads(canonical_receipt_path.read_text())
     for key in ("project", "worker", "task_id", "branch", "checkout", "base"):
         if not isinstance(old.get(key), str) or not old[key]:
-            raise PreparationError("Recovery receipt is missing required fields")
+            raise PreparationError("Canonical original receipt is missing required fields")
+    if old.get("lock_protocol") != LOCK_PROTOCOL_VERSION:
+        if not isinstance(legacy_stop_evidence, str) or not legacy_stop_evidence.strip():
+            raise PreparationError(
+                "Canonical receipt predates the lock protocol; an absent or unlocked lock file cannot "
+                "prove that process stopped. Recovery requires explicit legacy-stop evidence recording "
+                "how the operator confirmed it stopped")
     project, worker, eligible = _eligible_tasks(config, fetch)
     if old["project"] != project:
         raise PreparationError("Recovery receipt belongs to a different project")
@@ -234,7 +282,6 @@ def recover(config, receipt_path, reason, fetch=_fetch):
     authority_text = _authority_text(config)
     common = Path(_git(repo, "rev-parse", "--git-common-dir"))
     common = (repo / common).resolve() if not common.is_absolute() else common.resolve()
-    reservation = receipt_path.parent
     attempts = reservation / "attempts"
     attempts.mkdir(exist_ok=True)
     n = 1
@@ -257,8 +304,14 @@ def recover(config, receipt_path, reason, fetch=_fetch):
     new_receipt = {"project": project, "worker": worker, "task_id": task_id,
                    "branch": old["branch"], "base": old["base"], "checkout": str(checkout),
                    "state": "recovered", "claimed": False,
-                   "recovery_of": str(receipt_path), "recovery_reason": reason,
+                   "lock_protocol": LOCK_PROTOCOL_VERSION,
+                   "recovery_of": str(canonical_receipt_path),
+                   "recovery_source_receipt": str(receipt_path),
+                   "recovery_reason": reason,
                    "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest()}
+    if legacy_stop_evidence:
+        new_receipt["legacy_stop_acknowledged"] = True
+        new_receipt["legacy_stop_evidence"] = legacy_stop_evidence
     new_receipt_path = attempt / "preparation.json"
     new_receipt_path.write_text(json.dumps(new_receipt, indent=2) + "\n")
     return {"argv": argv, "checkout": str(checkout), "receipt": str(new_receipt_path),
@@ -271,8 +324,14 @@ def _acquire_lock(lock_path):
 
     The lock is tied to the open file descriptor's lifetime, not a PID: if a
     prior process dies (even uncleanly) the kernel releases it when the
-    descriptor closes, so liveness never rests on a PID-age guess.
+    descriptor closes, so liveness never rests on a PID-age guess. This
+    requires POSIX advisory locking (fcntl.flock); on a platform without it
+    this fails closed rather than launching without exclusion, and rather
+    than crashing the whole module at import time.
     """
+    if fcntl is None:
+        raise PreparationError(
+            "POSIX file locking is unavailable on this platform; refuse to launch without reservation exclusion")
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -291,6 +350,9 @@ def main(argv=None):
                          help="Preserved preparation.json to resume; requires --recovery-reason")
     parser.add_argument("--recovery-reason",
                          help="Operator rationale for explicit recovery; requires --recover-receipt")
+    parser.add_argument("--legacy-stop-evidence",
+                         help="Operator's retained proof a pre-lock-protocol receipt's process stopped; "
+                              "required only when the canonical receipt predates the lock protocol")
     args = parser.parse_args(argv)
     if bool(args.recover_receipt) != bool(args.recovery_reason):
         print("Task preparation stopped: --recover-receipt and --recovery-reason must be used together",
@@ -299,7 +361,8 @@ def main(argv=None):
     try:
         config = json.loads(Path(args.config).read_text())
         if args.recover_receipt:
-            result = recover(config, args.recover_receipt, args.recovery_reason)
+            result = recover(config, args.recover_receipt, args.recovery_reason,
+                              legacy_stop_evidence=args.legacy_stop_evidence)
         else:
             result = prepare(config)
         if result is None:
