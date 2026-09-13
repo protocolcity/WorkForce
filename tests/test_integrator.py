@@ -1040,8 +1040,8 @@ def test_default_ops_dispatch_reviewer_writes_prompt_file_and_reads_output_file(
         # simulate that here so the dispatch's offset-based wait has a row
         # appended *after* it to find.
         reviewer_dispatch_cmd=["/bin/sh", "-c", "printf '%s DONE\\n' \"$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)\" >> " + ledger_path],
-        reviewer_prompt_path=str(run_dir / "{reviewer}.prompt.md"),
-        reviewer_output_path=str(run_dir / "{reviewer}.out"),
+        reviewer_prompt_paths={"cursor-reviewer": str(run_dir / "cursor-reviewer.prompt.md")},
+        reviewer_output_paths={"cursor-reviewer": str(run_dir / "cursor-reviewer.out")},
     )
     (run_dir / "cursor-reviewer.out").write_text('{"findings": []}')
 
@@ -1066,13 +1066,28 @@ def test_default_ops_dispatch_reviewer_fails_when_ledger_terminal_event_is_not_d
         tmp_path, roster_path,
         local_root=local_root,
         reviewer_dispatch_cmd=["/bin/sh", "-c", "echo 2099-01-01T00:00:00Z ERROR reason=crashed >> " + ledger_path],
-        reviewer_prompt_path=str(run_dir / "{reviewer}.prompt.md"),
-        reviewer_output_path=str(run_dir / "{reviewer}.out"),
+        reviewer_prompt_paths={"cursor-reviewer": str(run_dir / "cursor-reviewer.prompt.md")},
+        reviewer_output_paths={"cursor-reviewer": str(run_dir / "cursor-reviewer.out")},
     )
 
     ops = integrator.default_ops(cfg)
     result = ops["dispatch_reviewer"]("cursor-reviewer", "review this diff")
     assert result["ok"] is False
+
+
+def test_default_ops_dispatch_reviewer_refuses_when_no_mapping_configured(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    local_root = str(tmp_path / "local")
+    cfg = base_config(
+        tmp_path, roster_path,
+        local_root=local_root,
+        reviewer_dispatch_cmd=["/bin/sh", "-c", "true"],
+        reviewer_prompt_paths={"workflow-reviewer": str(tmp_path / "workflow-reviewer.prompt.md")},
+        reviewer_output_paths={"workflow-reviewer": str(tmp_path / "workflow-reviewer.out")},
+    )
+    ops = integrator.default_ops(cfg)
+    with pytest.raises(integrator.IntegratorError):
+        ops["dispatch_reviewer"]("cursor-reviewer", "review this diff")
 
 
 # --------------------------------------------------------------------------
@@ -1136,6 +1151,44 @@ def test_latest_reviewer_terminal_event_ignores_rows_before_since_offset(tmp_pat
     with open(ledger_path, "a") as fh:
         fh.write("%s DONE\n" % integrator._utc_iso_z())
     assert integrator.latest_reviewer_terminal_event(local_root, "cursor-reviewer", since_offset) == "DONE"
+
+
+def test_latest_reviewer_terminal_event_succeeds_on_done_followed_by_stop(tmp_path):
+    # A real engine shift with max_passes 1 appends DONE and then its own
+    # normal end-of-shift STOP row — that trailing STOP must never flip a
+    # successful review into a failure.
+    local_root = str(tmp_path / "local")
+    ledger_dir = os.path.join(local_root, "ledger")
+    os.makedirs(ledger_dir, exist_ok=True)
+    ledger_path = os.path.join(ledger_dir, "cursor-reviewer.log")
+    since_offset = integrator.reviewer_ledger_offset(local_root, "cursor-reviewer")
+    with open(ledger_path, "w") as fh:
+        fh.write("%s DONE\n" % integrator._utc_iso_z())
+        fh.write("%s STOP\n" % integrator._utc_iso_z())
+    assert integrator.latest_reviewer_terminal_event(local_root, "cursor-reviewer", since_offset) == "DONE"
+
+
+def test_latest_reviewer_terminal_event_fails_on_error_even_after_done(tmp_path):
+    local_root = str(tmp_path / "local")
+    ledger_dir = os.path.join(local_root, "ledger")
+    os.makedirs(ledger_dir, exist_ok=True)
+    ledger_path = os.path.join(ledger_dir, "cursor-reviewer.log")
+    since_offset = integrator.reviewer_ledger_offset(local_root, "cursor-reviewer")
+    with open(ledger_path, "w") as fh:
+        fh.write("%s DONE\n" % integrator._utc_iso_z())
+        fh.write("%s ERROR reason=crashed\n" % integrator._utc_iso_z())
+    assert integrator.latest_reviewer_terminal_event(local_root, "cursor-reviewer", since_offset) == "ERROR"
+
+
+def test_latest_reviewer_terminal_event_none_on_lone_stop_with_no_done(tmp_path):
+    local_root = str(tmp_path / "local")
+    ledger_dir = os.path.join(local_root, "ledger")
+    os.makedirs(ledger_dir, exist_ok=True)
+    ledger_path = os.path.join(ledger_dir, "cursor-reviewer.log")
+    since_offset = integrator.reviewer_ledger_offset(local_root, "cursor-reviewer")
+    with open(ledger_path, "w") as fh:
+        fh.write("%s STOP\n" % integrator._utc_iso_z())
+    assert integrator.latest_reviewer_terminal_event(local_root, "cursor-reviewer", since_offset) is None
 
 
 def test_wait_for_reviewer_ledger_polls_until_terminal_row_or_timeout(tmp_path):
@@ -1238,9 +1291,13 @@ def test_default_ops_stage_activate_verify_screenshot_receive_placeholders(tmp_p
 def test_default_ops_dispatch_reviewer_passes_file_and_data_dir_env(tmp_path):
     roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
     local_root = str(tmp_path / "local")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
     cfg = base_config(
         tmp_path, roster_path, local_root=local_root,
         reviewer_dispatch_cmd=["workforce", "dispatch", "{reviewer}"],
+        reviewer_prompt_paths={"cursor-reviewer": str(run_dir / "cursor-reviewer.prompt.md")},
+        reviewer_output_paths={"cursor-reviewer": str(run_dir / "cursor-reviewer.out")},
     )
     captured = {}
 
@@ -1249,16 +1306,19 @@ def test_default_ops_dispatch_reviewer_passes_file_and_data_dir_env(tmp_path):
     def spy_run(argv, cwd=None, input_text=None, env=None):
         captured["argv"] = list(argv)
         captured["env"] = env
-        return {"rc": 0, "output": ""}
+        # rc != 0 so dispatch_reviewer returns before waiting on the
+        # reviewer's own ledger — this test only pins the dispatch argv/env.
+        return {"rc": 1, "output": ""}
 
     import workforce.integrator as integrator_mod
     integrator_mod._run = spy_run
     try:
         ops = integrator.default_ops(cfg)
-        ops["dispatch_reviewer"]("cursor-reviewer", "review this diff")
+        result = ops["dispatch_reviewer"]("cursor-reviewer", "review this diff")
     finally:
         integrator_mod._run = real_run
 
+    assert result["ok"] is False
     assert "--file" in captured["argv"]
     assert captured["argv"][captured["argv"].index("--file") + 1] == cfg["roster_path"]
     assert captured["env"]["WORKFORCE_DATA_DIR"] == str(Path(local_root).parent)
@@ -1411,6 +1471,46 @@ def test_workdir_from_comments_ignores_relative_path():
     assert integrator.workdir_from_comments(comments, seat="tester") is None
 
 
+# --------------------------------------------------------------------------
+# wf-265 recovery 5, finding 2 — workdir_from_comments only honours a
+# Workdir ending with /<task_id>/checkout or matching the template
+# expansion for that worker+task; otherwise falls back to the template
+# --------------------------------------------------------------------------
+
+
+def test_workdir_from_comments_accepts_path_ending_with_task_id_checkout():
+    comments = [
+        {"body": "Owner: tester\nWorkdir: /some/tree/wf-265/checkout\nStart: x", "author": "tester"},
+    ]
+    assert integrator.workdir_from_comments(
+        comments, seat="tester", task_id="wf-265",
+    ) == "/some/tree/wf-265/checkout"
+
+
+def test_workdir_from_comments_accepts_path_matching_template_expansion():
+    comments = [
+        {"body": "Owner: tester\nWorkdir: /root/local/task-runs/tester/wf-265/checkout\nStart: x", "author": "tester"},
+    ]
+    assert integrator.workdir_from_comments(
+        comments, seat="tester", task_id="wf-265",
+        checkout_template="local/task-runs/{worker}/{task_id}/checkout",
+        workspace_root="/root",
+    ) == "/root/local/task-runs/tester/wf-265/checkout"
+
+
+def test_workdir_from_comments_rejects_stale_task_path():
+    # A Workdir left over from an earlier order on the same seat
+    # (.../wf-264/checkout) must never redirect wf-265's pipeline.
+    comments = [
+        {"body": "Owner: tester\nWorkdir: /some/tree/wf-264/checkout\nStart: x", "author": "tester"},
+    ]
+    assert integrator.workdir_from_comments(
+        comments, seat="tester", task_id="wf-265",
+        checkout_template="local/task-runs/{worker}/{task_id}/checkout",
+        workspace_root="/root",
+    ) is None
+
+
 def test_discover_candidates_uses_workdir_from_owner_comment_over_template(tmp_path):
     w1 = make_worker(tmp_path, name="tester")
     roster_path = write_roster(tmp_path, [w1])
@@ -1418,7 +1518,7 @@ def test_discover_candidates_uses_workdir_from_owner_comment_over_template(tmp_p
     tasks = [
         {
             "id": "wf-1", "labels": ["worker:tester"], "title": "one",
-            "comments": [{"body": "Owner: tester\nWorkdir: /real/checkout\nStart: x", "author": "tester"}],
+            "comments": [{"body": "Owner: tester\nWorkdir: /real/wf-1/checkout\nStart: x", "author": "tester"}],
         },
     ]
 
@@ -1426,4 +1526,32 @@ def test_discover_candidates_uses_workdir_from_owner_comment_over_template(tmp_p
         return {"ok": True, "tasks": tasks}
 
     candidates = integrator.discover_candidates(cfg, http=fake_http)
-    assert candidates[0]["checkout_override"] == "/real/checkout"
+    assert candidates[0]["checkout_override"] == "/real/wf-1/checkout"
+
+
+def test_discover_candidates_falls_back_to_template_and_records_stale_workdir_mismatch(tmp_path):
+    w1 = make_worker(tmp_path, name="tester")
+    roster_path = write_roster(tmp_path, [w1])
+    local_root = str(tmp_path / "local")
+    cfg = make_config(
+        tmp_path, roster_path, active_implementation_cap=5, local_root=local_root,
+    )
+    tasks = [
+        {
+            "id": "wf-265", "labels": ["worker:tester"], "title": "one",
+            "comments": [
+                {"body": "Owner: tester\nWorkdir: /some/tree/wf-264/checkout\nStart: x", "author": "tester"},
+            ],
+        },
+    ]
+
+    def fake_http(method, url, body=None, timeout=15.0):
+        return {"ok": True, "tasks": tasks}
+
+    candidates = integrator.discover_candidates(cfg, http=fake_http)
+    assert candidates[0]["checkout_override"] is None
+
+    ledger_path = os.path.join(local_root, "ledger", "integrator-%s.log" % cfg["project"])
+    with open(ledger_path, "r", encoding="utf-8") as fh:
+        ledger_text = fh.read()
+    assert "workdir_mismatch=/some/tree/wf-264/checkout" in ledger_text
