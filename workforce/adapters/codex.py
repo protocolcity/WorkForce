@@ -64,4 +64,5 @@ ADAPTER = ProviderAdapter(
         "WorkLane hand tools; --dangerously-bypass-approvals-and-sandbox is "
         "never emitted."
     ),
+    default_model="gpt-6-astra",
 )

@@ -13,8 +13,12 @@ def _build_command(ctx: SeatContext, binary: str) -> List[str]:
     allowed = _BASE_TOOLS + "," + ",".join(
         "mcp__worklane__%s" % name for name in ctx.mcp_tool_names
     )
+    # --trust only dismisses the interactive "trust this workspace?" prompt
+    # (required headless, same ruling as cursor) — grok will not load the
+    # seat's project-scoped .grok/config.toml MCP server from an untrusted
+    # folder otherwise.
     cmd = [
-        binary, "--single", "{prompt}",
+        binary, "--trust", "--single", "{prompt}",
         "--permission-mode", "dontAsk",
         "--tools", _BASE_TOOLS,
         "--allowedTools", allowed,
@@ -48,6 +52,10 @@ ADAPTER = ProviderAdapter(
         "Single-turn (--single) with --permission-mode dontAsk and an "
         "explicit --tools/--allowedTools allow list (--allow is the alias "
         "grok documents for --allowedTools); --always-approve is never "
-        "emitted."
+        "emitted. --trust only skips the workspace-trust prompt. The "
+        "worklane MCP server is not wired through a CLI flag — the "
+        "generated seat plants a project-scoped .grok/config.toml the "
+        "grok CLI reads from its working directory."
     ),
+    default_model="grok-4.6",
 )

@@ -10,6 +10,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
@@ -857,20 +858,59 @@ def hire(
     return result
 
 
-def _default_worker_config_root(base: str) -> str:
-    return os.path.join(base, "local", "worker-config")
+def _default_workspace_root(base: str) -> Optional[str]:
+    """Parent of the data home, when that parent looks like a workspace root.
+
+    WorkForce's own data home (``base``) is usually ``<workspace>/workforce``
+    on a multi-project host; a generated seat's law and shared tool paths
+    (WorkLane venv, worker-config) live under the workspace, not under
+    WorkForce's own folder. An ``AGENTS.md`` directly in the parent is the
+    workspace-root signal; anything else (a lone product checkout with no
+    such parent) has no workspace to default to — the caller must pass
+    ``--workspace`` explicitly.
+    """
+    parent = os.path.dirname(os.path.abspath(base).rstrip(os.sep))
+    if parent and os.path.isfile(os.path.join(parent, "AGENTS.md")):
+        return parent
+    return None
+
+
+def _default_worker_config_root(base: str, workspace: Optional[str] = None) -> str:
+    return os.path.join(workspace or base, "local", "worker-config")
 
 
 def _default_state_dir(base: str) -> str:
     return os.path.join(base, "local", "task-runs")
 
 
-def _default_worklane_python(base: str) -> str:
-    return os.path.join(base, "local", "worklane", "current", "venv", "bin", "python")
+def _default_worklane_python(base: str, workspace: Optional[str] = None) -> str:
+    root = workspace or base
+    return os.path.join(root, "local", "worklane", "current", "venv", "bin", "python")
 
 
-def _default_worklane_runtime_dir(base: str) -> str:
-    return os.path.join(base, "worklane", "worklane", "local")
+def _default_worklane_runtime_dir(base: str, workspace: Optional[str] = None) -> str:
+    root = workspace or base
+    return os.path.join(root, "worklane", "worklane", "local")
+
+
+def _default_authority_chain(
+    *, workspace: Optional[str], repository: str, contract_path: str
+) -> List[str]:
+    """Workspace AGENTS.md, then the repository's own AGENTS.md, then CONTRACT.md.
+
+    A generated seat must read the same law a hand-built one does: the
+    workspace root's instructions (not WorkForce's own AGENTS.md — a
+    different product's rules), the project's own AGENTS.md when it has
+    one, and finally this seat's CONTRACT.md.
+    """
+    chain: List[str] = []
+    if workspace:
+        chain.append(os.path.join(workspace, "AGENTS.md"))
+    repo_agents = os.path.join(repository, "AGENTS.md")
+    if os.path.isfile(repo_agents) and repo_agents not in chain:
+        chain.append(repo_agents)
+    chain.append(contract_path)
+    return chain
 
 
 def _backup_seat_dir(seat_dir: str) -> str:
@@ -906,7 +946,9 @@ def generate_seat_folder(
     state_dir: Optional[str] = None,
     worklane_python: Optional[str] = None,
     worklane_runtime_dir: Optional[str] = None,
+    workspace: Optional[str] = None,
     authority_chain: Optional[List[str]] = None,
+    schedule: Optional[str] = None,
     held: Optional[bool] = None,
     regenerate: bool = False,
     dry_run: bool = False,
@@ -917,6 +959,7 @@ def generate_seat_folder(
     keychain_env: str = "",
     scope_home: str = "",
     perimeter_grants: Optional[List[str]] = None,
+    interpreter: str = "",
 ) -> Dict[str, Any]:
     """Generate the D13 seat shape (5 files) + roster row from a provider adapter.
 
@@ -939,6 +982,10 @@ def generate_seat_folder(
         raise RosterError("repository does not exist: %r" % repository)
 
     path = _resolve_roster_path(roster_path, base)
+    # An omitted --model must never mean "whatever the vendor feels like
+    # today" for a seat meant to run unattended — fall back to the
+    # adapter's own pin before validating (gap 6).
+    model = model or adapter.default_model
     model = validate_model_pin(
         model,
         roster_path=path if os.path.isfile(path) else None,
@@ -977,7 +1024,8 @@ def generate_seat_folder(
     prior_held = bool(prior_spec) and (prior_spec.get("schedule") or "") == ""
     held = held if held is not None else (prior_held if regenerate else False)
 
-    worker_config_root = worker_config_root or _default_worker_config_root(base)
+    workspace = workspace or _default_workspace_root(base)
+    worker_config_root = worker_config_root or _default_worker_config_root(base, workspace)
     seat_dir = os.path.join(worker_config_root, slug)
     exists = os.path.isdir(seat_dir)
     if exists and not regenerate and not dry_run:
@@ -987,24 +1035,26 @@ def generate_seat_folder(
         )
 
     state_dir = state_dir or _default_state_dir(base)
-    worklane_python = worklane_python or _default_worklane_python(base)
-    worklane_runtime_dir = worklane_runtime_dir or _default_worklane_runtime_dir(base)
+    worklane_python = worklane_python or _default_worklane_python(base, workspace)
+    worklane_runtime_dir = (
+        worklane_runtime_dir or _default_worklane_runtime_dir(base, workspace)
+    )
     desk_url = desk_url or desk_base_url()
     contract_path = os.path.join(seat_dir, "CONTRACT.md")
     prompt_path = os.path.join(seat_dir, "prompt.md")
     mcp_path = os.path.join(seat_dir, "mcp.json")
     runner_path = os.path.join(seat_dir, "runner.json")
     launch_path = os.path.join(seat_dir, "launch.py")
-    authority_chain = list(authority_chain or [
-        os.path.join(base, "AGENTS.md"),
-        contract_path,
-    ])
+    repository = os.path.abspath(repository)
+    authority_chain = list(authority_chain or _default_authority_chain(
+        workspace=workspace, repository=repository, contract_path=contract_path,
+    ))
 
     ctx = SeatContext(
         slug=slug,
         identity=identity,
         model=model,
-        repository=os.path.abspath(repository),
+        repository=repository,
         remote=remote,
         project=project,
         mcp_config_path=mcp_path,
@@ -1016,17 +1066,13 @@ def generate_seat_folder(
     auth_check = adapter.auth_check()
     allow_list = adapter.allow_list(ctx)
 
-    remote_status = git_remote_status(repository)
-    land_it = _land_it_contract_text(slug, remote_status)
-    land_it_prompt = _land_it_prompt_text(slug, remote_status)
-
     files = {
         "runner.json": json.dumps({
             "project": project,
             "worker": slug,
             "desk_url": desk_url,
             "required_label": required_label,
-            "repository": os.path.abspath(repository),
+            "repository": repository,
             "expected_remote": remote,
             "base_ref": base_ref,
             "state_dir": state_dir,
@@ -1035,7 +1081,7 @@ def generate_seat_folder(
             "auth_check": auth_check,
             "command": command,
         }, indent=2) + "\n",
-        "launch.py": seat_templates.render_launch_py(),
+        "launch.py": seat_templates.render_launch_py(provider),
         "mcp.json": seat_templates.render_mcp_json_text(
             identity=identity,
             worklane_python=worklane_python,
@@ -1043,14 +1089,21 @@ def generate_seat_folder(
         ),
         "CONTRACT.md": seat_templates.render_contract(
             slug=slug, identity=identity, provider=provider, model=model,
-            project=project, test_commands=test_commands, land_it=land_it,
+            project=project, test_commands=test_commands,
         ),
         "prompt.md": seat_templates.render_prompt(
-            slug=slug, identity=identity, project=project,
-            contract_path=contract_path, test_commands=test_commands,
-            land_it_prompt=land_it_prompt,
+            identity=identity, project=project, test_commands=test_commands,
         ),
     }
+    if provider == "cursor":
+        files["permissions.json"] = seat_templates.render_permissions_json_text(
+            mcp_tool_names=allow_list,
+        )
+    elif provider == "grok":
+        files[os.path.join(".grok", "config.toml")] = seat_templates.render_grok_config_toml(
+            identity=identity, worklane_python=worklane_python,
+            worklane_runtime_dir=worklane_runtime_dir,
+        )
 
     queue_url = (
         "%s/api/admin/tasks/ready?product=%s&label=worker:%s"
@@ -1092,49 +1145,72 @@ def generate_seat_folder(
         result["backup"] = backup
     os.makedirs(seat_dir, exist_ok=True)
     for filename, body in files.items():
-        with open(os.path.join(seat_dir, filename), "w", encoding="utf-8") as fh:
+        dest = os.path.join(seat_dir, filename)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as fh:
             fh.write(body)
 
     prior_budget = int(prior_spec.get("budget_secs") or budget_secs)
     prior_max_passes = prior_spec.get("max_passes")
-    # --regenerate keeps the prior row's actual cron unless held overrides it;
-    # a brand-new hire (or a regenerate with no prior row) gets the default.
-    if regenerate and prior_spec and not held:
-        schedule = prior_spec.get("schedule") or "*/30 * * * *"
+    # --regenerate keeps the prior row's actual schedule unless held/schedule
+    # override it; a brand-new hire (or a regenerate with no prior row) gets
+    # the default. A generated seat must never start unattended by
+    # accident (gap 1) — "manual" (never daemon-fired; see schedule.py) is
+    # the default, not a live cron.
+    if schedule is not None:
+        resolved_schedule = schedule
+    elif regenerate and prior_spec and not held:
+        resolved_schedule = prior_spec.get("schedule") or "manual"
     else:
-        schedule = "" if held else "*/30 * * * *"
+        resolved_schedule = "" if held else "manual"
+
+    # The roster command must run under the interpreter WorkForce itself
+    # runs under (gap 7) — a bare "python3" resolves to the system
+    # interpreter outside WorkForce's own venv, which has no workforce
+    # package to import from launch.py.
+    interpreter = interpreter or sys.executable or "python3"
+
+    env_map = {
+        "WL_AGENT_ID": identity,
+        "TP_AGENT_ID": identity,
+        "WORKLANE_RUNTIME_DIR": worklane_runtime_dir,
+        # Same PATH the engine runs under, so the seat's own subprocess can
+        # find vendor CLIs installed for this user (gap 7/12).
+        "PATH": os.environ.get("PATH", ""),
+    }
 
     w = Worker(
         name=slug,
-        workdir=os.path.abspath(repository),
+        workdir=seat_dir,
         contract=contract_path,
         prompt=prompt_path,
         identity=identity,
-        command=[
-            "python3", str(launch_path), "--config", str(runner_path),
-        ],
+        command=[interpreter, str(launch_path), "--config", str(runner_path)],
         kind="lane",
         model=model,
         budget_secs=prior_budget,
-        max_passes=int(prior_max_passes) if prior_max_passes is not None else 0,
-        # held (D12/D15 desk OFF): no cron field means the daemon never
-        # auto-fires this seat — fire_now still works for a manual dispatch.
-        schedule=schedule,
+        min_pass_secs=int(prior_spec.get("min_pass_secs") or 600),
+        # Lane seats drain one claimed ticket per shift, not the whole
+        # ready queue (gap 11); "manual" schedule plus max_passes=1 mirrors
+        # the hand-built seats exactly.
+        max_passes=int(prior_max_passes) if prior_max_passes is not None else 1,
+        schedule=resolved_schedule,
         queue_url=queue_url,
         keychain_service=keychain_service,
         keychain_env=keychain_env,
+        env=env_map,
         display=name.strip() or slug,
-        scope_home=scope_home,
-        perimeter_grants=list(perimeter_grants or []),
+        # scope_home/perimeter_grants default to the seat folder plus the
+        # repository (gap 5/10) — a generated seat's own paths, not the
+        # data home's project-folder convention `hire()` uses.
+        scope_home=scope_home or seat_dir,
+        perimeter_grants=list(perimeter_grants or [seat_dir, repository]),
         authority_chain=authority_chain,
         shift_worktree=True,
     )
     w.validate()
 
     workers[slug] = worker_to_spec(w)
-    for _f in ("workdir", "contract", "prompt"):
-        if workers[slug].get(_f):
-            workers[slug][_f] = os.path.relpath(workers[slug][_f], base)
     _atomic_write_json(path, raw)
     try:
         load(path=path, base=base)
