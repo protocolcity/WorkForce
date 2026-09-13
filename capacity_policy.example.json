@@ -32,6 +32,34 @@
         "runtime": "grok"
       },
       "bidirectional": true
+    },
+    {
+      "id": "generalist-claude5-grok",
+      "tier": "generalist",
+      "description": "Generalist seats on the current Claude pin (claude-sonnet-5, AGENT_ADOPTION D12). Emergency re-pin to Grok when Claude pool is walled; restore to Claude when capacity clears.",
+      "a": {
+        "model": "claude-sonnet-5",
+        "runtime": "claude"
+      },
+      "b": {
+        "model": "grok-4.6",
+        "runtime": "grok"
+      },
+      "bidirectional": true
+    },
+    {
+      "id": "generalist-cursor-grok",
+      "tier": "generalist",
+      "description": "Cursor generalist seats (composer-2.5, AGENT_ADOPTION D12). Emergency re-pin to Grok when the Cursor pool is walled.",
+      "a": {
+        "model": "composer-2.5",
+        "runtime": "cursor"
+      },
+      "b": {
+        "model": "grok-4.6",
+        "runtime": "grok"
+      },
+      "bidirectional": true
     }
   ],
   "stay_pinned_tiers": ["heavy_multipass"],
