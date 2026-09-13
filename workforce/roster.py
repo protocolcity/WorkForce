@@ -101,6 +101,22 @@ class Worker:
     # hire default true for kind=lane when the key is absent (slice 4); jobs
     # stay false. Explicit false on a lane row is a permanent opt-out.
     shift_worktree: bool = False
+    # wf-262 — stop-reason verification: some CLIs (grok) exit 0 with a JSON
+    # result whose own stop-reason field says the turn was cut short by an
+    # internal vendor budget, not truly finished; a bare rc==0 cannot tell
+    # the two apart. Empty completion_field = feature off (every worker not
+    # explicitly opted in keeps today's rc==0-is-done behavior unchanged).
+    # An incomplete pass is continued (bounded by continuation_attempts)
+    # through task_runner's own existing --recover-receipt/--recovery-reason
+    # path -- the same numbered-attempt, same-checkout, same-reservation
+    # mechanism an operator already uses by hand -- never a raw vendor
+    # "resume" flag, so continuation still requires the task to be
+    # currently ready-eligible (task_runner's own recover() check): a real
+    # claim/cancel/auth block still refuses instead of being silently
+    # retried.
+    completion_field: str = ""          # dot-path into the pass's JSON result naming its stop reason
+    completion_values: List[str] = field(default_factory=list)  # values of completion_field meaning "actually done"
+    continuation_attempts: int = 0      # bounded auto-recoveries tried before giving up honestly (0 = none)
 
     @property
     def worker_type(self) -> str:
@@ -173,6 +189,18 @@ class Worker:
         if int(self.max_fires_per_day) < 0:
             raise RosterError(
                 "worker %r max_fires_per_day must be >= 0 (0 = unlimited)" % self.name
+            )
+        if int(self.continuation_attempts) < 0:
+            raise RosterError(
+                "worker %r continuation_attempts must be >= 0" % self.name
+            )
+        if self.completion_values and not self.completion_field:
+            raise RosterError(
+                "worker %r completion_values requires completion_field" % self.name
+            )
+        if int(self.continuation_attempts) > 0 and not self.completion_field:
+            raise RosterError(
+                "worker %r continuation_attempts requires completion_field" % self.name
             )
 
 

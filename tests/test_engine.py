@@ -2061,3 +2061,183 @@ def test_list_tasks_non_dict_and_items_key():
     )
     assert rows[0]["id"] == "a"
     assert rows[0]["product"] == "workforce"
+
+
+# wf-262 — stop-reason verification + bounded task_runner-recovery continuation
+#
+# A fake task_runner-shaped CLI: prints the same "Prepared ...; Receipt: ..."
+# line every real task_runner.py invocation prints (fresh or recovered),
+# then a JSON result whose stopReason depends only on whether its own argv
+# carries --recover-receipt — mirroring grok's real rc==0/stopReason=cancelled
+# behavior on a first pass and a genuine end_turn once "resumed".
+
+_FAKE_TASK_RUNNER = '''import sys
+from pathlib import Path
+calls_path, receipt_path = sys.argv[1], sys.argv[2]
+n = int(Path(calls_path).read_text()) if Path(calls_path).exists() else 0
+Path(calls_path).write_text(str(n + 1))
+print("Prepared demo-task; not yet claimed. Receipt: %s" % receipt_path)
+if "--recover-receipt" in sys.argv:
+    print('{"stopReason": "end_turn", "sessionId": "sid-1"}')
+else:
+    print('{"stopReason": "cancelled", "sessionId": "sid-1"}')
+'''
+
+
+def _fake_task_runner_worker(tmp_path, **over):
+    script = tmp_path / "fake_task_runner.py"
+    script.write_text(_FAKE_TASK_RUNNER)
+    calls = tmp_path / "calls.txt"
+    receipt = tmp_path / "preparation.json"
+    receipt.write_text("{}")
+    over.setdefault("completion_field", "stopReason")
+    over.setdefault("completion_values", ["end_turn"])
+    w = make_worker(
+        tmp_path,
+        command=[sys.executable, str(script), str(calls), str(receipt)],
+        **over,
+    )
+    return w, calls
+
+
+def test_completion_field_off_keeps_rc0_is_done(tmp_path):
+    """A worker that never opts in keeps today's behavior: rc==0 is DONE,
+    even though the (unchecked) JSON result says stopReason=cancelled."""
+    w, calls = _fake_task_runner_worker(tmp_path, completion_field="", completion_values=[])
+    assert engine.dispatch(w, local(tmp_path)) == 0
+    text = ledger_text(tmp_path)
+    assert "DONE" in text and "STOP" in text
+    assert calls.read_text() == "1"
+
+
+def test_incomplete_stop_with_no_continuation_budget_fails_honestly(tmp_path):
+    """rc==0 + stopReason=cancelled + continuation_attempts=0 → ERROR, not DONE."""
+    w, calls = _fake_task_runner_worker(tmp_path, continuation_attempts=0)
+    assert engine.dispatch(w, local(tmp_path)) == 1
+    text = ledger_text(tmp_path)
+    assert "ERROR" in text
+    assert "incomplete: cancelled" in text
+    assert "DONE" not in text
+    assert calls.read_text() == "1"  # never blindly retried
+
+
+def test_incomplete_stop_auto_continues_through_task_runner_recovery(tmp_path):
+    """One bounded continuation reaches end_turn → honest DONE, evidence of the resume."""
+    w, calls = _fake_task_runner_worker(tmp_path, continuation_attempts=1)
+    assert engine.dispatch(w, local(tmp_path)) == 0
+    text = ledger_text(tmp_path)
+    assert "DONE" in text and "continuations=1" in text
+    assert "STOP" in text
+    assert calls.read_text() == "2"  # first pass + one continuation
+
+
+def test_continuation_exhausted_still_incomplete_fails(tmp_path):
+    """A CLI that never reports end_turn exhausts its budget and fails, not loops forever."""
+    always_cancelled = '''import sys
+print("Prepared demo-task; not yet claimed. Receipt: %s" % sys.argv[1])
+print('{"stopReason": "cancelled", "sessionId": "sid-1"}')
+'''
+    script = tmp_path / "always_cancelled.py"
+    script.write_text(always_cancelled)
+    receipt = tmp_path / "preparation.json"
+    receipt.write_text("{}")
+    w = make_worker(
+        tmp_path,
+        command=[sys.executable, str(script), str(receipt)],
+        completion_field="stopReason", completion_values=["end_turn"],
+        continuation_attempts=2,
+    )
+    assert engine.dispatch(w, local(tmp_path)) == 1
+    text = ledger_text(tmp_path)
+    assert "incomplete: cancelled" in text
+    assert "continuations=2" in text
+    assert "DONE" not in text
+
+
+def test_incomplete_stop_without_receipt_cannot_continue(tmp_path):
+    """A pass with no task_runner receipt line can't be auto-continued — honest failure."""
+    w = make_worker(
+        tmp_path,
+        command=["/bin/sh", "-c", 'echo \'{"stopReason": "cancelled"}\'; exit 0'],
+        completion_field="stopReason", completion_values=["end_turn"],
+        continuation_attempts=3,
+    )
+    assert engine.dispatch(w, local(tmp_path)) == 1
+    text = ledger_text(tmp_path)
+    assert "incomplete: cancelled (no receipt to continue)" in text
+
+
+def test_completion_field_missing_from_output_is_incomplete(tmp_path):
+    """rc==0 with JSON present but no stopReason key at all — never trust silently."""
+    w = make_worker(
+        tmp_path,
+        command=["/bin/sh", "-c", 'echo \'{"other": "value"}\'; exit 0'],
+        completion_field="stopReason", completion_values=["end_turn"],
+    )
+    assert engine.dispatch(w, local(tmp_path)) == 1
+    assert "incomplete: missing stopReason" in ledger_text(tmp_path)
+
+
+def test_unparseable_output_with_completion_field_is_incomplete(tmp_path):
+    """rc==0 with no JSON at all in the output — configured verification still refuses to trust it."""
+    w = make_worker(
+        tmp_path,
+        command=["/bin/sh", "-c", "echo 'plain text, no json'; exit 0"],
+        completion_field="stopReason", completion_values=["end_turn"],
+    )
+    assert engine.dispatch(w, local(tmp_path)) == 1
+    assert "incomplete: unparseable output" in ledger_text(tmp_path)
+
+
+def test_classify_completion_pretty_printed_json(tmp_path):
+    """Grok's real --output-format json is pretty-printed, not one compact line — must still parse."""
+    out = tmp_path / "pretty.out"
+    out.write_text('{\n  "stopReason": "end_turn",\n  "sessionId": "abc"\n}\n')
+    configured, complete, stop_value = engine._classify_completion(
+        make_worker(tmp_path, completion_field="stopReason", completion_values=["end_turn"]),
+        str(out), 0,
+    )
+    assert configured is True
+    assert complete is True
+    assert stop_value == "end_turn"
+
+
+def test_classify_completion_not_configured_defaults_complete(tmp_path):
+    configured, complete, stop_value = engine._classify_completion(
+        make_worker(tmp_path), str(tmp_path / "missing.out"), 0,
+    )
+    assert configured is False
+    assert complete is True
+
+
+def test_last_receipt_path_picks_the_most_recent_match(tmp_path):
+    out = tmp_path / "run.out"
+    out.write_text(
+        "Prepared x; not yet claimed. Receipt: /a/1/preparation.json\n"
+        "--- continuation 1 ---\n"
+        "Prepared x; not yet claimed. Receipt: /a/2/preparation.json\n"
+    )
+    assert engine._last_receipt_path(str(out), 0) == "/a/2/preparation.json"
+
+
+def test_last_receipt_path_absent_returns_empty(tmp_path):
+    out = tmp_path / "run.out"
+    out.write_text('{"stopReason": "cancelled"}\n')
+    assert engine._last_receipt_path(str(out), 0) == ""
+
+
+def test_continuation_attempts_requires_completion_field(tmp_path):
+    with pytest.raises(RosterError, match="continuation_attempts requires completion_field"):
+        make_worker(tmp_path, continuation_attempts=1).validate()
+
+
+def test_completion_values_requires_completion_field(tmp_path):
+    with pytest.raises(RosterError, match="completion_values requires completion_field"):
+        make_worker(tmp_path, completion_values=["end_turn"]).validate()
+
+
+def test_continuation_attempts_negative_rejected(tmp_path):
+    with pytest.raises(RosterError, match="continuation_attempts must be >= 0"):
+        make_worker(
+            tmp_path, completion_field="stopReason", continuation_attempts=-1,
+        ).validate()

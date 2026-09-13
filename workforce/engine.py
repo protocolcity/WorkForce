@@ -1642,6 +1642,84 @@ def _classify_exit(out_path: str) -> str:
     return "agent exit"
 
 
+def _pass_result_json(out_path: str, offset: int) -> Optional[dict]:
+    """Return the first JSON object in a pass's own output slice, or None.
+
+    Some CLIs (grok's ``--output-format json``) pretty-print one JSON object
+    per invocation rather than emitting compact NDJSON, so the line-by-line
+    scan ``_usage_from_output`` uses cannot see it. ``raw_decode`` from the
+    first ``{`` tolerates any stray banner text before the object and any
+    trailing bytes after it. Must never raise — a parse failure just means
+    "no result to classify", not a crash of the shift.
+    """
+    try:
+        with open(out_path, "r", encoding="utf-8", errors="replace") as fh:
+            fh.seek(offset)
+            chunk = fh.read(2 * 1024 * 1024)
+    except OSError:
+        return None
+    idx = chunk.find("{")
+    if idx == -1:
+        return None
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(chunk[idx:])
+    except ValueError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _classify_completion(
+    worker: Worker, out_path: str, offset: int,
+) -> Tuple[bool, bool, str]:
+    """Return (configured, complete, stop_value) for one rc==0 pass.
+
+    ``configured=False`` means this worker never opted into stop-reason
+    verification (``completion_field`` empty) — callers must then treat the
+    pass exactly as today (rc==0 already means done); no provider is held to
+    a stricter bar it never configured. When configured, a genuinely
+    complete pass has ``worker.completion_field`` resolve to one of
+    ``worker.completion_values``; anything else (a different value, a
+    missing field, or unparseable output) is honestly incomplete rather than
+    silently trusted from the exit code alone (wf-262).
+    """
+    if not worker.completion_field:
+        return False, True, ""
+    obj = _pass_result_json(out_path, offset)
+    if obj is None:
+        return True, False, "unparseable output"
+    try:
+        value = _dig(obj, worker.completion_field)
+    except KeyError:
+        return True, False, "missing " + worker.completion_field
+    complete = isinstance(value, str) and value in worker.completion_values
+    return True, complete, ("" if value is None else str(value))
+
+
+# task_runner.py prints exactly this line, unconditionally, on every one of
+# its own invocations (a fresh prepare() or an explicit recover()) right
+# before it execs the provider — the one place the reservation's own receipt
+# path is guaranteed to surface in a pass's captured output.
+_PREPARED_RECEIPT_RE = re.compile(r"Prepared \S+; not yet claimed\. Receipt: (\S+)")
+
+
+def _last_receipt_path(out_path: str, offset: int) -> str:
+    """Return the most recent task_runner receipt path this pass printed.
+
+    Empty when this pass's own command was never routed through
+    task_runner.py (e.g. a hand-built seat invoking a vendor CLI directly)
+    — such a pass cannot be auto-continued through task_runner's own
+    recovery path, so the caller must give up honestly rather than guess.
+    """
+    try:
+        with open(out_path, "r", encoding="utf-8", errors="replace") as fh:
+            fh.seek(offset)
+            chunk = fh.read(2 * 1024 * 1024)
+    except OSError:
+        return ""
+    matches = _PREPARED_RECEIPT_RE.findall(chunk)
+    return matches[-1] if matches else ""
+
+
 def _scope_check(worker: Worker, ledger: Ledger) -> bool:
     """Return True if workdir is within the allowed scope; log SCOPE_DENY and return False if not.
 
@@ -2036,11 +2114,78 @@ def dispatch(
                     )
                 ledger.append("ERROR", reason=reason, rc=rc, on_pass=passes + 1, **recovery_kv)
                 return 1
+
+            # wf-262 — a clean exit alone does not mean the turn actually
+            # finished (grok exits 0 with stopReason=cancelled on an
+            # internal vendor stop, e.g. pc-1467). Workers that opt in via
+            # completion_field get bounded, honest continuations through
+            # task_runner's own existing --recover-receipt/--recovery-reason
+            # path (the same numbered-attempt mechanism an operator already
+            # drives by hand) before an incomplete pass is reported as
+            # failed; workers that never opted in keep rc==0-is-done
+            # unchanged. Each continuation still goes through task_runner's
+            # own ready-eligibility recheck, so a real claim/cancel/auth
+            # block refuses instead of being silently retried.
+            configured, complete, stop_value = _classify_completion(
+                worker, out_path, pass_offset,
+            )
+            final_offset = pass_offset
+            continuations = 0
+            while configured and not complete:
+                if continuations >= worker.continuation_attempts:
+                    ledger.append("ERROR", reason="incomplete: " + stop_value,
+                                  on_pass=passes + 1, continuations=continuations,
+                                  **recovery_kv)
+                    return 1
+                receipt_path = _last_receipt_path(out_path, pass_offset)
+                if not receipt_path:
+                    ledger.append(
+                        "ERROR", reason="incomplete: %s (no receipt to continue)" % stop_value,
+                        on_pass=passes + 1, continuations=continuations, **recovery_kv,
+                    )
+                    return 1
+                cont_remain = deadline - time.monotonic()
+                if cont_remain <= 0:
+                    ledger.append("ERROR", reason="killed at budget",
+                                  budget_secs=worker.budget_secs, on_pass=passes + 1,
+                                  continuations=continuations, **recovery_kv)
+                    return 1
+                continuations += 1
+                cont_reason = ("wf-262 auto-continuation %d/%d after incomplete stop: %s"
+                              % (continuations, worker.continuation_attempts, stop_value))
+                cont_argv = argv + ["--recover-receipt", receipt_path,
+                                    "--recovery-reason", cont_reason]
+                outfh.write("--- continuation %d: %s ---\n" % (continuations, stop_value))
+                outfh.flush()
+                final_offset = outfh.tell()
+                cont_proc = subprocess.Popen(cont_argv, cwd=shift_cwd, env=env,
+                                             stdout=outfh, stderr=subprocess.STDOUT)
+                try:
+                    rc = cont_proc.wait(timeout=max(cont_remain, 0.1))
+                except subprocess.TimeoutExpired:
+                    cont_proc.kill()
+                    cont_proc.wait()
+                    ledger.append("ERROR", reason="killed at budget",
+                                  budget_secs=worker.budget_secs, on_pass=passes + 1,
+                                  continuations=continuations, **recovery_kv)
+                    return 1
+                if rc != 0:
+                    ledger.append("ERROR", reason=_classify_exit(out_path), rc=rc,
+                                  on_pass=passes + 1, continuations=continuations,
+                                  **recovery_kv)
+                    return 1
+                configured, complete, stop_value = _classify_completion(
+                    worker, out_path, final_offset,
+                )
+
             passes += 1
             outfh.flush()
-            usage = _usage_from_output(out_path, pass_offset, worker.usage_fields)
+            usage = _usage_from_output(out_path, final_offset, worker.usage_fields)
+            done_kv = dict(usage)
+            if continuations:
+                done_kv["continuations"] = continuations
             ledger.append("DONE", rc=0, on_pass=passes,
-                          secs=int(time.monotonic() - pass_t0), **usage, **recovery_kv)
+                          secs=int(time.monotonic() - pass_t0), **done_kv, **recovery_kv)
 
             if passes >= pass_ceiling:
                 if recover_receipt:
