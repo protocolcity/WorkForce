@@ -44,6 +44,7 @@ from ...roster import Roster, RosterError, Worker  # noqa: F401
 from ...schedule import calendar_intervals_to_cron, maybe_cron, next_fire_utc  # noqa: F401
 from ... import roster as roster_mod  # noqa: F401
 from ... import runtimes as runtimes_mod  # noqa: F401
+from ...reports import supervisor_report_section  # noqa: F401
 
 from .constants import (  # noqa: F401
     CITYHALL,

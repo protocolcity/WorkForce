@@ -47,3 +47,16 @@ def _days_param(path: str) -> Optional[int]:
         return int(raw)
     except ValueError:
         return None
+
+
+def _limit_param(path: str, default: int = 20, max_limit: int = 100) -> int:
+    """?limit= from a request path; invalid values fall back to ``default``."""
+    query = urllib.parse.urlsplit(path).query
+    raw = urllib.parse.parse_qs(query).get("limit", [""])[0]
+    try:
+        val = int(raw)
+    except ValueError:
+        return default
+    if val <= 0:
+        return default
+    return min(val, max_limit)
