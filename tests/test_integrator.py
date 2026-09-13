@@ -273,10 +273,12 @@ def test_discover_candidates_filters_seat_project_lock_and_cap(tmp_path, monkeyp
 
     # Simulate busy-seat holding a live lock — engine.lock_inspect reads
     # local_root/locks/<name>.lock; a live (non-orphan) lock excludes it.
-    locks_dir = os.path.join(cfg["local_root"], "locks")
-    os.makedirs(locks_dir, exist_ok=True)
-    with open(os.path.join(locks_dir, "busy-seat.lock"), "w") as fh:
-        json.dump({"pid": os.getpid(), "started": integrator._utc_iso_z()}, fh)
+    # A real §3 lock is a directory holding a pid file (engine.lock_inspect);
+    # a JSON file of that name was never recognised, which the dropped cap hid.
+    lock_dir = os.path.join(cfg["local_root"], "locks", "busy-seat.lock")
+    os.makedirs(lock_dir, exist_ok=True)
+    with open(os.path.join(lock_dir, "pid"), "w") as fh:
+        fh.write(str(os.getpid()))
 
     candidates = integrator.discover_candidates(cfg, http=fake_http)
     ids = [c["task_id"] for c in candidates]
@@ -2004,3 +2006,12 @@ def test_load_config_accepts_an_empty_screenshot_list(tmp_path):
     must load; an empty list means no screenshots."""
     cfg = make_config(tmp_path, str(tmp_path / "roster.json"), screenshot_cmd=[])
     assert cfg.get("screenshot_cmd") is None
+
+
+def test_parse_reviewer_findings_unwraps_a_json_findings_array():
+    """Rehearsal on pc-1492: the reviewer answered the generated prompt with a JSON
+    object holding a findings array; the parser must return one finding per entry."""
+    body = 'Reviewing against the spec.\n{"findings": ["boot() drops the item deep link", "renderProjectPanel() loses focus", "#map-reset does not clear focus"]}'
+    found = integrator.parse_reviewer_findings(body)
+    assert found == ["boot() drops the item deep link", "renderProjectPanel() loses focus", "#map-reset does not clear focus"]
+    assert integrator.parse_reviewer_findings('{"findings": []}') == []

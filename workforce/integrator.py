@@ -823,9 +823,32 @@ def parse_reviewer_findings(output_text: str) -> List[str]:
     if items:
         return items
 
+    json_items = _json_findings_array(body)
+    if json_items is not None:
+        return json_items
+
     if _is_empty_findings_body(body):
         return []
     return [body]
+
+
+def _json_findings_array(body: str) -> Optional[List[str]]:
+    """A reviewer that answers a structured prompt with ``{"findings": [...]}``
+    (possibly after a line of prose) yields one finding per array entry; any
+    other shape returns None so the text path decides."""
+    start = body.find("{")
+    if start < 0:
+        return None
+    try:
+        data = json.loads(body[start:])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    found = data.get("findings")
+    if not isinstance(found, list):
+        return None
+    return [str(item).strip() for item in found if str(item).strip()]
 
 
 # --------------------------------------------------------------------------
