@@ -73,6 +73,35 @@ def test_cursor_trust_always_carries_sandbox_enabled():
     assert cmd[trust_idx + 1 : trust_idx + 3] == ["--sandbox", "enabled"]
 
 
+def test_grok_uses_auto_permission_mode_not_dontask():
+    """wf-262: dontAsk denies the whole turn (stopReason=cancelled) on any
+    run_terminal_command a bare tool-name grant can't match per-segment, not
+    only genuinely dangerous ones (reproduced live: dontAsk cancelled a
+    harmless `mkdir && echo && cat` chain). auto instead reports a blocked
+    call back to the model so the turn can still finish."""
+    adapter = ADAPTERS["grok"]
+    cmd = adapter.command(_ctx())
+    mode_idx = cmd.index("--permission-mode")
+    assert cmd[mode_idx + 1] == "auto"
+    assert "dontAsk" not in cmd
+
+
+def test_grok_hard_denies_its_own_dangerous_command_bucket():
+    """auto mode's classifier alone lets rm/chmod/kill/git-push through
+    unconfirmed in a headless session (reproduced live) — explicit --deny
+    rules keep grok's own documented dangerous-command bucket hard-blocked
+    regardless of mode, since deny always wins over allow/classifier."""
+    adapter = ADAPTERS["grok"]
+    cmd = adapter.command(_ctx())
+    denied = [cmd[i + 1] for i, part in enumerate(cmd) if part == "--deny"]
+    for pattern in (
+        "Bash(rm *)", "Bash(chmod *)", "Bash(chown *)", "Bash(chgrp *)",
+        "Bash(chattr *)", "Bash(pkill *)", "Bash(kill *)", "Bash(killall *)",
+        "Bash(git push*)", "Bash(sudo *)",
+    ):
+        assert pattern in denied
+
+
 @pytest.mark.parametrize("provider", ["claude", "cursor", "grok", "codex"])
 def test_adapter_fails_closed_when_bypass_flag_is_injected(provider, monkeypatch):
     """command() must refuse even if a future edit slips a bypass flag in."""
