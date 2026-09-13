@@ -1,0 +1,35 @@
+{
+  "schema": "workforce.integration_config/v1",
+  "# comment": "Copy under the host's local worker-config per project (e.g. local/worker-config/<project>/integration_config.json) and edit paths/commands for that repo. All paths must be absolute. See workforce/integrator.py for field meaning.",
+  "local_root": "/path/to/OneSeo/local",
+  "roster_path": "/path/to/OneSeo/local/roster.json",
+  "project": "workforce",
+  "desk": "",
+  "test_cmd": ["/path/to/venv/bin/pytest", "-q"],
+  "pr_base": "main",
+  "version_bump": "patch",
+  "version_file": "pyproject.toml",
+  "version_key": "version",
+  "stage_cmd": ["/path/to/project/scripts/stage.sh"],
+  "activate_cmd": ["/path/to/project/scripts/activate.sh"],
+  "verify_cmd": ["/path/to/project/scripts/print_installed_version.sh"],
+  "screenshot_cmd": [],
+  "reviewer_dispatch_cmd": ["python3", "-m", "workforce", "dispatch", "{reviewer}"],
+  "reviewer_by_provider": {
+    "cursor": "workflow-reviewer",
+    "claude": "cursor-reviewer",
+    "grok": "cursor-reviewer"
+  },
+  "merge_method": "merge",
+  "max_recovery_rounds": 2,
+  "coordinator_lock_path": "/path/to/OneSeo/local/COORDINATOR.lock",
+  "coordinator_lock_ttl_secs": 900,
+  "checkout_template": "local/task-runs/{worker}/{task_id}/checkout",
+  "branch_template": "workforce/task/{worker}/{task_id}",
+  "workspace_root": "/path/to/OneSeo",
+  "active_implementation_cap": 1,
+  "notes": [
+    "Dry run first: python -m workforce integrate --config <this file> --dry-run",
+    "Schedulable via cron or the daemon's job scheduling; also runnable manually."
+  ]
+}
