@@ -938,6 +938,28 @@ def test_bump_version_local_suffix_rejects_bare_semver():
         integrator.bump_version("1.2.3", "local-suffix")
 
 
+def test_read_version_accepts_local_suffix_form(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / "pyproject.toml").write_text(
+        'name = "workforce"\nversion = "0.1.9+consolidation.13"\nother = "1.2.3"\n'
+    )
+    cfg = {"version_file": "pyproject.toml", "version_key": "version"}
+    assert integrator._read_version(cfg, str(checkout)) == "0.1.9+consolidation.13"
+
+
+def test_write_version_replaces_only_the_version_line_local_suffix(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    original = 'name = "workforce"\nversion = "0.1.9+consolidation.13"\nother = "1.2.3"\n'
+    (checkout / "pyproject.toml").write_text(original)
+    cfg = {"version_file": "pyproject.toml", "version_key": "version"}
+    integrator._write_version(cfg, str(checkout), "0.1.9+consolidation.14")
+    updated = (checkout / "pyproject.toml").read_text()
+    assert updated == 'name = "workforce"\nversion = "0.1.9+consolidation.14"\nother = "1.2.3"\n'
+    assert integrator._read_version(cfg, str(checkout)) == "0.1.9+consolidation.14"
+
+
 def test_load_config_accepts_local_suffix_version_bump(tmp_path):
     roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
     cfg = base_config(tmp_path, roster_path, version_bump="local-suffix")
@@ -1003,18 +1025,25 @@ def test_default_ops_dispatch_reviewer_writes_prompt_file_and_reads_output_file(
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     local_root = str(tmp_path / "local")
+    ledger_dir = os.path.join(local_root, "ledger")
+    os.makedirs(ledger_dir, exist_ok=True)
+    ledger_path = os.path.join(ledger_dir, "cursor-reviewer.log")
+    # A stale DONE row from an earlier run, already on disk before this
+    # dispatch's offset is captured — it must never satisfy the wait even
+    # though it shares the same terminal-event shape as the real one below.
+    with open(ledger_path, "w") as fh:
+        fh.write("2020-01-01T00:00:00Z DONE\n")
     cfg = base_config(
         tmp_path, roster_path,
         local_root=local_root,
-        reviewer_dispatch_cmd=["/bin/sh", "-c", "exit 0"],
+        # The real reviewer job appends its own terminal row to its ledger;
+        # simulate that here so the dispatch's offset-based wait has a row
+        # appended *after* it to find.
+        reviewer_dispatch_cmd=["/bin/sh", "-c", "printf '%s DONE\\n' \"$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)\" >> " + ledger_path],
         reviewer_prompt_path=str(run_dir / "{reviewer}.prompt.md"),
         reviewer_output_path=str(run_dir / "{reviewer}.out"),
     )
     (run_dir / "cursor-reviewer.out").write_text('{"findings": []}')
-    ledger_dir = os.path.join(local_root, "ledger")
-    os.makedirs(ledger_dir, exist_ok=True)
-    with open(os.path.join(ledger_dir, "cursor-reviewer.log"), "w") as fh:
-        fh.write("%s DONE\n" % integrator._utc_iso_z())
 
     ops = integrator.default_ops(cfg)
     result = ops["dispatch_reviewer"]("cursor-reviewer", "review this diff")
@@ -1030,36 +1059,92 @@ def test_default_ops_dispatch_reviewer_fails_when_ledger_terminal_event_is_not_d
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     local_root = str(tmp_path / "local")
+    ledger_dir = os.path.join(local_root, "ledger")
+    os.makedirs(ledger_dir, exist_ok=True)
+    ledger_path = os.path.join(ledger_dir, "cursor-reviewer.log")
     cfg = base_config(
         tmp_path, roster_path,
         local_root=local_root,
-        reviewer_dispatch_cmd=["/bin/sh", "-c", "exit 0"],
+        reviewer_dispatch_cmd=["/bin/sh", "-c", "echo 2099-01-01T00:00:00Z ERROR reason=crashed >> " + ledger_path],
         reviewer_prompt_path=str(run_dir / "{reviewer}.prompt.md"),
         reviewer_output_path=str(run_dir / "{reviewer}.out"),
     )
-    ledger_dir = os.path.join(local_root, "ledger")
-    os.makedirs(ledger_dir, exist_ok=True)
-    with open(os.path.join(ledger_dir, "cursor-reviewer.log"), "w") as fh:
-        fh.write("%s ERROR reason=crashed\n" % integrator._utc_iso_z())
 
     ops = integrator.default_ops(cfg)
     result = ops["dispatch_reviewer"]("cursor-reviewer", "review this diff")
     assert result["ok"] is False
 
 
-def test_latest_reviewer_terminal_event_ignores_rows_before_since(tmp_path):
+# --------------------------------------------------------------------------
+# wf-265 recovery 4 secondary — wait until reviewer_output_path is stable
+# (size unchanged across two reads) before parsing
+# --------------------------------------------------------------------------
+
+
+def test_read_stable_file_waits_for_size_to_stop_changing(tmp_path):
+    path = str(tmp_path / "out.txt")
+    clock = {"t": 0.0}
+    calls = {"n": 0}
+
+    def now_fn():
+        return clock["t"]
+
+    def sleep_fn(secs):
+        clock["t"] += secs
+        calls["n"] += 1
+        if calls["n"] == 1:
+            with open(path, "w") as fh:
+                fh.write("partial")
+        elif calls["n"] == 2:
+            pass  # same size as the previous read — now considered stable
+
+    content = integrator._read_stable_file(
+        path, timeout_secs=10, poll_interval_secs=1, now_fn=now_fn, sleep_fn=sleep_fn,
+    )
+    assert content == "partial"
+
+
+def test_read_stable_file_times_out_when_file_never_appears(tmp_path):
+    path = str(tmp_path / "missing.txt")
+    clock = {"t": 0.0}
+
+    def now_fn():
+        return clock["t"]
+
+    def sleep_fn(secs):
+        clock["t"] += secs
+
+    content = integrator._read_stable_file(
+        path, timeout_secs=3, poll_interval_secs=1, now_fn=now_fn, sleep_fn=sleep_fn,
+    )
+    assert content is None
+
+
+def test_latest_reviewer_terminal_event_ignores_rows_before_since_offset(tmp_path):
+    local_root = str(tmp_path / "local")
+    ledger_dir = os.path.join(local_root, "ledger")
+    os.makedirs(ledger_dir, exist_ok=True)
+    ledger_path = os.path.join(ledger_dir, "cursor-reviewer.log")
+    # Seed a terminal row (even one stamped "now") *before* capturing the
+    # offset — a same-second stale row from an earlier run must never
+    # satisfy a later dispatch's wait.
+    with open(ledger_path, "w") as fh:
+        fh.write("%s DONE\n" % integrator._utc_iso_z())
+    since_offset = integrator.reviewer_ledger_offset(local_root, "cursor-reviewer")
+    assert integrator.latest_reviewer_terminal_event(local_root, "cursor-reviewer", since_offset) is None
+
+    with open(ledger_path, "a") as fh:
+        fh.write("%s DONE\n" % integrator._utc_iso_z())
+    assert integrator.latest_reviewer_terminal_event(local_root, "cursor-reviewer", since_offset) == "DONE"
+
+
+def test_wait_for_reviewer_ledger_polls_until_terminal_row_or_timeout(tmp_path):
     local_root = str(tmp_path / "local")
     ledger_dir = os.path.join(local_root, "ledger")
     os.makedirs(ledger_dir, exist_ok=True)
     with open(os.path.join(ledger_dir, "cursor-reviewer.log"), "w") as fh:
         fh.write("2020-01-01T00:00:00Z DONE\n")
-    since = integrator._utc_iso_z()
-    assert integrator.latest_reviewer_terminal_event(local_root, "cursor-reviewer", since) is None
-
-
-def test_wait_for_reviewer_ledger_polls_until_terminal_row_or_timeout(tmp_path):
-    local_root = str(tmp_path / "local")
-    since = integrator._utc_iso_z()
+    since_offset = integrator.reviewer_ledger_offset(local_root, "cursor-reviewer")
     clock = {"t": 0.0}
     sleeps = []
 
@@ -1070,13 +1155,11 @@ def test_wait_for_reviewer_ledger_polls_until_terminal_row_or_timeout(tmp_path):
         sleeps.append(secs)
         clock["t"] += secs
         if len(sleeps) == 2:
-            ledger_dir = os.path.join(local_root, "ledger")
-            os.makedirs(ledger_dir, exist_ok=True)
-            with open(os.path.join(ledger_dir, "cursor-reviewer.log"), "w") as fh:
+            with open(os.path.join(ledger_dir, "cursor-reviewer.log"), "a") as fh:
                 fh.write("%s DONE\n" % integrator._utc_iso_z())
 
     event = integrator.wait_for_reviewer_ledger(
-        local_root, "cursor-reviewer", since,
+        local_root, "cursor-reviewer", since_offset,
         timeout_secs=100, poll_interval_secs=1, now_fn=now_fn, sleep_fn=sleep_fn,
     )
     assert event == "DONE"
@@ -1085,7 +1168,7 @@ def test_wait_for_reviewer_ledger_polls_until_terminal_row_or_timeout(tmp_path):
 
 def test_wait_for_reviewer_ledger_times_out_without_terminal_row(tmp_path):
     local_root = str(tmp_path / "local")
-    since = integrator._utc_iso_z()
+    since_offset = integrator.reviewer_ledger_offset(local_root, "cursor-reviewer")
     clock = {"t": 0.0}
 
     def now_fn():
@@ -1095,7 +1178,7 @@ def test_wait_for_reviewer_ledger_times_out_without_terminal_row(tmp_path):
         clock["t"] += secs
 
     event = integrator.wait_for_reviewer_ledger(
-        local_root, "cursor-reviewer", since,
+        local_root, "cursor-reviewer", since_offset,
         timeout_secs=5, poll_interval_secs=2, now_fn=now_fn, sleep_fn=sleep_fn,
     )
     assert event is None
@@ -1152,6 +1235,119 @@ def test_default_ops_stage_activate_verify_screenshot_receive_placeholders(tmp_p
     assert shots == [str(main_checkout)]
 
 
+def test_default_ops_dispatch_reviewer_passes_file_and_data_dir_env(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    local_root = str(tmp_path / "local")
+    cfg = base_config(
+        tmp_path, roster_path, local_root=local_root,
+        reviewer_dispatch_cmd=["workforce", "dispatch", "{reviewer}"],
+    )
+    captured = {}
+
+    real_run = integrator._run
+
+    def spy_run(argv, cwd=None, input_text=None, env=None):
+        captured["argv"] = list(argv)
+        captured["env"] = env
+        return {"rc": 0, "output": ""}
+
+    import workforce.integrator as integrator_mod
+    integrator_mod._run = spy_run
+    try:
+        ops = integrator.default_ops(cfg)
+        ops["dispatch_reviewer"]("cursor-reviewer", "review this diff")
+    finally:
+        integrator_mod._run = real_run
+
+    assert "--file" in captured["argv"]
+    assert captured["argv"][captured["argv"].index("--file") + 1] == cfg["roster_path"]
+    assert captured["env"]["WORKFORCE_DATA_DIR"] == str(Path(local_root).parent)
+
+
+# --------------------------------------------------------------------------
+# wf-265 recovery 4 — sync_main_checkout must check the rc of fetch,
+# checkout and reset --hard, never trust a stale rev-parse HEAD
+# --------------------------------------------------------------------------
+
+
+def _git(args, cwd):
+    import subprocess
+    r = subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip()
+
+
+def _init_bare_remote_and_clone(tmp_path):
+    remote = tmp_path / "remote.git"
+    remote.mkdir()
+    _git(["init", "--bare"], cwd=str(remote))
+    clone = tmp_path / "main_checkout"
+    _git(["clone", str(remote), str(clone)], cwd=str(tmp_path))
+    _git(["config", "user.email", "t@example.com"], cwd=str(clone))
+    _git(["config", "user.name", "t"], cwd=str(clone))
+    (clone / "README.md").write_text("hi\n")
+    _git(["add", "."], cwd=str(clone))
+    _git(["commit", "-m", "init"], cwd=str(clone))
+    _git(["push", "-u", "origin", "HEAD:main"], cwd=str(clone))
+    return remote, clone
+
+
+def test_default_ops_sync_main_checkout_returns_sha_on_clean_sync(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    remote, clone = _init_bare_remote_and_clone(tmp_path)
+    cfg = base_config(tmp_path, roster_path, main_checkout=str(clone))
+    ops = integrator.default_ops(cfg)
+    result = ops["sync_main_checkout"](str(clone), "main")
+    assert result["rc"] == 0
+    assert result["sha"] == _git(["rev-parse", "HEAD"], cwd=str(clone))
+
+
+def test_default_ops_sync_main_checkout_returns_empty_sha_when_fetch_fails(tmp_path, monkeypatch):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    remote, clone = _init_bare_remote_and_clone(tmp_path)
+    cfg = base_config(tmp_path, roster_path, main_checkout=str(clone))
+
+    real_run = integrator._run
+
+    def spy_run(argv, cwd=None, input_text=None, env=None):
+        if list(argv[:2]) == ["git", "fetch"]:
+            return {"rc": 1, "output": "fetch failed"}
+        return real_run(argv, cwd=cwd, input_text=input_text, env=env)
+
+    import workforce.integrator as integrator_mod
+    integrator_mod._run = spy_run
+    try:
+        ops = integrator.default_ops(cfg)
+        result = ops["sync_main_checkout"](str(clone), "main")
+    finally:
+        integrator_mod._run = real_run
+    assert result["rc"] != 0
+    assert result["sha"] == ""
+
+
+def test_default_ops_sync_main_checkout_returns_empty_sha_when_reset_fails(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    remote, clone = _init_bare_remote_and_clone(tmp_path)
+    cfg = base_config(tmp_path, roster_path, main_checkout=str(clone))
+
+    real_run = integrator._run
+
+    def spy_run(argv, cwd=None, input_text=None, env=None):
+        if list(argv[:3]) == ["git", "reset", "--hard"]:
+            return {"rc": 1, "output": "reset failed"}
+        return real_run(argv, cwd=cwd, input_text=input_text, env=env)
+
+    import workforce.integrator as integrator_mod
+    integrator_mod._run = spy_run
+    try:
+        ops = integrator.default_ops(cfg)
+        result = ops["sync_main_checkout"](str(clone), "main")
+    finally:
+        integrator_mod._run = real_run
+    assert result["rc"] != 0
+    assert result["sha"] == ""
+
+
 # --------------------------------------------------------------------------
 # wf-265 recovery 3, finding 5 — dispatch_recovery passes --file roster_path
 # and WORKFORCE_DATA_DIR; checkout prefers the Workdir: line of the seat's
@@ -1187,17 +1383,32 @@ def test_default_ops_dispatch_recovery_passes_file_and_data_dir_env(tmp_path):
 
 def test_workdir_from_comments_prefers_latest_owner_claim():
     comments = [
-        {"body": "Intake: filed by you"},
-        {"body": "Owner: tester\nWorkdir: /old/checkout\nStart: x"},
-        {"body": "Parked: done"},
-        {"body": "Owner: tester\nWorkdir: /new/checkout\nStart: y"},
+        {"body": "Intake: filed by you", "author": "you"},
+        {"body": "Owner: tester\nWorkdir: /old/checkout\nStart: x", "author": "tester"},
+        {"body": "Parked: done", "author": "tester"},
+        {"body": "Owner: tester\nWorkdir: /new/checkout\nStart: y", "author": "tester"},
     ]
     assert integrator.workdir_from_comments(comments) == "/new/checkout"
+    assert integrator.workdir_from_comments(comments, seat="tester") == "/new/checkout"
 
 
 def test_workdir_from_comments_none_when_absent():
     assert integrator.workdir_from_comments([{"body": "Intake: filed by you"}]) is None
     assert integrator.workdir_from_comments(None) is None
+
+
+def test_workdir_from_comments_ignores_claim_not_authored_by_seat():
+    comments = [
+        {"body": "Owner: other-seat\nWorkdir: /spoofed/checkout\nStart: x", "author": "other-seat"},
+    ]
+    assert integrator.workdir_from_comments(comments, seat="tester") is None
+
+
+def test_workdir_from_comments_ignores_relative_path():
+    comments = [
+        {"body": "Owner: tester\nWorkdir: relative/checkout\nStart: x", "author": "tester"},
+    ]
+    assert integrator.workdir_from_comments(comments, seat="tester") is None
 
 
 def test_discover_candidates_uses_workdir_from_owner_comment_over_template(tmp_path):
@@ -1207,7 +1418,7 @@ def test_discover_candidates_uses_workdir_from_owner_comment_over_template(tmp_p
     tasks = [
         {
             "id": "wf-1", "labels": ["worker:tester"], "title": "one",
-            "comments": [{"body": "Owner: tester\nWorkdir: /real/checkout\nStart: x"}],
+            "comments": [{"body": "Owner: tester\nWorkdir: /real/checkout\nStart: x", "author": "tester"}],
         },
     ]
 

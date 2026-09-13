@@ -277,25 +277,40 @@ def _reviewer_ledger_path(local_root: str, reviewer: str) -> str:
     return os.path.join(local_root, "ledger", "%s.log" % reviewer)
 
 
-def latest_reviewer_terminal_event(local_root: str, reviewer: str, since: str) -> Optional[str]:
-    """The reviewer job's DONE/ERROR/STOP row at or after *since* (a ``_utc_iso_z`` string).
+def reviewer_ledger_offset(local_root: str, reviewer: str) -> int:
+    """The reviewer ledger's current byte size, or 0 if it does not exist yet.
 
-    ``since`` is compared as a string — safe because ``_utc_iso_z`` always
-    produces the same fixed-width, lexicographically-ordered format. ``None``
-    when no terminal row has landed yet (or the ledger predates *since*).
+    Captured immediately before dispatch so a terminal row from an earlier
+    run — even one stamped in the same second as the new dispatch — can
+    never satisfy the wait: only bytes appended after this offset count.
+    """
+    path = _reviewer_ledger_path(local_root, reviewer)
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def latest_reviewer_terminal_event(local_root: str, reviewer: str, since_offset: int) -> Optional[str]:
+    """The reviewer job's DONE/ERROR/STOP row appended after *since_offset* bytes.
+
+    ``since_offset`` must be the ledger's size at dispatch time (from
+    :func:`reviewer_ledger_offset`) — rows entirely within the first
+    *since_offset* bytes are pre-existing and never satisfy the wait, even
+    when their timestamp equals or exceeds the dispatch time. ``None`` when
+    no terminal row has landed in the appended tail yet.
     """
     path = _reviewer_ledger_path(local_root, reviewer)
     try:
         with open(path, "r", encoding="utf-8") as fh:
-            lines = fh.readlines()
+            fh.seek(since_offset)
+            tail = fh.read()
     except OSError:
         return None
-    for line in reversed(lines):
+    for line in reversed(tail.splitlines()):
         parts = line.strip().split(" ", 2)
         if len(parts) < 2 or parts[1] not in ("DONE", "ERROR", "STOP"):
             continue
-        if parts[0] < since:
-            return None
         return parts[1]
     return None
 
@@ -303,7 +318,7 @@ def latest_reviewer_terminal_event(local_root: str, reviewer: str, since: str) -
 def wait_for_reviewer_ledger(
     local_root: str,
     reviewer: str,
-    since: str,
+    since_offset: int,
     *,
     timeout_secs: int = 1800,
     poll_interval_secs: int = 5,
@@ -318,7 +333,7 @@ def wait_for_reviewer_ledger(
     """
     deadline = now_fn() + timeout_secs
     while True:
-        event = latest_reviewer_terminal_event(local_root, reviewer, since)
+        event = latest_reviewer_terminal_event(local_root, reviewer, since_offset)
         if event is not None:
             return event
         if now_fn() >= deadline:
@@ -329,24 +344,68 @@ def wait_for_reviewer_ledger(
 _WORKDIR_MARKER_RE = re.compile(r"(?m)^Workdir:\s*(\S+)")
 
 
-def workdir_from_comments(comments: Optional[Sequence[Dict[str, Any]]]) -> Optional[str]:
-    """The latest ``Owner:`` claim comment's ``Workdir:`` line, or ``None``.
+def workdir_from_comments(
+    comments: Optional[Sequence[Dict[str, Any]]], seat: Optional[str] = None,
+) -> Optional[str]:
+    """The seat's latest ``Owner:`` claim comment's ``Workdir:`` line, or ``None``.
 
     Mirrors :func:`workforce._utils.latest_owner_id`'s "latest wins" reading
     of PROCESS §5 claim markers, scoped to the ``Workdir:`` line a claim
-    records alongside ``Owner:``.
+    records alongside ``Owner:``. Only honours a claim comment authored by
+    *seat* itself (when given) — another seat's stale or spoofed Owner
+    comment on the same order must never redirect this seat's checkout — and
+    only an absolute path, never a relative one that could resolve outside
+    the intended workspace.
     """
     workdir: Optional[str] = None
     for c in comments or []:
         if not isinstance(c, dict):
+            continue
+        if seat is not None and str(c.get("author") or "") != seat:
             continue
         body = str(c.get("body") or "")
         if not body.lstrip().startswith("Owner:"):
             continue
         m = _WORKDIR_MARKER_RE.search(body)
         if m:
-            workdir = m.group(1).strip()
+            candidate = m.group(1).strip()
+            if os.path.isabs(candidate):
+                workdir = candidate
     return workdir
+
+
+def _read_stable_file(
+    path: str,
+    *,
+    timeout_secs: int = 30,
+    poll_interval_secs: float = 1.0,
+    now_fn: Callable[[], float] = time.time,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> Optional[str]:
+    """Read *path* once its size stops changing across two consecutive reads.
+
+    A reviewer job's writer may still be flushing its output file when the
+    ledger's terminal row lands; reading a half-written file would parse
+    truncated findings as clean. Returns ``None`` if the file never becomes
+    readable/stable within *timeout_secs*.
+    """
+    deadline = now_fn() + timeout_secs
+    last_size = None
+    while True:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = None
+        if size is not None and size == last_size:
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    return fh.read()
+            except OSError:
+                return None
+        last_size = size
+        if now_fn() >= deadline:
+            return None
+        sleep_fn(poll_interval_secs)
 
 
 def substitute_placeholders(argv: Sequence[str], **values: str) -> List[str]:
@@ -927,7 +986,7 @@ def discover_candidates(
             "worker": seat,
             "provider": provider,
             "title": str(t.get("title") or ""),
-            "checkout_override": workdir_from_comments(t.get("comments")),
+            "checkout_override": workdir_from_comments(t.get("comments"), seat=seat),
         })
     candidates.sort(key=lambda c: c["task_id"])
     return candidates[:headroom] if headroom < len(candidates) else candidates
@@ -962,6 +1021,13 @@ def _branch_name(config: Dict[str, Any], order: Dict[str, Any]) -> str:
     return config["branch_template"].format(worker=order["worker"], task_id=order["task_id"])
 
 
+# Matches a MAJOR.MINOR.PATCH version with an optional "+<tag>.<n>" local
+# suffix (e.g. "0.1.9" or "0.1.9+consolidation.13") — the same shape
+# bump_version's "local-suffix" rule produces, so a file this job just wrote
+# is always readable on the next pass.
+_VERSION_LINE_VALUE_RE = r"[0-9]+\.[0-9]+\.[0-9]+(?:\+[^\"'\s]+\.[0-9]+)?"
+
+
 def _read_version(config: Dict[str, Any], checkout: str) -> str:
     path = os.path.join(checkout, config["version_file"])
     with open(path, "r", encoding="utf-8") as fh:
@@ -971,7 +1037,7 @@ def _read_version(config: Dict[str, Any], checkout: str) -> str:
                 data = data[key]
             return str(data)
         text = fh.read()
-    m = re.search(r'"?version"?\s*[:=]\s*"([0-9]+\.[0-9]+\.[0-9]+)"', text)
+    m = re.search(r'"?version"?\s*[:=]\s*"(%s)"' % _VERSION_LINE_VALUE_RE, text)
     if not m:
         raise IntegratorError("could not find a version in %s" % path)
     return m.group(1)
@@ -990,12 +1056,14 @@ def _write_version(config: Dict[str, Any], checkout: str, new_version: str) -> N
         node[parts[-1]] = new_version
         raw = json.dumps(data, indent=2) + "\n"
     else:
-        raw = re.sub(
-            r'("?version"?\s*[:=]\s*")[0-9]+\.[0-9]+\.[0-9]+(")',
-            r"\g<1>%s\g<2>" % new_version,
+        raw, count = re.subn(
+            r'(?m)^(.*?"?version"?\s*[:=]\s*")%s(".*)$' % _VERSION_LINE_VALUE_RE,
+            lambda mo: mo.group(1) + new_version + mo.group(2),
             raw,
             count=1,
         )
+        if count != 1:
+            raise IntegratorError("could not find a version line to replace in %s" % path)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(raw)
 
@@ -1060,11 +1128,15 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
         if not config.get("reviewer_dispatch_cmd"):
             raise IntegratorError("reviewer_dispatch_cmd not configured")
         argv = [a.replace("{reviewer}", reviewer) for a in config["reviewer_dispatch_cmd"]]
+        env = dict(os.environ)
+        env["WORKFORCE_DATA_DIR"] = str(Path(config["local_root"]).parent)
+        if "--file" not in argv:
+            argv = argv + ["--file", config["roster_path"]]
 
         prompt_tpl = config.get("reviewer_prompt_path")
         output_tpl = config.get("reviewer_output_path")
         if not (prompt_tpl and output_tpl):
-            r = _run(argv, input_text=prompt)
+            r = _run(argv, input_text=prompt, env=env)
             return {"ok": r["rc"] == 0, "output": r["output"]}
 
         prompt_path = prompt_tpl.format(reviewer=reviewer)
@@ -1081,18 +1153,17 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
             os.path.join(copy_dir, "%s-%s.md" % (reviewer, _utc_iso_z().replace(":", ""))),
         )
 
-        since = _utc_iso_z()
-        r = _run(argv)
+        since_offset = reviewer_ledger_offset(config["local_root"], reviewer)
+        r = _run(argv, env=env)
         if r["rc"] != 0:
             return {"ok": False, "output": r["output"]}
-        event = wait_for_reviewer_ledger(config["local_root"], reviewer, since)
+        event = wait_for_reviewer_ledger(config["local_root"], reviewer, since_offset)
         if event != "DONE":
             return {"ok": False, "output": "reviewer ledger terminal event: %s" % (event or "timeout")}
-        try:
-            with open(output_path, "r", encoding="utf-8") as fh:
-                return {"ok": True, "output": fh.read()}
-        except OSError as exc:
-            return {"ok": False, "output": "could not read reviewer output %s: %s" % (output_path, exc)}
+        content = _read_stable_file(output_path)
+        if content is None:
+            return {"ok": False, "output": "could not read reviewer output %s" % output_path}
+        return {"ok": True, "output": content}
 
     def merge_pr(checkout: str, pr_number: Any) -> Dict[str, Any]:
         return _run(
@@ -1111,12 +1182,24 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
         return r["output"].strip() if r["rc"] == 0 else ""
 
     def sync_main_checkout(main_checkout: str, branch: str) -> Dict[str, Any]:
-        """Fetch+reset the configured host checkout to ``origin/<branch>``."""
-        _run(["git", "fetch", "origin", branch], cwd=main_checkout)
-        _run(["git", "checkout", branch], cwd=main_checkout)
+        """Fetch+reset the configured host checkout to ``origin/<branch>``.
+
+        Any of fetch/checkout/reset failing (stale network, dirty tree,
+        unknown ref) means the checkout cannot be trusted to build a version
+        bump on — return an empty sha so the caller stops with
+        ``main_unverified`` instead of bumping from a stale base.
+        """
+        fetch = _run(["git", "fetch", "origin", branch], cwd=main_checkout)
+        if fetch["rc"] != 0:
+            return {"rc": fetch["rc"], "sha": "", "output": fetch["output"]}
+        checkout = _run(["git", "checkout", branch], cwd=main_checkout)
+        if checkout["rc"] != 0:
+            return {"rc": checkout["rc"], "sha": "", "output": checkout["output"]}
         reset = _run(["git", "reset", "--hard", "origin/%s" % branch], cwd=main_checkout)
+        if reset["rc"] != 0:
+            return {"rc": reset["rc"], "sha": "", "output": reset["output"]}
         sha = _run(["git", "rev-parse", "HEAD"], cwd=main_checkout)
-        return {"rc": reset["rc"], "sha": sha["output"].strip() if sha["rc"] == 0 else ""}
+        return {"rc": sha["rc"], "sha": sha["output"].strip() if sha["rc"] == 0 else ""}
 
     def commit_and_push_version(main_checkout: str, branch: str, new_version: str) -> Dict[str, Any]:
         _run(["git", "add", config["version_file"]], cwd=main_checkout)
