@@ -201,6 +201,35 @@ def prepare(config, fetch=_fetch):
         raise
 
 
+def exclude_from_git(checkout, names):
+    """Append names to the checkout worktree's git info/exclude, idempotently.
+
+    Planted vendor identity files (``.cursor/``, ``.grok/``) must never be
+    picked up by the seat's own ``git add``. A dispatched checkout is a git
+    worktree, so ``<checkout>/.git`` is a file pointing at the real gitdir
+    under ``<repo>/.git/worktrees/<name>``; resolve that before writing.
+    """
+    checkout = Path(checkout)
+    dotgit = checkout / ".git"
+    if dotgit.is_dir():
+        git_dir = dotgit
+    elif dotgit.is_file():
+        line = dotgit.read_text().strip()
+        _, _, target = line.partition(":")
+        target = Path(target.strip())
+        git_dir = target if target.is_absolute() else (checkout / target).resolve()
+    else:
+        return
+    exclude_path = git_dir / "info" / "exclude"
+    exclude_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = set(exclude_path.read_text().splitlines()) if exclude_path.exists() else set()
+    missing = [name for name in names if name not in existing]
+    if missing:
+        with exclude_path.open("a") as handle:
+            for name in missing:
+                handle.write(name + "\n")
+
+
 def _find_worktree(repo, checkout, branch):
     """Return True if checkout is a registered worktree of repo on branch."""
     listing = _git(repo, "worktree", "list", "--porcelain")

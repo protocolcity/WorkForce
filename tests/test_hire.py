@@ -1500,3 +1500,97 @@ def test_generate_seat_folder_claude_launch_py_has_no_provider_planting(tmp_path
     seat_dir = tmp_path / "local" / "worker-config" / "demo"
     launch_body = (seat_dir / "launch.py").read_text()
     assert ".cursor" not in launch_body and ".grok" not in launch_body
+
+
+# --- wf-261 review findings: recovery planting, no-overwrite, git-exclude ---
+
+
+def _exec_launch_py(source, seat_dir, argv, monkeypatch, **patched):
+    """Exec a generated launch.py body as __main__, with task_runner patched.
+
+    Runs the real generated source (not a reimplementation) so these tests
+    catch the same regressions review found: planting skipped on recovery,
+    and an existing task config overwritten. ``__file__`` is set to the seat
+    dir's own launch.py so ``h=Path(__file__).parent`` resolves like a real
+    dispatch.
+    """
+    from workforce import task_runner as task_runner_mod
+    for name, value in patched.items():
+        monkeypatch.setattr(task_runner_mod, name, value)
+    monkeypatch.setattr(sys, "argv", ["launch.py"] + argv)
+    globs = {"__name__": "__main__", "__file__": str(seat_dir / "launch.py")}
+    with pytest.raises(SystemExit):
+        exec(compile(source, "<launch.py>", "exec"), globs)
+
+
+def test_launch_py_cursor_plants_identity_on_recovery_path(tmp_path, monkeypatch):
+    seat_dir = tmp_path / "seat"; seat_dir.mkdir()
+    (seat_dir / "mcp.json").write_text('{"mcpServers": {}}')
+    (seat_dir / "permissions.json").write_text('{"permissions": {}}')
+    checkout = tmp_path / "checkout"; checkout.mkdir()
+    (checkout / ".git").mkdir()
+    receipt = tmp_path / "preparation.json"
+    receipt.write_text(json.dumps({"checkout": str(checkout)}))
+
+    def fail_prepare(*a, **k):
+        raise AssertionError("prepare() must not run on the recovery path")
+
+    _exec_launch_py(
+        hire_mod.seat_templates.LAUNCH_PY_CURSOR, seat_dir,
+        ["--config", str(seat_dir / "runner.json"), "--recover-receipt", str(receipt),
+         "--recovery-reason", "provider crashed"],
+        monkeypatch, main=lambda argv: 0, prepare=fail_prepare,
+    )
+
+    assert (checkout / ".cursor" / "mcp.json").read_text() == '{"mcpServers": {}}'
+    assert (checkout / ".cursor" / "cli.json").read_text() == '{"permissions": {}}'
+    exclude = (checkout / ".git" / "info" / "exclude").read_text()
+    assert ".cursor/" in exclude
+
+
+def test_launch_py_grok_never_overwrites_existing_checkout_config(tmp_path, monkeypatch):
+    seat_dir = tmp_path / "seat"; seat_dir.mkdir()
+    (seat_dir / ".grok").mkdir()
+    (seat_dir / ".grok" / "config.toml").write_text("# seat config\n")
+    checkout = tmp_path / "checkout"; checkout.mkdir()
+    (checkout / ".git").mkdir()
+    (checkout / ".grok").mkdir()
+    (checkout / ".grok" / "config.toml").write_text("# task-provided config, keep me\n")
+    receipt = tmp_path / "preparation.json"
+    receipt.write_text(json.dumps({"checkout": str(checkout)}))
+
+    from workforce import task_runner as task_runner_mod
+    globs = {"__name__": "__main__", "__file__": str(seat_dir / "launch.py")}
+    monkeypatch.setattr(task_runner_mod, "main", lambda argv: 0)
+    monkeypatch.setattr(sys, "argv",
+                         ["launch.py", "--config", str(seat_dir / "runner.json"),
+                          "--recover-receipt", str(receipt), "--recovery-reason", "provider crashed"])
+    with pytest.raises(SystemExit):
+        exec(compile(hire_mod.seat_templates.LAUNCH_PY_GROK, "<launch.py>", "exec"), globs)
+
+    assert (checkout / ".grok" / "config.toml").read_text() == "# task-provided config, keep me\n"
+    exclude = (checkout / ".git" / "info" / "exclude").read_text()
+    assert ".grok/" in exclude
+
+
+def test_launch_py_grok_plants_config_on_recovery_when_absent(tmp_path, monkeypatch):
+    seat_dir = tmp_path / "seat"; seat_dir.mkdir()
+    (seat_dir / ".grok").mkdir()
+    (seat_dir / ".grok" / "config.toml").write_text("# seat config\n")
+    checkout = tmp_path / "checkout"; checkout.mkdir()
+    (checkout / ".git").mkdir()
+    receipt = tmp_path / "preparation.json"
+    receipt.write_text(json.dumps({"checkout": str(checkout)}))
+
+    from workforce import task_runner as task_runner_mod
+    globs = {"__name__": "__main__", "__file__": str(seat_dir / "launch.py")}
+    monkeypatch.setattr(task_runner_mod, "main", lambda argv: 0)
+    monkeypatch.setattr(sys, "argv",
+                         ["launch.py", "--config", str(seat_dir / "runner.json"),
+                          "--recover-receipt", str(receipt), "--recovery-reason", "provider crashed"])
+    with pytest.raises(SystemExit):
+        exec(compile(hire_mod.seat_templates.LAUNCH_PY_GROK, "<launch.py>", "exec"), globs)
+
+    assert (checkout / ".grok" / "config.toml").read_text() == "# seat config\n"
+    exclude = (checkout / ".git" / "info" / "exclude").read_text()
+    assert ".grok/" in exclude
