@@ -148,3 +148,9 @@ monitoring flag must be resolved through the explicit preserved-reservation
 recovery protocol above, not a fresh dispatch. The CLI exits non-zero on a
 provider failure or any failed dispatch; it never reports success just
 because the process reached exit.
+
+`GET /api/supervisor` on the board port exposes read-only rows from those
+evidence files (`passes`, newest-first, optional `?limit=`). It is a record
+of past coordination passes only — not a running supervisor, not liveness,
+and not a roster worker. `/api/report` includes a matching `supervisor`
+summary for the same report window.

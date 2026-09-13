@@ -9,6 +9,7 @@ from typing import Dict, List, Optional
 from ...daemon import heartbeat_status, read_heartbeat
 from ..._utils import _parse_iso_z, _utc_iso_z, _utcnow
 from ...ledger import Ledger, open_candidates, parse_shifts
+from ...reports import supervisor_report_section
 from ...roster import Worker
 from ...schedule import maybe_cron, next_fire_utc
 from ... import runtimes as runtimes_mod
@@ -505,6 +506,7 @@ def report_model(local_root: str, days: Optional[int] = None) -> Dict[str, objec
         "desk": desk,
         "capacity": sorted(vendors.values(),
                            key=lambda v: -int(v["busy_secs"])),  # type: ignore[arg-type]
+        "supervisor": supervisor_report_section(local_root, days),
     }
 
 

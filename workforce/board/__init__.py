@@ -49,6 +49,8 @@ from ..ledger import Ledger, parse_shifts  # noqa: F401
 from ..roster import RosterError  # noqa: F401
 from ..schedule import maybe_cron, next_fire_utc  # noqa: F401
 
+from ..reports import supervisor_api_model  # noqa: F401
+
 from ..api.roster import (  # noqa: F401
     DEFAULT_PORT, CITYHALL, _BRAND_TITLE,
     generation_token, scene_model, scene_tape, report_model, worker_model,
@@ -68,6 +70,7 @@ from .paths import (  # noqa: F401
     SUITE_URL,
     _days_param,
     _html_escape_requested,
+    _limit_param,
     _map_roster_url,
     _out_path,
     _refuse_html_escape,
@@ -103,6 +106,7 @@ for _name in (
     "_out_path",
     "_safe_worker_name",
     "_days_param",
+    "_limit_param",
     "make_server",
     "serve",
 ):
