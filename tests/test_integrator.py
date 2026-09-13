@@ -319,6 +319,7 @@ class FakeOps:
         self.review_output = overrides.get("review_output")
         self.review_retry = overrides.get("review_retry", False)
         self.review_empty = overrides.get("review_empty", False)
+        self.review_stale = overrides.get("review_stale", False)
         self.ci_status = overrides.get("ci_status", "success")
         self.checkout_clean = overrides.get("checkout_clean_val", True)
         self.merge_rc = overrides.get("merge_rc", 0)
@@ -373,6 +374,8 @@ class FakeOps:
             return {"ok": False, "retry": True, "output": "reviewer dispatch skipped (lock held)"}
         if self.review_empty:
             return {"ok": False, "empty": True, "output": "reviewer output was empty after DONE"}
+        if self.review_stale:
+            return {"ok": False, "stale": True, "output": "reviewer output was unchanged after DONE (stale)"}
         output = self.review_output
         if output is None:
             output = json.dumps({"findings": self.review_findings})
@@ -651,6 +654,17 @@ def test_run_one_review_empty_stops_with_blocked_comment_and_never_merges(tmp_pa
     ops = FakeOps(tmp_path, review_empty=True)
     result = integrator.run_one(make_order(), cfg, ops.as_dict())
     assert result["outcome"] == "review_empty"
+    assert "post_comment" in ops.calls
+    assert "merge_pr" not in ops.calls
+    assert "close_order" not in ops.calls
+
+
+def test_run_one_review_stale_stops_with_blocked_comment_and_never_merges(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, review_stale=True)
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "review_stale"
     assert "post_comment" in ops.calls
     assert "merge_pr" not in ops.calls
     assert "close_order" not in ops.calls
@@ -1057,6 +1071,26 @@ def test_run_one_stops_main_moved_when_push_races_origin(tmp_path):
 # --------------------------------------------------------------------------
 
 
+# A reviewer_dispatch_cmd for tests that behaves like the real engine: reads
+# the prompt file this dispatch just wrote, records its sha256 (truncated to
+# 16 hex chars, matching engine._sha256) on its own START row, optionally
+# writes findings to the output file, then appends DONE.
+_FAKE_REVIEWER_SCRIPT = (
+    "import hashlib, datetime, sys\n"
+    "prompt_path, ledger_path, output_path, content = sys.argv[1:5]\n"
+    "t = open(prompt_path, encoding='utf-8').read()\n"
+    "h = hashlib.sha256(t.encode('utf-8')).hexdigest()[:16]\n"
+    "ts = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')\n"
+    "open(ledger_path, 'a').write(ts + ' START prompt_sha=' + h + '\\n' + ts + ' DONE\\n')\n"
+    "if content != '__WF265_NO_WRITE__':\n"
+    "    open(output_path, 'w').write(content)\n"
+)
+
+
+def _fake_reviewer_dispatch_cmd(prompt_path, ledger_path, output_path, content="__WF265_NO_WRITE__"):
+    return [sys.executable, "-c", _FAKE_REVIEWER_SCRIPT, prompt_path, ledger_path, output_path, content]
+
+
 def test_default_ops_dispatch_reviewer_writes_prompt_file_and_reads_output_file(tmp_path, monkeypatch):
     roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
     run_dir = tmp_path / "run"
@@ -1070,23 +1104,29 @@ def test_default_ops_dispatch_reviewer_writes_prompt_file_and_reads_output_file(
     # though it shares the same terminal-event shape as the real one below.
     with open(ledger_path, "w") as fh:
         fh.write("2020-01-01T00:00:00Z DONE\n")
+    prompt_path = str(run_dir / "cursor-reviewer.prompt.md")
+    output_path = str(run_dir / "cursor-reviewer.out")
     cfg = base_config(
         tmp_path, roster_path,
         local_root=local_root,
-        # The real reviewer job appends its own terminal row to its ledger;
-        # simulate that here so the dispatch's offset-based wait has a row
-        # appended *after* it to find.
-        reviewer_dispatch_cmd=["/bin/sh", "-c", "printf '%s START\\n%s DONE\\n' \"$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)\" \"$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)\" >> " + ledger_path],
-        reviewer_prompt_paths={"cursor-reviewer": str(run_dir / "cursor-reviewer.prompt.md")},
-        reviewer_output_paths={"cursor-reviewer": str(run_dir / "cursor-reviewer.out")},
+        # The real reviewer job appends its own terminal row to its ledger
+        # and writes the review to its output file; simulate both here so
+        # the dispatch's offset-based wait and stale-output guard both see
+        # fresh, matching evidence.
+        reviewer_dispatch_cmd=_fake_reviewer_dispatch_cmd(
+            prompt_path, ledger_path, output_path, '{"findings": []}',
+        ),
+        reviewer_prompt_paths={"cursor-reviewer": prompt_path},
+        reviewer_output_paths={"cursor-reviewer": output_path},
     )
-    (run_dir / "cursor-reviewer.out").write_text('{"findings": []}')
 
     ops = integrator.default_ops(cfg)
     result = ops["dispatch_reviewer"]("cursor-reviewer", "review this diff")
     assert result["ok"] is True
     assert result["output"] == '{"findings": []}'
-    assert (run_dir / "cursor-reviewer.prompt.md").read_text() == "review this diff"
+    written_prompt = (run_dir / "cursor-reviewer.prompt.md").read_text()
+    assert written_prompt.startswith("<!-- integrator-dispatch:")
+    assert written_prompt.endswith("review this diff")
     copy_dir = os.path.join(local_root, "reports", "integrator", cfg["project"], "reviewer-prompts")
     assert os.path.isdir(copy_dir) and os.listdir(copy_dir)
 
@@ -1194,22 +1234,93 @@ def test_default_ops_dispatch_reviewer_fails_review_empty_on_blank_output(tmp_pa
     ledger_dir = os.path.join(local_root, "ledger")
     os.makedirs(ledger_dir, exist_ok=True)
     ledger_path = os.path.join(ledger_dir, "cursor-reviewer.log")
+    prompt_path = str(run_dir / "cursor-reviewer.prompt.md")
+    output_path = str(run_dir / "cursor-reviewer.out")
     cfg = base_config(
         tmp_path, roster_path,
         local_root=local_root,
-        reviewer_dispatch_cmd=[
-            "/bin/sh", "-c",
-            "printf '%s START\\n%s DONE\\n' \"$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)\" \"$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)\" >> " + ledger_path,
-        ],
-        reviewer_prompt_paths={"cursor-reviewer": str(run_dir / "cursor-reviewer.prompt.md")},
-        reviewer_output_paths={"cursor-reviewer": str(run_dir / "cursor-reviewer.out")},
+        reviewer_dispatch_cmd=_fake_reviewer_dispatch_cmd(
+            prompt_path, ledger_path, output_path, "   \n  ",
+        ),
+        reviewer_prompt_paths={"cursor-reviewer": prompt_path},
+        reviewer_output_paths={"cursor-reviewer": output_path},
     )
-    (run_dir / "cursor-reviewer.out").write_text("   \n  ")
 
     ops = integrator.default_ops(cfg)
     result = ops["dispatch_reviewer"]("cursor-reviewer", "review this diff")
     assert result["ok"] is False
     assert result["empty"] is True
+
+
+# --------------------------------------------------------------------------
+# wf-265 recovery 7, finding 3 — an output file untouched after DONE (still
+# carrying whatever an earlier, unrelated dispatch left in it) fails as
+# review_stale rather than being read as this dispatch's review.
+# --------------------------------------------------------------------------
+
+
+def test_default_ops_dispatch_reviewer_fails_review_stale_when_output_unchanged_after_done(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    local_root = str(tmp_path / "local")
+    ledger_dir = os.path.join(local_root, "ledger")
+    os.makedirs(ledger_dir, exist_ok=True)
+    ledger_path = os.path.join(ledger_dir, "cursor-reviewer.log")
+    prompt_path = str(run_dir / "cursor-reviewer.prompt.md")
+    output_path = str(run_dir / "cursor-reviewer.out")
+    (run_dir / "cursor-reviewer.out").write_text("stale findings from an earlier dispatch")
+    cfg = base_config(
+        tmp_path, roster_path,
+        local_root=local_root,
+        # This dispatch's own START/DONE land correctly (prompt_sha
+        # matches), but the reviewer never rewrote its output file — the
+        # leftover content from an earlier, unrelated dispatch must never
+        # be read as this dispatch's review.
+        reviewer_dispatch_cmd=_fake_reviewer_dispatch_cmd(prompt_path, ledger_path, output_path),
+        reviewer_prompt_paths={"cursor-reviewer": prompt_path},
+        reviewer_output_paths={"cursor-reviewer": output_path},
+    )
+
+    ops = integrator.default_ops(cfg)
+    result = ops["dispatch_reviewer"]("cursor-reviewer", "review this diff")
+    assert result["ok"] is False
+    assert result["stale"] is True
+
+
+def test_default_ops_dispatch_reviewer_accepts_output_when_size_unchanged_but_mtime_changed(tmp_path):
+    # Same-length findings text as the stale leftover is not itself grounds
+    # for review_stale as long as the file was genuinely rewritten (mtime
+    # moved forward) — only "untouched" output is stale.
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    local_root = str(tmp_path / "local")
+    ledger_dir = os.path.join(local_root, "ledger")
+    os.makedirs(ledger_dir, exist_ok=True)
+    ledger_path = os.path.join(ledger_dir, "cursor-reviewer.log")
+    prompt_path = str(run_dir / "cursor-reviewer.prompt.md")
+    output_path = str(run_dir / "cursor-reviewer.out")
+    stale_text = "old findings same length"
+    fresh_text = "new findings same length"
+    assert len(stale_text) == len(fresh_text)
+    (run_dir / "cursor-reviewer.out").write_text(stale_text)
+    old_mtime = os.path.getmtime(output_path) - 5
+    os.utime(output_path, (old_mtime, old_mtime))
+    cfg = base_config(
+        tmp_path, roster_path,
+        local_root=local_root,
+        reviewer_dispatch_cmd=_fake_reviewer_dispatch_cmd(
+            prompt_path, ledger_path, output_path, fresh_text,
+        ),
+        reviewer_prompt_paths={"cursor-reviewer": prompt_path},
+        reviewer_output_paths={"cursor-reviewer": output_path},
+    )
+
+    ops = integrator.default_ops(cfg)
+    result = ops["dispatch_reviewer"]("cursor-reviewer", "review this diff")
+    assert result["ok"] is True
+    assert result["output"] == fresh_text
 
 
 def test_parse_reviewer_findings_empty_string_is_no_findings():
@@ -1347,6 +1458,60 @@ def test_latest_reviewer_terminal_event_skip_without_start_is_retry_later(tmp_pa
     with open(ledger_path, "w") as fh:
         fh.write("%s SKIP reason=lock-held\n" % integrator._utc_iso_z())
     assert integrator.latest_reviewer_terminal_event(local_root, "cursor-reviewer", since_offset) == "SKIP"
+
+
+def test_latest_reviewer_terminal_event_skip_wins_over_other_shifts_done(tmp_path):
+    # wf-265 recovery 7, finding 1 — START(A) -> SKIP(B) -> DONE(A), all
+    # after B's dispatch offset: B's own dispatch never started (it hit the
+    # reviewer's lock, held by A's already-running shift) and must be
+    # reported as SKIP (retry later), never as DONE just because *some*
+    # START and DONE rows both landed in the post-offset tail.
+    local_root = str(tmp_path / "local")
+    ledger_dir = os.path.join(local_root, "ledger")
+    os.makedirs(ledger_dir, exist_ok=True)
+    ledger_path = os.path.join(ledger_dir, "cursor-reviewer.log")
+    since_offset = integrator.reviewer_ledger_offset(local_root, "cursor-reviewer")
+    with open(ledger_path, "w") as fh:
+        fh.write("%s START prompt_sha=aaaaaaaaaaaaaaaa\n" % integrator._utc_iso_z())
+        fh.write("%s SKIP reason=lock-held\n" % integrator._utc_iso_z())
+        fh.write("%s DONE\n" % integrator._utc_iso_z())
+    assert integrator.latest_reviewer_terminal_event(
+        local_root, "cursor-reviewer", since_offset, expected_prompt_sha="bbbbbbbbbbbbbbbb",
+    ) == "SKIP"
+
+
+def test_latest_reviewer_terminal_event_requires_matching_prompt_sha_for_done(tmp_path):
+    # A START row for a *different* dispatch's prompt (a concurrently
+    # running shift that started before this dispatch and finishes after
+    # its offset) must never let that shift's DONE satisfy this dispatch's
+    # wait, even with no SKIP anywhere in the tail.
+    local_root = str(tmp_path / "local")
+    ledger_dir = os.path.join(local_root, "ledger")
+    os.makedirs(ledger_dir, exist_ok=True)
+    ledger_path = os.path.join(ledger_dir, "cursor-reviewer.log")
+    since_offset = integrator.reviewer_ledger_offset(local_root, "cursor-reviewer")
+    with open(ledger_path, "w") as fh:
+        fh.write("%s START prompt_sha=aaaaaaaaaaaaaaaa\n" % integrator._utc_iso_z())
+        fh.write("%s DONE\n" % integrator._utc_iso_z())
+    assert integrator.latest_reviewer_terminal_event(
+        local_root, "cursor-reviewer", since_offset, expected_prompt_sha="bbbbbbbbbbbbbbbb",
+    ) is None
+
+
+def test_latest_reviewer_terminal_event_accepts_done_when_prompt_sha_matches(tmp_path):
+    local_root = str(tmp_path / "local")
+    ledger_dir = os.path.join(local_root, "ledger")
+    os.makedirs(ledger_dir, exist_ok=True)
+    ledger_path = os.path.join(ledger_dir, "cursor-reviewer.log")
+    since_offset = integrator.reviewer_ledger_offset(local_root, "cursor-reviewer")
+    with open(ledger_path, "w") as fh:
+        fh.write("%s START prompt_sha=othershift0000000\n" % integrator._utc_iso_z())
+        fh.write("%s DONE\n" % integrator._utc_iso_z())
+        fh.write("%s START prompt_sha=aaaaaaaaaaaaaaaa\n" % integrator._utc_iso_z())
+        fh.write("%s DONE\n" % integrator._utc_iso_z())
+    assert integrator.latest_reviewer_terminal_event(
+        local_root, "cursor-reviewer", since_offset, expected_prompt_sha="aaaaaaaaaaaaaaaa",
+    ) == "DONE"
 
 
 def test_wait_for_reviewer_ledger_polls_until_terminal_row_or_timeout(tmp_path):
@@ -1680,15 +1845,82 @@ def test_workdir_from_comments_rejects_task_id_suffix_when_directory_missing():
     ) is None
 
 
-def test_workdir_from_comments_accepts_path_matching_template_expansion():
+def test_workdir_from_comments_accepts_path_matching_template_expansion(tmp_path):
+    # The template arm must be branch-verified exactly like the suffix arm
+    # (wf-265 recovery 7, finding 2) — a real worktree on the expected
+    # branch at the exact template path is accepted.
+    workspace_root = tmp_path / "root"
+    checkout = workspace_root / "local" / "task-runs" / "tester" / "wf-265" / "checkout"
+    checkout.mkdir(parents=True)
+    _git(["init", "-q"], str(checkout))
+    _git(["checkout", "-q", "-b", "workforce/task/tester/wf-265"], str(checkout))
     comments = [
-        {"body": "Owner: tester\nWorkdir: /root/local/task-runs/tester/wf-265/checkout\nStart: x", "author": "tester"},
+        {"body": "Owner: tester\nWorkdir: %s\nStart: x" % checkout, "author": "tester"},
     ]
     assert integrator.workdir_from_comments(
         comments, seat="tester", task_id="wf-265",
         checkout_template="local/task-runs/{worker}/{task_id}/checkout",
-        workspace_root="/root",
-    ) == "/root/local/task-runs/tester/wf-265/checkout"
+        workspace_root=str(workspace_root),
+        branch_template="workforce/task/{worker}/{task_id}",
+    ) == str(checkout)
+
+
+def test_workdir_from_comments_rejects_template_expansion_on_repointed_branch(tmp_path):
+    # A template-expansion path that exists as a git worktree but is
+    # repointed to the wrong branch (e.g. reused after a prior checkout was
+    # torn down and rebuilt elsewhere) must not be trusted just because it
+    # matches the template exactly.
+    workspace_root = tmp_path / "root"
+    checkout = workspace_root / "local" / "task-runs" / "tester" / "wf-265" / "checkout"
+    checkout.mkdir(parents=True)
+    _git(["init", "-q"], str(checkout))
+    _git(["checkout", "-q", "-b", "some-other-branch"], str(checkout))
+    comments = [
+        {"body": "Owner: tester\nWorkdir: %s\nStart: x" % checkout, "author": "tester"},
+    ]
+    assert integrator.workdir_from_comments(
+        comments, seat="tester", task_id="wf-265",
+        checkout_template="local/task-runs/{worker}/{task_id}/checkout",
+        workspace_root=str(workspace_root),
+        branch_template="workforce/task/{worker}/{task_id}",
+    ) is None
+
+
+def test_workdir_from_comments_rejects_template_expansion_when_detached(tmp_path):
+    workspace_root = tmp_path / "root"
+    checkout = workspace_root / "local" / "task-runs" / "tester" / "wf-265" / "checkout"
+    checkout.mkdir(parents=True)
+    _git(["init", "-q"], str(checkout))
+    _git(["commit", "--allow-empty", "-q", "-m", "x"], str(checkout))
+    sha = _git(["rev-parse", "HEAD"], str(checkout))
+    _git(["checkout", "-q", sha], str(checkout))
+    comments = [
+        {"body": "Owner: tester\nWorkdir: %s\nStart: x" % checkout, "author": "tester"},
+    ]
+    assert integrator.workdir_from_comments(
+        comments, seat="tester", task_id="wf-265",
+        checkout_template="local/task-runs/{worker}/{task_id}/checkout",
+        workspace_root=str(workspace_root),
+        branch_template="workforce/task/{worker}/{task_id}",
+    ) is None
+
+
+def test_workdir_from_comments_rejects_template_expansion_without_branch_template(tmp_path):
+    # No branch_template configured means the template arm can never be
+    # verified, so it must never be trusted blindly either.
+    workspace_root = tmp_path / "root"
+    checkout = workspace_root / "local" / "task-runs" / "tester" / "wf-265" / "checkout"
+    checkout.mkdir(parents=True)
+    _git(["init", "-q"], str(checkout))
+    _git(["checkout", "-q", "-b", "workforce/task/tester/wf-265"], str(checkout))
+    comments = [
+        {"body": "Owner: tester\nWorkdir: %s\nStart: x" % checkout, "author": "tester"},
+    ]
+    assert integrator.workdir_from_comments(
+        comments, seat="tester", task_id="wf-265",
+        checkout_template="local/task-runs/{worker}/{task_id}/checkout",
+        workspace_root=str(workspace_root),
+    ) is None
 
 
 def test_workdir_from_comments_rejects_stale_task_path():
