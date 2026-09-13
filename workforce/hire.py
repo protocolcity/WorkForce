@@ -490,6 +490,14 @@ def worker_to_spec(w: Worker) -> Dict[str, Any]:
     # staff=false is the default — only persist true (Map Office-staff bay, wf-143)
     if not spec.get("staff"):
         spec.pop("staff", None)
+    # wf-262 — stop-reason verification defaults (all off); omit so older
+    # daemons whose Worker dataclass predates these fields stay loadable.
+    if not spec.get("completion_field"):
+        spec.pop("completion_field", None)
+    if not spec.get("completion_values"):
+        spec.pop("completion_values", None)
+    if not int(spec.get("continuation_attempts", 0) or 0):
+        spec.pop("continuation_attempts", None)
     # wf-153 slice 4 — load() defaults absent key by kind (lane→true, job→false).
     # Lanes: always persist so explicit false survives as opt-out (omitting
     # false would re-enable isolation on next load). Jobs: omit false (default);
@@ -960,6 +968,9 @@ def generate_seat_folder(
     scope_home: str = "",
     perimeter_grants: Optional[List[str]] = None,
     interpreter: str = "",
+    completion_field: Optional[str] = None,
+    completion_values: Optional[List[str]] = None,
+    continuation_attempts: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Generate the D13 seat shape (5 files) + roster row from a provider adapter.
 
@@ -1152,6 +1163,26 @@ def generate_seat_folder(
 
     prior_budget = int(prior_spec.get("budget_secs") or budget_secs)
     prior_max_passes = prior_spec.get("max_passes")
+    # wf-262 — grok's --output-format json exits 0 with stopReason=cancelled
+    # on an internal vendor stop, not just a genuine finish (stopReason=
+    # end_turn); wire the honest default for every generated grok seat so a
+    # bare rc==0 is never silently trusted as done. --regenerate keeps a
+    # prior row's own explicit choice unless the caller overrides it; other
+    # providers stay off (empty) until their own stop-reason shape is
+    # verified the same way.
+    if completion_field is None:
+        completion_field = prior_spec.get("completion_field")
+        if completion_field is None:
+            completion_field = "stopReason" if provider == "grok" else ""
+    if completion_values is None:
+        completion_values = prior_spec.get("completion_values")
+        if completion_values is None:
+            completion_values = ["end_turn"] if provider == "grok" else []
+    # continuation_attempts stays 0 (off) by default even for grok — the
+    # acceptance criteria calls for an *explicit* cumulative budget, not one
+    # code silently opts every generated seat into; a caller (host) sets it.
+    if continuation_attempts is None:
+        continuation_attempts = int(prior_spec.get("continuation_attempts") or 0)
     # --regenerate keeps the prior row's actual schedule unless held/schedule
     # override it; a brand-new hire (or a regenerate with no prior row) gets
     # the default. A generated seat must never start unattended by
@@ -1207,6 +1238,9 @@ def generate_seat_folder(
         perimeter_grants=list(perimeter_grants or [seat_dir, repository]),
         authority_chain=authority_chain,
         shift_worktree=True,
+        completion_field=completion_field,
+        completion_values=list(completion_values),
+        continuation_attempts=continuation_attempts,
     )
     w.validate()
 
