@@ -1,10 +1,13 @@
+import fcntl
 import json
+import os
 from pathlib import Path
 import subprocess
+import time
 
 import pytest
 
-from workforce.task_runner import PreparationError, prepare
+from workforce.task_runner import PreparationError, _acquire_lock, prepare, recover
 
 
 def git(repo, *args):
@@ -147,3 +150,227 @@ def test_conflicting_envelope_and_row_fail(setup):
     config, task = setup
     with pytest.raises(PreparationError):
         prepare(config, lambda url: {"product": "foreign", "count": 1, "tasks": [task]})
+
+
+def test_recover_requires_reason_and_known_receipt(setup):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    with pytest.raises(PreparationError, match="reason"):
+        recover(config, prepared["receipt"], "", feed(task))
+    with pytest.raises(PreparationError, match="reason"):
+        recover(config, prepared["receipt"], "   ", feed(task))
+
+
+def test_recover_rejects_receipt_outside_state_dir(setup, tmp_path):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    foreign = tmp_path / "elsewhere.json"
+    foreign.write_text(Path(prepared["receipt"]).read_text())
+    with pytest.raises(PreparationError, match="state directory"):
+        recover(config, foreign, "resume after crash", feed(task))
+
+
+def test_recover_rejects_missing_receipt(setup):
+    config, task = setup
+    missing = Path(config["state_dir"]) / "builder" / "p-1" / "preparation.json"
+    with pytest.raises(PreparationError, match="does not exist"):
+        recover(config, missing, "resume after crash", feed(task))
+
+
+@pytest.mark.parametrize("change", [
+    {"status": "done"}, {"status": "in_progress"}, {"gate_type": "human"},
+    {"labels": ["worker:other", "execution:bounded"]},
+])
+def test_recover_rejects_unready_gated_done_or_wrong_owner(setup, change):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    with pytest.raises(PreparationError):
+        recover(config, prepared["receipt"], "resume after crash", feed(dict(task, **change)))
+
+
+def test_recover_preserves_dirty_checkout_and_writes_unique_attempt(setup):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    checkout = Path(prepared["checkout"])
+    (checkout / "README.md").write_text("unfinished agent work\n")
+    original_prompt = Path(prepared["receipt"]).parent / "prompt.md"
+    original_prompt_text = original_prompt.read_text()
+
+    result = recover(config, prepared["receipt"], "provider crashed mid-run", feed(task))
+
+    assert result["checkout"] == prepared["checkout"]
+    assert (checkout / "README.md").read_text() == "unfinished agent work\n"
+    assert len(git(checkout, "log", "--oneline").splitlines()) == 1  # original commit preserved
+    assert original_prompt.read_text() == original_prompt_text
+    assert json.loads(Path(prepared["receipt"]).read_text())["state"] == "prepared"
+
+    receipt = json.loads(Path(result["receipt"]).read_text())
+    assert result["receipt"] != prepared["receipt"]
+    assert receipt["state"] == "recovered"
+    assert receipt["recovery_of"] == prepared["receipt"]
+    assert receipt["recovery_reason"] == "provider crashed mid-run"
+    assert receipt["claimed"] is False
+
+
+def test_recover_twice_never_overwrites_prior_attempt(setup):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    first = recover(config, prepared["receipt"], "first crash", feed(task))
+    second = recover(config, prepared["receipt"], "second crash", feed(task))
+    assert first["receipt"] != second["receipt"]
+    assert Path(first["receipt"]).exists()
+    assert Path(second["receipt"]).exists()
+    assert json.loads(Path(first["receipt"]).read_text())["recovery_reason"] == "first crash"
+    assert json.loads(Path(second["receipt"]).read_text())["recovery_reason"] == "second crash"
+
+
+def test_recover_rejects_tampered_checkout_path(setup, tmp_path):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    receipt_path = Path(prepared["receipt"])
+    receipt = json.loads(receipt_path.read_text())
+    other_dir = tmp_path / "runs" / "elsewhere"
+    other_dir.mkdir(parents=True)
+    receipt["checkout"] = str(other_dir)
+    receipt_path.write_text(json.dumps(receipt))
+    with pytest.raises(PreparationError, match="worktree"):
+        recover(config, receipt_path, "resume after crash", feed(task))
+
+
+def test_recover_rejects_wrong_remote(setup):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    git(config["repository"], "remote", "set-url", "--push", "origin", "https://example.invalid/private")
+    with pytest.raises(PreparationError, match="push destination"):
+        recover(config, prepared["receipt"], "resume after crash", feed(task))
+
+
+def test_recover_handoff_to_another_configured_worker(setup, monkeypatch):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+
+    other_config = dict(config, worker="other")
+    monkeypatch.setenv("WL_AGENT_ID", "other")
+    handoff_task = dict(task, labels=["worker:other", "execution:bounded"])
+
+    result = recover(other_config, prepared["receipt"], "reassigned after builder went dark", feed(handoff_task))
+
+    assert result["worker"] == "other"
+    assert result["checkout"] == prepared["checkout"]
+    receipt = json.loads(Path(result["receipt"]).read_text())
+    assert receipt["worker"] == "other"
+    assert receipt["recovery_reason"] == "reassigned after builder went dark"
+
+
+def test_double_start_lock_excludes_concurrent_launch(setup):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    fd = _acquire_lock(prepared["lock"])
+    try:
+        with pytest.raises(PreparationError, match="active"):
+            _acquire_lock(prepared["lock"])
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def test_lock_available_again_once_holder_releases(setup):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    fd = _acquire_lock(prepared["lock"])
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+    second_fd = _acquire_lock(prepared["lock"])
+    fcntl.flock(second_fd, fcntl.LOCK_UN)
+    os.close(second_fd)
+
+
+def test_recover_of_nested_attempt_receipt_resolves_canonical_anchor(setup):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    first = recover(config, prepared["receipt"], "first crash", feed(task))
+
+    second = recover(config, first["receipt"], "second crash, pointed at nested receipt", feed(task))
+
+    assert second["lock"] == prepared["lock"] == first["lock"]
+    receipt = json.loads(Path(second["receipt"]).read_text())
+    assert receipt["recovery_of"] == prepared["receipt"]  # canonical original, not the nested one
+    assert receipt["recovery_source_receipt"] == first["receipt"]
+    # Both attempts still live flat under the one reservation, never nested under each other.
+    assert Path(second["receipt"]).parent.parent == Path(first["receipt"]).parent.parent
+
+
+def test_nested_receipt_recovery_is_excluded_by_the_same_lock_as_original(setup):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    first = recover(config, prepared["receipt"], "first crash", feed(task))
+    second = recover(config, first["receipt"], "second crash", feed(task))
+
+    fd = _acquire_lock(prepared["lock"])
+    try:
+        with pytest.raises(PreparationError, match="active"):
+            _acquire_lock(second["lock"])
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _make_legacy(receipt_path):
+    """Simulate a receipt written before the lock protocol existed."""
+    data = json.loads(receipt_path.read_text())
+    del data["lock_protocol"]
+    receipt_path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def test_legacy_receipt_refuses_recovery_without_explicit_acknowledgement(setup):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    _make_legacy(Path(prepared["receipt"]))
+    with pytest.raises(PreparationError, match="legacy|lock protocol"):
+        recover(config, prepared["receipt"], "resume after crash", feed(task))
+    with pytest.raises(PreparationError, match="legacy|lock protocol"):
+        recover(config, prepared["receipt"], "resume after crash", feed(task), legacy_stop_evidence="   ")
+
+
+def test_legacy_receipt_recovers_with_explicit_acknowledgement_and_evidence(setup):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    _make_legacy(Path(prepared["receipt"]))
+    evidence = "Operator confirmed via `ps -p 4821` that the prior provider process no longer exists (2026-09-13)."
+
+    result = recover(config, prepared["receipt"], "resume after crash", feed(task),
+                      legacy_stop_evidence=evidence)
+
+    receipt = json.loads(Path(result["receipt"]).read_text())
+    assert receipt["legacy_stop_acknowledged"] is True
+    assert receipt["legacy_stop_evidence"] == evidence
+    # The canonical original receipt itself is never rewritten by recovery.
+    assert "legacy_stop_acknowledged" not in json.loads(Path(prepared["receipt"]).read_text())
+
+
+def test_exec_retains_lock_and_releases_only_after_child_process_exits(setup):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    lock_path = prepared["lock"]
+
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover -- child branch, exercised but not measured
+        try:
+            fd = _acquire_lock(lock_path)
+            os.set_inheritable(fd, True)
+            os.execvp("sleep", ["sleep", "0.5"])
+        except Exception:
+            os._exit(1)
+        os._exit(0)
+
+    try:
+        time.sleep(0.15)
+        with pytest.raises(PreparationError, match="active"):
+            _acquire_lock(lock_path)
+    finally:
+        _, status = os.waitpid(pid, 0)
+        assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+
+    fd = _acquire_lock(lock_path)
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)

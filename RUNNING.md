@@ -53,3 +53,53 @@ files before recovery. Never remove the reservation to hide a failure. No
 automatic retry, cross-provider takeover, review acceptance or deployment is
 established by a prepared checkout or a zero provider exit. Preserve the PR-stage
 handoff and record completion on the same order after actual review/acceptance.
+
+### Explicit recovery
+
+`--recover-receipt /absolute/path/preparation.json --recovery-reason "..."`
+resumes a preserved reservation instead of preparing a new task. Both flags are
+required together; there is no automatic or unattended recovery path. The
+operator, not the helper, first releases or reassigns the task in WorkLane —
+recovery only proceeds once the current authoritative ready feed shows the
+task backlog, ungated, and labeled for the configured worker. A gated, done,
+foreign, or wrong-owner task is refused with no WorkLane writes.
+
+Recovery reuses the exact preserved checkout, worktree, and branch verified
+against the repository's registered worktrees and the authorized remote; it
+never fabricates or resets a checkout, and dirty files, commits, and the
+original preparation receipt, prompt, and result are left untouched. Each
+recovery attempt gets its own numbered `attempts/N/` directory under the
+existing reservation with a fresh prompt, result path, and receipt (marked
+`state: "recovered"` with `recovery_of` and `recovery_reason`); it never
+overwrites earlier evidence.
+
+A per-reservation OS lock (`state_dir/worker/task-id/lock`, held open across
+the provider's exec) excludes a second start against the same reservation.
+Because the lock is tied to the holding process's open file descriptor, the
+kernel releases it automatically if that process dies for any reason —
+recovery never infers liveness from a PID or its age, and refuses to proceed
+while the lock is held. This requires POSIX advisory locking (`fcntl.flock`);
+on a platform without it, launching fails closed with an explicit error
+instead of the module crashing at import time or launching unlocked.
+
+`--recover-receipt` may point at the original `preparation.json` or at any
+later `attempts/N/preparation.json`; either way, recovery resolves the single
+canonical reservation root first and reads the original receipt there, so
+every attempt and every worker always shares the exact same lock. A receipt
+can never define its own separate lock scope by nesting.
+
+Every receipt records a `lock_protocol` marker. A canonical receipt written
+before that marker existed never held the reservation lock in the first
+place, so its absence or an unlocked lock file proves nothing about whether
+its process is still running. Recovering such a legacy receipt additionally
+requires `--legacy-stop-evidence "..."`: an explicit, retained operator
+statement of how they confirmed the prior process stopped. That statement is
+recorded on the new attempt's receipt; recovery still makes no WorkLane
+writes and never overwrites the canonical original.
+
+Recovery to a different worker (handoff) is allowed only when the operator has
+already reassigned the `worker:` label in WorkLane to that worker and that
+worker's own config/identity requests the recovery; the new worker signs its
+own WorkLane claim before any writes. The target checkout is always the one
+in the canonical original receipt — never an arbitrary path or foreign
+repository.
