@@ -472,7 +472,10 @@ def workdir_from_comments(
         if seat is not None and str(c.get("author") or "") != seat:
             continue
         body = str(c.get("body") or "")
-        if not body.lstrip().startswith("Owner:"):
+        # The Workdir line may sit in the seat's Owner claim or in one of its
+        # signed evidence notes (seats record it there); the author check above
+        # is the trust boundary, not the comment heading (pc-1487 rehearsal).
+        if not (body.lstrip().startswith("Owner:") or "Workdir:" in body):
             continue
         m = _WORKDIR_MARKER_RE.search(body)
         if m:
