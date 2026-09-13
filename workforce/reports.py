@@ -2,12 +2,17 @@
 
 Writes local/reports/cost/YYYY-MM-DD.md, one file per day, idempotent.
 Read-model over ledger files; stdlib only; Python 3.9 floor.
+
+Also exposes read-only supervisor pass evidence under
+``local/reports/supervisor/`` for the board API (wf-254).
 """
 
 import datetime
+import json
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
+from ._utils import _parse_iso_z, _utcnow
 from .ledger import parse_shifts
 
 
@@ -125,3 +130,145 @@ def write_daily_cost_report(
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(content)
     return path
+
+
+_DEFAULT_SUPERVISOR_LIMIT = 20
+_MAX_SUPERVISOR_LIMIT = 100
+
+
+def _supervisor_dir(local_root: str) -> str:
+    return os.path.join(local_root, "reports", "supervisor")
+
+
+def _positive_int_field(data: dict, key: str) -> Optional[int]:
+    val = data.get(key)
+    if isinstance(val, bool) or not isinstance(val, int):
+        return None
+    return val
+
+
+def _supervisor_row_from_report(data: object, evidence_file: str) -> Optional[Dict[str, object]]:
+    """Parse one on-disk supervisor evidence file into an API row.
+
+    Returns ``None`` when the file is malformed or cannot be trusted in full.
+    """
+    if not isinstance(data, dict):
+        return None
+    generated_at = data.get("generated_at")
+    mode = data.get("mode")
+    provider_ok = data.get("provider_ok")
+    proposals = data.get("proposals")
+    dispatched = data.get("dispatched")
+    if (not isinstance(generated_at, str) or not generated_at
+            or not isinstance(mode, str)
+            or not isinstance(provider_ok, bool)
+            or not isinstance(proposals, list)
+            or not isinstance(dispatched, list)):
+        return None
+    dispatch_attempted = _positive_int_field(data, "dispatch_attempted")
+    dispatch_started = _positive_int_field(data, "dispatch_started")
+    dispatch_completed = _positive_int_field(data, "dispatch_completed")
+    dispatch_failed = _positive_int_field(data, "dispatch_failed")
+    if None in (dispatch_attempted, dispatch_started, dispatch_completed, dispatch_failed):
+        return None
+    provider_error = data.get("provider_error")
+    if provider_error is not None and not isinstance(provider_error, str):
+        return None
+    pass_outcome = data.get("pass_outcome") if "pass_outcome" in data else None
+    if pass_outcome is not None and not isinstance(pass_outcome, str):
+        return None
+    dispatched_rows: List[Dict[str, str]] = []
+    for item in dispatched:
+        if not isinstance(item, dict):
+            return None
+        worker = item.get("worker")
+        project = item.get("project")
+        outcome = item.get("outcome")
+        if (not isinstance(worker, str) or not worker
+                or not isinstance(project, str) or not project
+                or not isinstance(outcome, str)):
+            return None
+        dispatched_rows.append({
+            "worker": worker,
+            "project": project,
+            "outcome": outcome,
+        })
+    proposals_total = len(proposals)
+    proposals_valid = sum(
+        1 for p in proposals if isinstance(p, dict) and p.get("valid") is True
+    )
+    return {
+        "generated_at": generated_at,
+        "mode": mode,
+        "pass_outcome": pass_outcome,
+        "provider_ok": provider_ok,
+        "provider_error": provider_error,
+        "proposals_total": proposals_total,
+        "proposals_valid": proposals_valid,
+        "dispatch_attempted": dispatch_attempted,
+        "dispatch_started": dispatch_started,
+        "dispatch_completed": dispatch_completed,
+        "dispatch_failed": dispatch_failed,
+        "dispatched": dispatched_rows,
+        "evidence_file": evidence_file,
+    }
+
+
+def _read_supervisor_row(path: str, basename: str) -> Optional[Dict[str, object]]:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return _supervisor_row_from_report(raw, basename)
+
+
+def scan_supervisor_passes(local_root: str) -> Tuple[List[Dict[str, object]], int]:
+    """Read every supervisor evidence JSON file; newest ``generated_at`` first."""
+    dir_path = _supervisor_dir(local_root)
+    if not os.path.isdir(dir_path):
+        return [], 0
+    passes: List[Dict[str, object]] = []
+    unreadable = 0
+    for name in sorted(os.listdir(dir_path)):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(dir_path, name)
+        if not os.path.isfile(path):
+            continue
+        row = _read_supervisor_row(path, name)
+        if row is None:
+            unreadable += 1
+        else:
+            passes.append(row)
+    passes.sort(key=lambda r: str(r["generated_at"]), reverse=True)
+    return passes, unreadable
+
+
+def supervisor_api_model(
+    local_root: str,
+    limit: int = _DEFAULT_SUPERVISOR_LIMIT,
+) -> Dict[str, object]:
+    """Payload for GET /api/supervisor — past-pass evidence only."""
+    bounded = max(1, min(int(limit or _DEFAULT_SUPERVISOR_LIMIT), _MAX_SUPERVISOR_LIMIT))
+    passes, unreadable = scan_supervisor_passes(local_root)
+    return {"ok": True, "passes": passes[:bounded], "unreadable": unreadable}
+
+
+def supervisor_report_section(
+    local_root: str,
+    days: int,
+) -> Dict[str, object]:
+    """Supervisor summary for /api/report using the report window."""
+    window_days = max(1, min(int(days or 1), 90))
+    since = _utcnow() - datetime.timedelta(days=window_days)
+    passes, unreadable = scan_supervisor_passes(local_root)
+    in_window = [
+        row for row in passes
+        if (_parse_iso_z(str(row.get("generated_at", ""))) or since) >= since
+    ]
+    return {
+        "passes_in_window": len(in_window),
+        "last_pass": in_window[0] if in_window else None,
+        "unreadable": unreadable,
+    }

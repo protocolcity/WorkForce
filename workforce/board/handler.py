@@ -25,8 +25,10 @@ from ..api.roster import (
     scene_tape,
     worker_model,
 )
+from ..reports import supervisor_api_model
 from .paths import (
     _days_param,
+    _limit_param,
     _map_roster_url,
     _out_path,
     _safe_worker_name,
@@ -208,6 +210,11 @@ class _Handler(BaseHTTPRequestHandler):
         path_only = (self.path or "").split("?", 1)[0]
         if not path_only.startswith("/api/"):
             self._reply_html_retired()
+            return
+        if self.path == "/api/supervisor" or self.path.startswith("/api/supervisor?"):
+            payload = supervisor_api_model(
+                self.local_root, limit=_limit_param(self.path))
+            self._json_response(payload, 200)
             return
         if self.path == "/api/report" or self.path.startswith("/api/report?"):
             # one seam: suite Map, the oc-15 daily brief (future), and
