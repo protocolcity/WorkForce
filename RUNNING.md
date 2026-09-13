@@ -104,6 +104,28 @@ own WorkLane claim before any writes. The target checkout is always the one
 in the canonical original receipt — never an arbitrary path or foreign
 repository.
 
+### Recovery through the engine
+
+Running `python -m workforce.task_runner --recover-receipt ... --recovery-reason
+...` directly, as above, resumes the reservation but bypasses `engine.dispatch`:
+the attempt gets no ledger START/STOP rows, no engine wall-clock budget, no
+engine per-worker lock, and no `run/<worker>.out`, so the engine API, the
+bounded supervisor, and BluePrint's open-shift view see the worker idle while a
+provider is actually running. `workforce dispatch <worker> --recover-receipt
+/absolute/path/preparation.json --recovery-reason "..."` (optionally with
+`--legacy-stop-evidence "..."`) routes the identical recovery through
+`engine.dispatch` instead: the two flags are appended to the worker's own
+`command` argv (a task_runner-based worker command is exactly the invocation
+above), and the shift's ledger START/CANDIDATE/STOP (or ERROR) rows are tagged
+`recovery=1`. The engine still holds its own per-worker lock and enforces the
+worker's budget for the recovered attempt, and still makes no WorkLane writes.
+task_runner's own reservation lock and ready-eligibility re-check, run inside
+the spawned subprocess, are unchanged — a second concurrent start (through the
+engine or run directly) is still refused, and an ungated task still fails
+closed. Direct `task_runner --recover-receipt` invocation, outside `workforce
+dispatch`, remains available for an operator who is not ready to route through
+the engine; it is simply not engine-visible.
+
 ## Bounded AI supervisory pass
 
 `python -m workforce.supervisor --config /absolute/path/supervisor.json` is a

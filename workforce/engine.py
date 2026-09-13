@@ -496,11 +496,13 @@ def _record_candidates(
     *,
     product: str = "",
     limit: int = 3,
+    extra: Optional[Dict[str, object]] = None,
 ) -> int:
     """Append CANDIDATE events for ready tasks handed to this shift.
 
     Caps at *limit* (scene bay teaser size). Returns how many rows written.
-    These are dispatch-input evidence, not confirmed WorkLane claims.
+    These are dispatch-input evidence, not confirmed WorkLane claims. *extra*
+    kv (e.g. an explicit-recovery marker) is merged onto every row.
     """
     n = 0
     for t in tasks[: max(0, int(limit))]:
@@ -521,6 +523,8 @@ def _record_candidates(
                 kv["priority"] = int(pri)  # type: ignore[arg-type]
             except (TypeError, ValueError):
                 kv["priority"] = str(pri)
+        if extra:
+            kv.update(extra)
         ledger.append("CANDIDATE", **kv)
         n += 1
     return n
@@ -1695,10 +1699,30 @@ def _host_mutation_check(worker: Worker, ledger: Ledger) -> bool:
     return False
 
 
-def dispatch(worker: Worker, local_root: str, dry_run: bool = False) -> int:
-    """Run one shift for one worker. Returns the process exit code (0/1)."""
+def dispatch(
+    worker: Worker, local_root: str, dry_run: bool = False,
+    recover_receipt: Optional[str] = None, recovery_reason: Optional[str] = None,
+    legacy_stop_evidence: Optional[str] = None,
+) -> int:
+    """Run one shift for one worker. Returns the process exit code (0/1).
+
+    ``recover_receipt``/``recovery_reason`` route an operator's explicit
+    task_runner reservation recovery through this same shift: the ledger
+    START/CANDIDATE/STOP (or ERROR) rows are tagged ``recovery=1`` and the
+    recovery flags are appended to the worker's own argv (worker.command is
+    the task_runner invocation for these workers — see RUNNING.md). Recovery
+    still gets the engine's per-worker lock, wall-clock budget, and
+    run/<worker>.out capture; it makes no WorkLane writes of its own. Both
+    flags are required together. task_runner's own reservation lock and
+    ready-eligibility re-check (inside the spawned subprocess) are unchanged
+    and still refuse a second concurrent start or an ungated task.
+    """
     ledger = Ledger(os.path.join(local_root, "ledger"), worker.name)
     lock = _Lock(os.path.join(local_root, "locks"), worker.name, worker.budget_secs, ledger)
+    if bool(recover_receipt) != bool(recovery_reason):
+        ledger.append("ERROR", reason="recover-receipt and recovery-reason must be used together")
+        return 1
+    recovery_kv: Dict[str, object] = {"recovery": 1} if recover_receipt else {}
     ready_tasks: List[dict] = []
     try:
         # Host-mutation / scope before preflight: a tier-2 argv must
@@ -1784,6 +1808,10 @@ def dispatch(worker: Worker, local_root: str, dry_run: bool = False) -> int:
             shift_workdir=shift_cwd,
         )
         argv = _build_argv(worker, prompt_text, chain_text=chain_text)
+        if recover_receipt:
+            argv = argv + ["--recover-receipt", recover_receipt, "--recovery-reason", recovery_reason]
+            if legacy_stop_evidence:
+                argv = argv + ["--legacy-stop-evidence", legacy_stop_evidence]
 
         if not dry_run and worker.ghost_audit:
             _run_ghost_audit(worker, env, ledger)
@@ -1803,6 +1831,7 @@ def dispatch(worker: Worker, local_root: str, dry_run: bool = False) -> int:
             contract_sha=contract_sha, prompt_sha=prompt_sha,
             dry_run=int(dry_run),
             **chain_kwargs,
+            **recovery_kv,
         )
 
         # wf-250 — dispatch-input evidence: record ready work orders this
@@ -1812,16 +1841,17 @@ def dispatch(worker: Worker, local_root: str, dry_run: bool = False) -> int:
             _record_candidates(
                 ledger, ready_tasks,
                 product=product_from_queue_url(worker.queue_url) or "",
+                extra=recovery_kv or None,
             )
 
         if dry_run:
-            ledger.append("DONE", dry_run=1, argv_head=argv[0], argv_len=len(argv))
+            ledger.append("DONE", dry_run=1, argv_head=argv[0], argv_len=len(argv), **recovery_kv)
             return 0
 
         def _stop_ok(reason: str) -> int:
             """Terminal STOP after a successful shift; attempt shift FF land."""
             ff_kv = _finalize_shift_workdir(worker, shift_cwd, ledger)
-            ledger.append("STOP", reason=reason, **ff_kv)
+            ledger.append("STOP", reason=reason, **ff_kv, **recovery_kv)
             return 0
 
         # §6 multi-pass drain loop: re-spawn while budget, ceiling,
@@ -1854,7 +1884,7 @@ def dispatch(worker: Worker, local_root: str, dry_run: bool = False) -> int:
                 proc.kill()
                 proc.wait()
                 ledger.append("ERROR", reason="killed at budget",
-                              budget_secs=worker.budget_secs, on_pass=passes + 1)
+                              budget_secs=worker.budget_secs, on_pass=passes + 1, **recovery_kv)
                 return 1
             if rc != 0:
                 reason = _classify_exit(out_path)
@@ -1875,29 +1905,29 @@ def dispatch(worker: Worker, local_root: str, dry_run: bool = False) -> int:
                         fb_proc.kill()
                         fb_proc.wait()
                         ledger.append("ERROR", reason="killed at budget (fallback)",
-                                      budget_secs=worker.budget_secs)
+                                      budget_secs=worker.budget_secs, **recovery_kv)
                         return 1
                     if fb_rc != 0:
                         ledger.append("ERROR", reason=_classify_exit(out_path),
                                       rc=fb_rc, on_pass=passes + 1,
-                                      fallback_runtime=worker.fallback_runtime)
+                                      fallback_runtime=worker.fallback_runtime, **recovery_kv)
                         return 1
                     passes += 1
                     outfh.flush()
                     usage = _usage_from_output(out_path, fb_pass_offset, worker.usage_fields)
                     ledger.append("DONE", rc=0, on_pass=passes,
                                   secs=int(time.monotonic() - fb_t0),
-                                  fallback_runtime=worker.fallback_runtime, **usage)
+                                  fallback_runtime=worker.fallback_runtime, **usage, **recovery_kv)
                     return _stop_ok(
                         "fallback complete (%s)" % worker.fallback_runtime,
                     )
-                ledger.append("ERROR", reason=reason, rc=rc, on_pass=passes + 1)
+                ledger.append("ERROR", reason=reason, rc=rc, on_pass=passes + 1, **recovery_kv)
                 return 1
             passes += 1
             outfh.flush()
             usage = _usage_from_output(out_path, pass_offset, worker.usage_fields)
             ledger.append("DONE", rc=0, on_pass=passes,
-                          secs=int(time.monotonic() - pass_t0), **usage)
+                          secs=int(time.monotonic() - pass_t0), **usage, **recovery_kv)
 
             if passes >= pass_ceiling:
                 if worker.max_passes == 0:
