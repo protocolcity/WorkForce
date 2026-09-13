@@ -68,6 +68,14 @@ def main(argv=None) -> int:
     p_dispatch.add_argument("worker")
     p_dispatch.add_argument("--dry-run", action="store_true",
                             help="every step except spawning the vendor CLI")
+    p_dispatch.add_argument("--recover-receipt",
+                            help="operator-preserved task_runner preparation.json to resume "
+                                 "through the engine (requires --recovery-reason)")
+    p_dispatch.add_argument("--recovery-reason",
+                            help="operator rationale for explicit recovery; requires --recover-receipt")
+    p_dispatch.add_argument("--legacy-stop-evidence",
+                            help="operator's retained proof a pre-lock-protocol receipt's process "
+                                 "stopped; forwarded to task_runner recovery")
 
     p_hire = sub.add_parser("hire", help="employ a worker (papers + roster row)")
     p_hire.add_argument("name", help="persona name (becomes the identity slug)")
@@ -1101,12 +1109,20 @@ def main(argv=None) -> int:
         return 0
 
     if args.cmd == "dispatch":
+        if bool(args.recover_receipt) != bool(args.recovery_reason):
+            print("dispatch stopped: --recover-receipt and --recovery-reason must be used together",
+                  file=sys.stderr)
+            return 1
         try:
             w = r.worker(args.worker)
         except roster_mod.RosterError as exc:
             print(str(exc), file=sys.stderr)
             return 1
-        return engine.dispatch(w, local_root, dry_run=args.dry_run)
+        return engine.dispatch(
+            w, local_root, dry_run=args.dry_run,
+            recover_receipt=args.recover_receipt, recovery_reason=args.recovery_reason,
+            legacy_stop_evidence=args.legacy_stop_evidence,
+        )
 
     if args.cmd == "ledger":
         print(Ledger(os.path.join(local_root, "ledger"), args.worker).tail(args.n), end="")

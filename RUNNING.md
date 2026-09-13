@@ -104,6 +104,42 @@ own WorkLane claim before any writes. The target checkout is always the one
 in the canonical original receipt — never an arbitrary path or foreign
 repository.
 
+### Recovery through the engine
+
+Running `python -m workforce.task_runner --recover-receipt ... --recovery-reason
+...` directly, as above, resumes the reservation but bypasses `engine.dispatch`:
+the attempt gets no ledger START/STOP rows, no engine wall-clock budget, no
+engine per-worker lock, and no `run/<worker>.out`, so the engine API, the
+bounded supervisor, and BluePrint's open-shift view see the worker idle while a
+provider is actually running. `workforce dispatch <worker> --recover-receipt
+/absolute/path/preparation.json --recovery-reason "..."` (optionally with
+`--legacy-stop-evidence "..."`) routes the identical recovery through
+`engine.dispatch` instead: the two flags are appended to the worker's own
+`command` argv (a task_runner-based worker command is exactly the invocation
+above), and the shift's ledger START/CANDIDATE/STOP (or ERROR) rows are tagged
+`recovery=1`. The engine still holds its own per-worker lock and enforces the
+worker's budget for the recovered attempt, and still makes no WorkLane writes.
+task_runner's own reservation lock and ready-eligibility re-check, run inside
+the spawned subprocess, are unchanged — a second concurrent start (through the
+engine or run directly) is still refused, and an ungated task still fails
+closed. Direct `task_runner --recover-receipt` invocation, outside `workforce
+dispatch`, remains available for an operator who is not ready to route through
+the engine; it is simply not engine-visible.
+
+A recovered shift through the engine is always a forced single pass: the
+worker's own `max_passes` (drain or multi-pass) never re-spawns the recovery
+argv a second time, and the forced ceiling is recorded on the START row
+(`recovery_single_pass=1`). If the primary recovery attempt exits with a
+vendor-limit signature and the worker has `fallback_runtime` set, the engine
+does not fall back — a recovery targets one specific reservation, and a
+silent runtime switch mid-recovery is not a lawful takeover; it logs
+`ERROR reason="fallback skipped during recovery"` instead. The shift's
+CANDIDATE evidence names only the task being resumed (read from the
+canonical original receipt), not the live ready snapshot, which may still
+list other backlog this attempt is not touching; dispatch refuses before
+START (ERROR, no ledger writes) if the receipt is unreadable or resolves
+outside the worker's configured `state_dir`.
+
 ## Bounded AI supervisory pass
 
 `python -m workforce.supervisor --config /absolute/path/supervisor.json` is a
