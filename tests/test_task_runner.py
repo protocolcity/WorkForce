@@ -242,6 +242,21 @@ def test_recovered_prompt_fills_template_slot_when_present(setup, tmp_path):
     assert "Recovery reason: provider crashed mid-run (attempt 1, of %s)" % prepared["receipt"] in rendered
 
 
+def test_recovered_prompt_survives_hostile_reason(setup):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    hostile = 'fix %s and %(x)s\nline two\n"quoted" and \'single\' {braces}'
+    result = recover(config, prepared["receipt"], hostile, feed(task))
+    prompt = Path(result["receipt"]).parent / "prompt.md"
+    text = prompt.read_text()
+    assert text.count("Recovery: this is recovery attempt 1") == 1
+    assert "\nline two\n" not in text
+    assert "fix %s and %(x)s line two" in text
+    # Full reason (newlines and all) is preserved in the receipt untouched.
+    receipt = json.loads(Path(result["receipt"]).read_text())
+    assert receipt["recovery_reason"] == hostile
+
+
 def test_recover_twice_never_overwrites_prior_attempt(setup):
     config, task = setup
     prepared = prepare(config, feed(task))
