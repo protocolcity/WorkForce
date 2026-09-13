@@ -17,6 +17,7 @@ from .ledger import parse_shifts
 
 
 _DEFAULT_THRESHOLD = 5.0
+_DEFAULT_REPORT_WINDOW_DAYS = int(os.environ.get("WORKFORCE_REPORT_WINDOW_DAYS", "7"))
 
 
 def _date_str(d: Optional[datetime.date] = None) -> str:
@@ -160,6 +161,7 @@ def _supervisor_row_from_report(data: object, evidence_file: str) -> Optional[Di
     proposals = data.get("proposals")
     dispatched = data.get("dispatched")
     if (not isinstance(generated_at, str) or not generated_at
+            or _parse_iso_z(generated_at) is None
             or not isinstance(mode, str)
             or not isinstance(provider_ok, bool)
             or not isinstance(proposals, list)
@@ -193,10 +195,11 @@ def _supervisor_row_from_report(data: object, evidence_file: str) -> Optional[Di
             "project": project,
             "outcome": outcome,
         })
+    for proposal in proposals:
+        if not isinstance(proposal, dict) or not isinstance(proposal.get("valid"), bool):
+            return None
     proposals_total = len(proposals)
-    proposals_valid = sum(
-        1 for p in proposals if isinstance(p, dict) and p.get("valid") is True
-    )
+    proposals_valid = sum(1 for p in proposals if p["valid"] is True)
     return {
         "generated_at": generated_at,
         "mode": mode,
@@ -241,7 +244,10 @@ def scan_supervisor_passes(local_root: str) -> Tuple[List[Dict[str, object]], in
             unreadable += 1
         else:
             passes.append(row)
-    passes.sort(key=lambda r: str(r["generated_at"]), reverse=True)
+    passes.sort(
+        key=lambda r: _parse_iso_z(str(r["generated_at"])),  # type: ignore[arg-type, return-value]
+        reverse=True,
+    )
     return passes, unreadable
 
 
@@ -257,16 +263,17 @@ def supervisor_api_model(
 
 def supervisor_report_section(
     local_root: str,
-    days: int,
+    days: Optional[int] = None,
 ) -> Dict[str, object]:
     """Supervisor summary for /api/report using the report window."""
-    window_days = max(1, min(int(days or 1), 90))
+    window_days = max(1, min(int(days if days is not None else _DEFAULT_REPORT_WINDOW_DAYS), 90))
     since = _utcnow() - datetime.timedelta(days=window_days)
     passes, unreadable = scan_supervisor_passes(local_root)
-    in_window = [
-        row for row in passes
-        if (_parse_iso_z(str(row.get("generated_at", ""))) or since) >= since
-    ]
+    in_window: List[Dict[str, object]] = []
+    for row in passes:
+        ts = _parse_iso_z(str(row.get("generated_at", "")))
+        if ts is not None and ts >= since:
+            in_window.append(row)
     return {
         "passes_in_window": len(in_window),
         "last_pass": in_window[0] if in_window else None,
