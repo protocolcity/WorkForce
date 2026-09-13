@@ -162,9 +162,14 @@ outside the worker's configured `state_dir`.
 `runner.json`, `launch.py`, `mcp.json`, `CONTRACT.md`, `prompt.md` — from the
 named adapter, plus the roster row. Each adapter's command is checked against
 its own `bypass_flags` list and refuses to generate one (`AdapterError`); no
-generated command carries `--dangerously-skip-permissions`, `--trust`-style
-sandbox bypass, or an equivalent. `--dry-run` prints the five file paths, the
-command, and the allow list without writing anything or touching the roster.
+generated command carries `--dangerously-skip-permissions`, `--force`/`--yolo`,
+or an equivalent tool-permission bypass. The cursor adapter does emit `--trust`
+— that flag only dismisses cursor-agent's interactive "trust this workspace?"
+prompt, which is required for headless dispatch; it is never emitted without
+`--sandbox enabled` immediately alongside it, which is the actual safety
+boundary, so `--trust` is not in `cursor`'s `bypass_flags` list. `--dry-run`
+prints the five file paths, the command, and the allow list without writing
+anything or touching the roster.
 `--held` clears the row's schedule so the desk shows the seat OFF (a bare
 hire without `--held` gets a normal cron schedule); `fire_now`/manual dispatch
 still work on a held seat. `--regenerate` rewrites an existing seat's folder,

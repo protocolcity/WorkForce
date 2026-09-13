@@ -1149,6 +1149,32 @@ def test_generate_seat_folder_refuses_to_clobber_without_regenerate(tmp_path):
         )
 
 
+def test_generate_seat_folder_refuses_roster_only_name_before_any_write(tmp_path):
+    """A roster row with no generated folder (e.g. an old --workdir hire)
+    must refuse before writing anything, not after creating the folder."""
+    repo = _seat_base(tmp_path)
+    roster_path = tmp_path / "local" / "roster.json"
+    roster_path.write_text(json.dumps({
+        "workers": {
+            "demo": {
+                "kind": "lane",
+                "workdir": str(repo),
+                "contract": str(repo / "c.md"),
+                "prompt": str(repo / "p.md"),
+                "identity": "demo",
+                "command": ["true"],
+            }
+        }
+    }))
+    with pytest.raises(RosterError, match="already on the roster"):
+        hire_mod.generate_seat_folder(
+            name="demo", provider="cursor", project="recipes",
+            repository=str(repo), base=str(tmp_path),
+        )
+    seat_dir = tmp_path / "local" / "worker-config" / "demo"
+    assert not seat_dir.exists()
+
+
 def test_generate_seat_folder_regenerate_backs_up_and_keeps_held(tmp_path):
     repo = _seat_base(tmp_path)
     hire_mod.generate_seat_folder(
@@ -1168,3 +1194,26 @@ def test_generate_seat_folder_regenerate_backs_up_and_keeps_held(tmp_path):
     er = load(result["roster_path"], base=str(tmp_path))
     # regenerate keeps the row's held state (schedule stays cleared)
     assert er.workers["demo"].schedule == ""
+
+
+def test_generate_seat_folder_regenerate_keeps_identity_and_custom_schedule(tmp_path):
+    """--regenerate must carry the prior row's identity and cron schedule
+    through unchanged unless the caller explicitly overrides them."""
+    repo = _seat_base(tmp_path)
+    hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path), identity="demo-signer",
+    )
+    roster_path = tmp_path / "local" / "roster.json"
+    raw = json.loads(roster_path.read_text())
+    raw["workers"]["demo"]["schedule"] = "0 9 * * 1-5"
+    roster_path.write_text(json.dumps(raw))
+
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path), regenerate=True,
+    )
+    assert result["worker"]["identity"] == "demo-signer"
+    er = load(result["roster_path"], base=str(tmp_path))
+    assert er.workers["demo"].identity == "demo-signer"
+    assert er.workers["demo"].schedule == "0 9 * * 1-5"

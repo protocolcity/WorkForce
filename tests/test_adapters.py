@@ -64,6 +64,15 @@ def test_adapter_has_a_nonempty_auth_check_and_doc(provider):
     assert adapter.doc.strip()
 
 
+def test_cursor_trust_always_carries_sandbox_enabled():
+    """--trust only dismisses the workspace-trust prompt; --sandbox enabled
+    is the actual safety boundary and must always accompany it."""
+    adapter = ADAPTERS["cursor"]
+    cmd = adapter.command(_ctx())
+    trust_idx = cmd.index("--trust")
+    assert cmd[trust_idx + 1 : trust_idx + 3] == ["--sandbox", "enabled"]
+
+
 @pytest.mark.parametrize("provider", ["claude", "cursor", "grok", "codex"])
 def test_adapter_fails_closed_when_bypass_flag_is_injected(provider, monkeypatch):
     """command() must refuse even if a future edit slips a bypass flag in."""
