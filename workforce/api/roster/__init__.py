@@ -78,6 +78,7 @@ from .desk import (  # noqa: F401
     _queue_human_link,
     _worker_flags,
     _worker_holdings,
+    _worker_holdings_evidence,
     _worker_queue,
     _worker_ready_teaser,
 )
@@ -97,6 +98,7 @@ from .law import (  # noqa: F401
     _worker_health,
 )
 from .models import (  # noqa: F401
+    _holding_fields,
     _ledger_candidates,
     _worker_full_data,
     report_model,
@@ -145,6 +147,7 @@ _ADOPT_NAMES = (
     "_queue_human_link",
     "_is_connection_exc",
     "_worker_queue",
+    "_holding_fields",
     "_ledger_candidates",
     "_worker_full_data",
     "_platforms",
@@ -159,6 +162,9 @@ _ADOPT_NAMES = (
     "_desk_owner_of",
     "_worker_identity_aliases",
     "_worker_holdings",
+    "_worker_holdings_evidence",
+    "_holding_evidence",
+    "_holding_not_queried",
     "_worker_ready_teaser",
     "_worker_flags",
     "worker_model",

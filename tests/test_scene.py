@@ -63,8 +63,9 @@ def test_scene_model_groups_workers_into_workplace_sectors(tmp_path, monkeypatch
                 "next_fire", "queue", "health", "last_shift", "holding"):
         assert key in a
     assert a["cli"] == "true"  # command=["true"] fixture
-    assert a["holding"]["state"] == "not_queried"  # not in_flight
-    assert a["holding"]["items"] == []
+    assert a["holding"] == []  # not in_flight
+    assert a["holding_state"] == "not_queried"
+    assert a["holding_evidence"]["state"] == "not_queried"
 
 
 def test_scene_model_exposes_display_when_set(tmp_path, monkeypatch):
@@ -129,14 +130,14 @@ def test_scene_model_holding_from_desk_candidates_from_ledger(tmp_path, monkeypa
             ], "error": "", "partial": False,
         }
 
-    monkeypatch.setattr(_api_roster, "_worker_holdings", fake_holdings)
+    monkeypatch.setattr(_api_roster, "_worker_holdings_evidence", fake_holdings)
     model = board.scene_model(str(local))
     workers = {row["name"]: row
                for s in model["sectors"]
                for row in s["workers"]}
-    held = workers["morgan"]["holding"]
-    assert held["state"] == "available"
-    assert held["items"][0]["id"] == "desk-only"
+    assert workers["morgan"]["holding_state"] == "available"
+    assert workers["morgan"]["holding"][0]["id"] == "desk-only"
+    assert isinstance(workers["morgan"]["holding"], list)
     cands = workers["morgan"]["candidates"]
     assert cands[0]["id"] == "wf-158"
     assert cands[0]["status"] == "candidate"
@@ -166,15 +167,16 @@ def test_scene_model_holding_teaser_only_when_in_flight(tmp_path, monkeypatch):
             ], "error": "", "partial": False,
         }
 
-    monkeypatch.setattr(_api_roster, "_worker_holdings", fake_holdings)
+    monkeypatch.setattr(_api_roster, "_worker_holdings_evidence", fake_holdings)
     model = board.scene_model(str(local))
     workers = {row["name"]: row
                for s in model["sectors"]
                for row in s["workers"]}
     assert model["in_flight"] == ["morgan"]
     assert calls == ["morgan"]
-    assert workers["morgan"]["holding"]["items"][0]["id"] == "ts-1"
-    assert workers["riley"]["holding"]["state"] == "not_queried"
+    assert workers["morgan"]["holding"][0]["id"] == "ts-1"
+    assert workers["riley"]["holding"] == []
+    assert workers["riley"]["holding_state"] == "not_queried"
 
 
 def test_scene_model_owned_and_next_fire_from_cron(tmp_path, monkeypatch):
@@ -386,8 +388,8 @@ def test_light_scene_schema_sentinels(tmp_path, monkeypatch):
     assert k["queue"] == "—"
     assert k["health"] == "ok"
     assert k["why"] == "light"
-    assert k["holding"]["state"] == "not_queried"
-    assert k["holding"]["items"] == []
+    assert k["holding"] == []
+    assert k["holding_state"] == "not_queried"
     assert k["candidates"] == []
     assert k["last_shift"] is None
     # stable fields still present and typed
@@ -422,15 +424,15 @@ def test_light_scene_candidates_from_ledger_not_holding(tmp_path, monkeypatch):
         desk_calls["n"] += 1
         raise AssertionError("light path must not hit desk holdings")
 
-    monkeypatch.setattr(_api_roster, "_worker_holdings", boom)
+    monkeypatch.setattr(_api_roster, "_worker_holdings_evidence", boom)
     monkeypatch.setattr(_api_roster, "_desk_json", boom)
 
     model = _api_roster.scene_model(str(local), light=True)
     workers = {row["name"]: row
                for s in model["sectors"]
                for row in s["workers"]}
-    assert workers["kai"]["holding"]["state"] == "not_queried"
-    assert workers["kai"]["holding"]["items"] == []
+    assert workers["kai"]["holding"] == []
+    assert workers["kai"]["holding_state"] == "not_queried"
     cands = workers["kai"]["candidates"]
     assert len(cands) == 1
     assert cands[0]["id"] == "wf-158"
@@ -463,14 +465,15 @@ def test_scene_model_holding_unavailable_vs_empty(tmp_path, monkeypatch):
             "error": "", "partial": False,
         }
 
-    monkeypatch.setattr(_api_roster, "_worker_holdings", fake_holdings)
+    monkeypatch.setattr(_api_roster, "_worker_holdings_evidence", fake_holdings)
     workers = {row["name"]: row
                for s in board.scene_model(str(local))["sectors"]
                for row in s["workers"]}
-    assert workers["down"]["holding"]["state"] == "unavailable"
-    assert workers["down"]["holding"]["error"]
-    assert workers["clear"]["holding"]["state"] == "empty"
-    assert workers["clear"]["holding"]["items"] == []
+    assert workers["down"]["holding"] == []
+    assert workers["down"]["holding_state"] == "unavailable"
+    assert workers["down"]["holding_evidence"]["error"]
+    assert workers["clear"]["holding"] == []
+    assert workers["clear"]["holding_state"] == "empty"
 
 
 def test_staff_string_does_not_mis_bay_lane_hand(tmp_path, monkeypatch):

@@ -26,9 +26,20 @@ from .desk import (
     _holding_not_queried,
     _worker_flags,
     _worker_holdings,
+    _worker_holdings_evidence,
     _worker_queue,
     _worker_ready_teaser,
 )
+
+
+def _holding_fields(
+    evidence: object,
+) -> tuple:
+    """Split holding evidence into public list + metadata + state shorthand."""
+    ev = evidence if isinstance(evidence, dict) else _holding_not_queried()
+    items = list(ev.get("items") or [])
+    state = str(ev.get("state") or "not_queried")
+    return items, ev, state
 from .helpers import _cli_label, _display_names, _load_roster, _sector_for_worker
 from .law import _law_stack, _worker_health
 from .pulse import _launchctl_rota
@@ -97,7 +108,7 @@ def _worker_full_data(
     wf-250: holdings come from desk probes (signed WorkLane claims). Ledger
     CANDIDATE rows are dispatch-input context only.
     """
-    holding: Dict[str, object] = _holding_not_queried()
+    holding_evidence: Dict[str, object] = _holding_not_queried()
     candidates: List[Dict[str, object]] = []
     if w.name in in_flight_set:
         candidates = _ledger_candidates(local_root, w.name)
@@ -105,21 +116,21 @@ def _worker_full_data(
             fq = _inner.submit(_worker_queue, w)
             # scene bay = live claims only (in_progress); skip in_review round-trip
             fh = _inner.submit(
-                _worker_holdings, w,  # type: ignore[name-defined]
+                _worker_holdings_evidence, w,  # type: ignore[name-defined]
                 ("in_progress",),
             )
             q = fq.result()
             try:
-                holding = fh.result()
-                if not isinstance(holding, dict):
-                    holding = _holding_evidence(
+                holding_evidence = fh.result()
+                if not isinstance(holding_evidence, dict):
+                    holding_evidence = _holding_evidence(
                         [], state="unavailable", error="holdings probe failed")
-                items = list(holding.get("items") or [])
+                items = list(holding_evidence.get("items") or [])
                 if len(items) > 3:
-                    holding = dict(holding)
-                    holding["items"] = items[:3]
+                    holding_evidence = dict(holding_evidence)
+                    holding_evidence["items"] = items[:3]
             except Exception as exc:
-                holding = _holding_evidence(
+                holding_evidence = _holding_evidence(
                     [], state="unavailable", error=str(exc))
     else:
         q = _worker_queue(w)
@@ -131,7 +142,8 @@ def _worker_full_data(
     last = next((s for s in shifts if not s["dry_run"]), None)
     return {
         "q": q, "health": health, "last": last,
-        "holding": holding, "candidates": candidates,
+        "holding_evidence": holding_evidence,
+        "candidates": candidates,
     }
 
 
@@ -155,7 +167,8 @@ def scene_model(local_root: str, light: bool = False) -> Dict[str, object]:
     candidates (not holding) are filled from engine-owned CANDIDATE ledger
     rows when the worker is in_flight — local disk only, no desk round-trip.
     Stable fields present in both modes: name, kind, display, model,
-    schedule, owned, owner, skill, next_fire, daemon, in_flight, last_tick.
+    schedule, owned, owner, skill, next_fire, daemon, in_flight, last_tick,
+    holding (list), holding_evidence, holding_state.
     """
     roster = _load_roster(local_root)
     status = heartbeat_status(local_root)
@@ -222,14 +235,16 @@ def scene_model(local_root: str, light: bool = False) -> Dict[str, object]:
                     candidates = _ledger_candidates(local_root, name)
                 else:
                     candidates = []
-                holding = _holding_not_queried()
+                holding_evidence = _holding_not_queried()
             else:
                 _wd = _wdata_by[name]
                 q = _wd["q"]
                 health = _wd["health"]
                 last = _wd["last"]
-                holding = _wd["holding"]
+                holding_evidence = _wd["holding_evidence"]
                 candidates = _wd["candidates"]
+            holding_items, holding_evidence, holding_state = _holding_fields(
+                holding_evidence)
             cron = maybe_cron(w.schedule)
             nf = next_fire_utc(cron, _utcnow()) if cron else None
             gkey, workplace, role = _sector_for_worker(name, w, names)
@@ -252,7 +267,9 @@ def scene_model(local_root: str, light: bool = False) -> Dict[str, object]:
                 "skill": w.skill or "",
                 "next_fire": _utc_iso_z(nf) if nf else "",
                 "queue": q, "health": health["cls"], "why": health["why"],
-                "holding": holding,
+                "holding": holding_items,
+                "holding_evidence": holding_evidence,
+                "holding_state": holding_state,
                 "candidates": candidates,
                 "last_shift": ({"ts": last["ts"], "outcome": last["outcome"],
                                 "passes": last["passes"], "reason": last["reason"]}
@@ -276,7 +293,9 @@ def scene_model(local_root: str, light: bool = False) -> Dict[str, object]:
             "queue": "—",
             "health": "ok",
             "why": "citizen",
-            "holding": _holding_not_queried(),
+            "holding": [],
+            "holding_evidence": _holding_not_queried(),
+            "holding_state": "not_queried",
             "candidates": [],
             "last_shift": None,
             "no_clock_in": True,
@@ -514,8 +533,9 @@ def worker_model(local_root: str, name: str) -> Optional[Dict[str, object]]:
     shifts = parse_shifts(
         Ledger(os.path.join(local_root, "ledger"), name).tail(400), limit=10)
     # Holding = Owner: claims; ready = top of queue; flags = governance layer.
-    holding = _worker_holdings(w)
-    holding_items = list(holding.get("items") or []) if isinstance(holding, dict) else []
+    holding_evidence = _worker_holdings_evidence(w)
+    holding_items, holding_evidence, holding_state = _holding_fields(
+        holding_evidence)
     ready = _worker_ready_teaser(w) if w.queue_url else []
     flags = _worker_flags(w) if w.queue_url else []
     return {
@@ -530,7 +550,9 @@ def worker_model(local_root: str, name: str) -> Optional[Dict[str, object]]:
         "budget_secs": w.budget_secs, "max_passes": w.max_passes,
         "queue": q, "queue_url": w.queue_url or "",
         "health": health["cls"], "why": health["why"],
-        "holding": holding,
+        "holding": holding_items,
+        "holding_evidence": holding_evidence,
+        "holding_state": holding_state,
         "holding_count": len(holding_items),
         "ready": ready,
         "flags": flags,

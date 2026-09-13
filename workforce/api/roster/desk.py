@@ -101,21 +101,42 @@ def _worker_queue(w: Worker) -> str:
     return "?"
 
 
-def _desk_owner_of(task_id: str) -> str:
-    """Latest Owner: marker on a ticket (PROCESS.md §5)."""
-    d = _desk_json(
-        "/api/admin/tasks/" + urllib.parse.quote(str(task_id)),
-        timeout=_BOARD_DESK_TIMEOUT_SECS,
-    )
-    task = (d or {}).get("task") if isinstance(d, dict) else None
+def _desk_owner_of(
+    task_id: str, product: str = "",
+) -> Tuple[str, bool, str]:
+    """Latest Owner: marker on a ticket (PROCESS.md §5).
+
+    Returns ``(owner, ok, error)``. ``ok=False`` means the detail fetch failed
+    or the task could not be read — not a verified-empty Owner field.
+    ``ok=True`` with an empty owner means the ticket was read and has no
+    Owner marker. Bare numeric ids require an explicit *product* scope.
+    """
+    tid = str(task_id).strip()
+    qid = urllib.parse.quote(tid)
+    if tid.isdigit():
+        if not product:
+            return "", False, "bare task id requires project"
+        path = "/api/admin/tasks/%s?project=%s" % (
+            qid, urllib.parse.quote(product))
+    else:
+        path = "/api/admin/tasks/" + qid
+    d = _desk_json(path, timeout=_BOARD_DESK_TIMEOUT_SECS)
+    if d is None:
+        return "", False, "detail unreachable"
+    if not isinstance(d, dict):
+        return "", False, "detail malformed"
+    task = d.get("task") if isinstance(d.get("task"), dict) else None
     if not isinstance(task, dict):
-        task = d if isinstance(d, dict) and d.get("id") else None
-    for c in reversed((task or {}).get("comments") or []):
+        task = d if d.get("id") else None
+    if not isinstance(task, dict):
+        return "", False, "detail missing task"
+    for c in reversed(task.get("comments") or []):
         body = str(c.get("body") or "")
         if body.startswith("Owner: "):
             line = body.split("\n", 1)[0][len("Owner: "):].strip()
-            return line.split()[0].rstrip(".,;:") if line else ""
-    return ""
+            owner = line.split()[0].rstrip(".,;:") if line else ""
+            return owner, True, ""
+    return "", True, ""
 
 
 def _holding_evidence(
@@ -139,16 +160,17 @@ def _holding_not_queried() -> Dict[str, object]:
     return _holding_evidence([], state="not_queried")
 
 
-def _worker_holdings(
+def _worker_holdings_evidence(
     w: Worker,
     statuses: Tuple[str, ...] = ("in_progress", "in_review"),
 ) -> Dict[str, object]:
-    """Tickets this worker currently holds (in_progress / in_review + Owner:).
+    """Desk holding probe with explicit availability metadata.
 
     Label filters are routing hints only — each row still needs a bounded
-    Owner: detail lookup before it counts as a signed hold. Returns a wrapper
-    with ``state`` (available | empty | partial | unavailable | not_queried)
-    so consumers can tell verified empty from unreachable desk.
+    Owner: detail lookup before it counts as a signed hold. Returns
+    ``state`` (available | empty | partial | unavailable | not_queried)
+    so consumers can tell verified empty from unreachable desk or failed
+    detail reads.
 
     *statuses* defaults to both live and parked holds (personnel drawer). The
     scene bay teaser passes ``("in_progress",)`` only so one desk round-trip
@@ -175,6 +197,7 @@ def _worker_holdings(
     owner_cap_hit = False
     _owner_cap = 5  # hard bound on Owner: detail GETs per holdings probe
     fetch_errors: List[str] = []
+    detail_errors: List[str] = []
     any_ok = False
     for status in statuses:
         if label:
@@ -207,8 +230,11 @@ def _worker_holdings(
             if owner_lookups >= _owner_cap:
                 owner_cap_hit = True
                 break
-            owner = _desk_owner_of(tid)
+            owner, ok, detail_err = _desk_owner_of(tid, product)
             owner_lookups += 1
+            if not ok:
+                detail_errors.append("%s: %s" % (tid, detail_err))
+                continue
             tok = (owner.strip().split()[0].rstrip(".,;:").lower()
                    if owner else "")
             if tok not in aliases:
@@ -228,16 +254,28 @@ def _worker_holdings(
             })
         if owner_cap_hit:
             break
-    err = "; ".join(fetch_errors)
+    err = "; ".join(fetch_errors + detail_errors)
     if not any_ok:
         return _holding_evidence(
             [], state="unavailable", error=err or "desk unreachable")
-    if owner_cap_hit or fetch_errors:
+    if detail_errors and not held:
+        return _holding_evidence(
+            [], state="partial", error=err, partial=True)
+    if owner_cap_hit or fetch_errors or detail_errors:
         return _holding_evidence(
             held, state="partial", error=err, partial=True)
     if not held:
         return _holding_evidence([], state="empty")
     return _holding_evidence(held, state="available")
+
+
+def _worker_holdings(
+    w: Worker,
+    statuses: Tuple[str, ...] = ("in_progress", "in_review"),
+) -> List[Dict[str, object]]:
+    """Compatibility list wrapper over :func:`_worker_holdings_evidence`."""
+    ev = _worker_holdings_evidence(w, statuses=statuses)
+    return list(ev.get("items") or [])
 
 
 def _worker_ready_teaser(w: Worker, *, limit: int = 10) -> List[Dict[str, object]]:
