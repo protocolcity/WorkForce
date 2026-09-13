@@ -104,8 +104,8 @@ def test_scene_model_cli_from_command_path(tmp_path, monkeypatch):
     assert workers["kai"]["model"] == "grok-4.5"
 
 
-def test_scene_model_prefers_ledger_claim_over_desk(tmp_path, monkeypatch):
-    """wf-158: full scene uses CLAIM ledger when present (desk is fallback)."""
+def test_scene_model_holding_from_desk_candidates_from_ledger(tmp_path, monkeypatch):
+    """wf-250: desk owns holding; ledger CANDIDATE is dispatch context only."""
     import datetime
     local = _local(tmp_path)
     w = _worker(tmp_path, "morgan", "hoodM")
@@ -114,7 +114,7 @@ def test_scene_model_prefers_ledger_claim_over_desk(tmp_path, monkeypatch):
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     (local / "ledger" / "morgan.log").write_text(
         "%s START identity=morgan kind=lane queue=1 dry_run=0\n"
-        "%s CLAIM ticket=wf-158 title=from-ledger product=workforce\n"
+        "%s CANDIDATE ticket=wf-158 title=from-ledger product=workforce\n"
         % (now, now)
     )
     (local / "daemon.json").write_text(json.dumps({
@@ -130,8 +130,11 @@ def test_scene_model_prefers_ledger_claim_over_desk(tmp_path, monkeypatch):
                for s in model["sectors"]
                for row in s["workers"]}
     held = workers["morgan"]["holding"]
-    assert held[0]["id"] == "wf-158"
-    assert held[0]["source"] == "ledger"
+    assert held[0]["id"] == "desk-only"
+    cands = workers["morgan"]["candidates"]
+    assert cands[0]["id"] == "wf-158"
+    assert cands[0]["status"] == "candidate"
+    assert cands[0]["source"] == "ledger"
 
 
 def test_scene_model_holding_teaser_only_when_in_flight(tmp_path, monkeypatch):
@@ -373,7 +376,8 @@ def test_light_scene_schema_sentinels(tmp_path, monkeypatch):
     assert k["queue"] == "—"
     assert k["health"] == "ok"
     assert k["why"] == "light"
-    assert k["holding"] == []  # not in_flight, no CLAIM
+    assert k["holding"] == []  # not in_flight, no desk holding
+    assert k["candidates"] == []
     assert k["last_shift"] is None
     # stable fields still present and typed
     for field in ("name", "kind", "display", "model", "schedule",
@@ -383,8 +387,8 @@ def test_light_scene_schema_sentinels(tmp_path, monkeypatch):
     assert k["owned"] is True
 
 
-def test_light_scene_holding_from_ledger_claim(tmp_path, monkeypatch):
-    """wf-158: light path surfaces open CLAIM without a desk round-trip."""
+def test_light_scene_candidates_from_ledger_not_holding(tmp_path, monkeypatch):
+    """wf-250: light path surfaces CANDIDATE without desk or fake holding."""
     import datetime
     local = _local(tmp_path)
     w = _worker(tmp_path, "kai", "hoodK", schedule="*/5 * * * *")
@@ -393,7 +397,7 @@ def test_light_scene_holding_from_ledger_claim(tmp_path, monkeypatch):
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     (local / "ledger" / "kai.log").write_text(
         "%s START identity=kai kind=lane queue=1 dry_run=0\n"
-        "%s CLAIM ticket=wf-158 title=\"Engine claim\" product=workforce\n"
+        "%s CANDIDATE ticket=wf-158 title=\"Dispatch candidate\" product=workforce\n"
         % (now, now)
     )
     # mark in_flight via heartbeat
@@ -414,10 +418,12 @@ def test_light_scene_holding_from_ledger_claim(tmp_path, monkeypatch):
     workers = {row["name"]: row
                for s in model["sectors"]
                for row in s["workers"]}
-    held = workers["kai"]["holding"]
-    assert len(held) == 1
-    assert held[0]["id"] == "wf-158"
-    assert held[0]["source"] == "ledger"
+    assert workers["kai"]["holding"] == []
+    cands = workers["kai"]["candidates"]
+    assert len(cands) == 1
+    assert cands[0]["id"] == "wf-158"
+    assert cands[0]["status"] == "candidate"
+    assert cands[0]["source"] == "ledger"
     assert desk_calls["n"] == 0
 
 

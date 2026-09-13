@@ -39,7 +39,7 @@ from ..._utils import (  # noqa: F401
     _utcnow,
     desk_base_url,
 )
-from ...ledger import Ledger, open_claims, parse_shifts  # noqa: F401
+from ...ledger import Ledger, open_candidates, open_claims, parse_shifts  # noqa: F401
 from ...roster import Roster, RosterError, Worker  # noqa: F401
 from ...schedule import calendar_intervals_to_cron, maybe_cron, next_fire_utc  # noqa: F401
 from ... import roster as roster_mod  # noqa: F401
@@ -95,7 +95,7 @@ from .law import (  # noqa: F401
     _worker_health,
 )
 from .models import (  # noqa: F401
-    _ledger_holdings,
+    _ledger_candidates,
     _worker_full_data,
     report_model,
     scene_model,
@@ -143,7 +143,7 @@ _ADOPT_NAMES = (
     "_queue_human_link",
     "_is_connection_exc",
     "_worker_queue",
-    "_ledger_holdings",
+    "_ledger_candidates",
     "_worker_full_data",
     "_platforms",
     "_load_roster",
