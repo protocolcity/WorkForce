@@ -189,10 +189,16 @@ def test_shipped_example_loads_and_encodes_founder_rails():
     assert p.is_allowed_transition("grok-4.6", "claude-sonnet-4-6")
     # Patrol haiku ↔ grok
     assert p.is_allowed_transition("claude-haiku-4-5-20251001", "grok-4.6")
+    # Current pins (AGENT_ADOPTION D12, 2026-09-13): claude-sonnet-5 and
+    # composer-2.5 generalist seats, both with Grok fallback.
+    assert p.is_allowed_transition("claude-sonnet-5", "grok-4.6")
+    assert p.is_allowed_transition("composer-2.5", "grok-4.6")
     assert "heavy_multipass" in p.stay_pinned_tiers
     pair_ids = {pair.id for pair in p.pin_pairs}
     assert "generalist-claude-grok" in pair_ids
     assert "patrol-haiku-grok" in pair_ids
+    assert "generalist-claude5-grok" in pair_ids
+    assert "generalist-cursor-grok" in pair_ids
 
 
 def test_allows_field():
