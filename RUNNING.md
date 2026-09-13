@@ -112,18 +112,32 @@ home), `roster_path`, `projects`/`workers` allowlists, `provider_argv`, a
 `time_budget_secs`/`output_budget_bytes` pair, and `max_dispatch` are all
 required. Default mode is inspect/propose — it collects a fresh snapshot of
 exactly the configured manual (non-cron) lane workers, hands it to the
-configured provider as untrusted JSON (the provider has no mutation tools and
-cannot exceed the byte cap even mid-stream), and validates every proposed
-`{worker, project, task_id}` action against a re-checked ready feed (exact
-`worker:` label, `backlog` status, matching project, no blocking gate),
-worker allowlist membership, busy/lock state, and recent-shift monitoring
-flags before reporting it eligible. `--execute` dispatches only the actions
-that pass every check, through the existing `engine.dispatch` for that
-worker — which re-probes and works its own ready feed in its own order, so
-the evidence records what the engine actually picked up (ledger `CANDIDATE`
-rows), not merely what was requested. Every pass writes
-`local/reports/supervisor/<timestamp>.json` with the snapshot, provider
-result, validation reasons, and dispatch outcomes; it never closes WorkLane
-work and never invents a recovery — a stale/failed monitoring flag must be
-resolved through the explicit preserved-reservation recovery protocol above,
-not a fresh dispatch.
+configured provider as untrusted JSON over a byte-and-time-bounded pipe (the
+bound is enforced during the read itself, and a timeout/over-budget cutoff
+kills the provider's whole process group, not just its leader PID — this
+module does not and cannot claim that a generic provider argv has no tool
+access; that is the operator's own configuration to trust or not), then
+**re-fetches state again** after the provider returns and validates every
+proposed `{worker, project}` action against that later snapshot. `engine.
+dispatch` takes no task id — a worker always re-probes and works its own
+authoritative ready feed in its own order — so an action is WORKER+PROJECT
+scoped only; a fresh ready-task-id list is carried as context (proof real
+work exists), never a binding promise about which task runs. Checks are:
+worker/project allowlist membership, no duplicate WORKER across proposals in
+the same pass, matching project, busy/lock state, recent-shift monitoring
+flags, and at least one fresh eligible ready task. `--execute` re-checks
+each validated worker **again, immediately before** its own dispatch call
+(closing the gap since the last snapshot), then dispatches through the
+existing `engine.dispatch`. Because dispatch's return code alone cannot
+distinguish a completed shift from a clean SKIP or an explicit SCOPE_DENY/
+HOST_MUTATION_DENY refusal, the outcome is classified from the ledger rows
+that call itself wrote (`attempted`/`started`/`completed`/`failed`, plus an
+`outcome` string) — never from `len(results)` and never assumed from mere
+`CANDIDATE` row presence. Every pass writes exactly one evidence file under
+`local/reports/supervisor/` with a unique, exclusively-created filename (a
+timestamp alone can collide) with its own path embedded inside it; it never
+closes WorkLane work and never invents a recovery — a stale/failed
+monitoring flag must be resolved through the explicit preserved-reservation
+recovery protocol above, not a fresh dispatch. The CLI exits non-zero on a
+provider failure or any failed dispatch; it never reports success just
+because the process reached exit.
