@@ -1,8 +1,10 @@
 """Integrator job (wf-265) — pure policy + orchestration with fake ops."""
 
+import datetime
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -181,6 +183,15 @@ def test_build_close_body_has_all_four_sections():
     assert "Follow-ups: none" in body
 
 
+def test_close_evidence_links_cites_merge_and_version_shas():
+    links = integrator.close_evidence_links(
+        "abc1234567890", "def9876543210", "http://pr/1",
+    )
+    assert "abc1234567890 (merge)" in links
+    assert "def9876543210 (version)" in links
+    assert "http://pr/1" in links
+
+
 def test_coordinator_lock_is_fresh(tmp_path):
     lock = tmp_path / "COORDINATOR.lock"
     assert integrator.coordinator_lock_is_fresh(str(lock), 900) is False
@@ -255,7 +266,7 @@ def test_append_ledger_row_and_receipt(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_discover_candidates_filters_seat_project_lock_and_cap(tmp_path, monkeypatch):
+def test_discover_candidates_includes_busy_seat_orders(tmp_path, monkeypatch):
     w1 = make_worker(tmp_path, name="tester", command=["claude", "-p", "x"])
     w2 = make_worker(tmp_path, name="busy-seat", command=["cursor-agent"])
     roster_path = write_roster(tmp_path, [w1, w2])
@@ -271,10 +282,8 @@ def test_discover_candidates_filters_seat_project_lock_and_cap(tmp_path, monkeyp
     def fake_http(method, url, body=None, timeout=15.0):
         return {"ok": True, "tasks": tasks}
 
-    # Simulate busy-seat holding a live lock — engine.lock_inspect reads
-    # local_root/locks/<name>.lock; a live (non-orphan) lock excludes it.
-    # A real §3 lock is a directory holding a pid file (engine.lock_inspect);
-    # a JSON file of that name was never recognised, which the dropped cap hid.
+    # A live lock on busy-seat must not hide its parked order — only recovery
+    # needs the seat free; merge/close proceed in run_one.
     lock_dir = os.path.join(cfg["local_root"], "locks", "busy-seat.lock")
     os.makedirs(lock_dir, exist_ok=True)
     with open(os.path.join(lock_dir, "pid"), "w") as fh:
@@ -282,8 +291,9 @@ def test_discover_candidates_filters_seat_project_lock_and_cap(tmp_path, monkeyp
 
     candidates = integrator.discover_candidates(cfg, http=fake_http)
     ids = [c["task_id"] for c in candidates]
-    assert ids == ["wf-1"]
+    assert ids == ["wf-1", "wf-2"]
     assert candidates[0]["provider"] == "claude"
+    assert candidates[1]["provider"] == "cursor"
 
 
 def test_discover_candidates_bounds_to_headroom(tmp_path):
@@ -408,10 +418,23 @@ class FakeOps:
             "diff_text_val", "diff --git a/src/x.py b/src/x.py\n+1\n",
         )
         self.diff_text_bases = []
+        self.merge_base_conflict = overrides.get("merge_base_conflict", False)
+        self.merge_base_conflict_paths = overrides.get("merge_base_conflict_paths", ["src/x.py"])
+        self.merge_base_sha = overrides.get("merge_base_sha", "")
+        self.merge_base_failed = overrides.get("merge_base_failed", False)
+        self.merge_base_failed_output = overrides.get("merge_base_failed_output", "fetch failed")
         self.last_prompt = None
 
     def _record(self, name, *a, **kw):
         self.calls.append(name)
+
+    def merge_base_into_branch(self, checkout, branch, base):
+        self._record("merge_base_into_branch")
+        if self.merge_base_conflict:
+            return {"ok": False, "conflict": True, "paths": self.merge_base_conflict_paths, "output": ""}
+        if self.merge_base_failed:
+            return {"ok": False, "conflict": False, "paths": [], "output": self.merge_base_failed_output}
+        return {"ok": True, "conflict": False, "paths": [], "sha": self.merge_base_sha, "output": ""}
 
     def run_suites(self, checkout):
         self._record("run_suites")
@@ -561,6 +584,7 @@ class FakeOps:
     def as_dict(self):
         return {
             "run_suites": self.run_suites,
+            "merge_base_into_branch": self.merge_base_into_branch,
             "checkout_clean": self.checkout_clean_fn,
             "diff_text": self.diff_text,
             "checkout_head_sha": self.checkout_head_sha,
@@ -646,7 +670,61 @@ def test_run_one_suite_failure_stops_after_recovery_rounds_exhausted(tmp_path):
     ops = FakeOps(tmp_path, suite_rc=1)
     result = integrator.run_one(make_order(), cfg, ops.as_dict())
     assert result["outcome"] == "stopped"
+    assert "release_seat" in ops.calls
+    assert "stop_seat" in ops.calls
     assert "merge_pr" not in ops.calls
+
+
+def test_run_one_merges_base_before_suites(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, merge_base_sha="sha-merged")
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "closed"
+    assert ops.calls.index("merge_base_into_branch") < ops.calls.index("run_suites")
+
+
+def test_run_one_merge_base_conflict_dispatches_recovery_without_running_suites(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, merge_base_conflict=True, merge_base_conflict_paths=["src/x.py", "src/y.py"])
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "merge_base_conflict"
+    assert result["conflict_paths"] == ["src/x.py", "src/y.py"]
+    assert "run_suites" not in ops.calls
+    assert "merge_pr" not in ops.calls
+    assert len(ops.recovery_calls) == 1
+    assert "src/x.py" in ops.recovery_calls[0][2]
+    state = integrator.read_recovery_state(cfg["local_root"], "wf-1")
+    assert state["rounds_used"] == 1
+
+
+def test_run_one_merge_base_operational_failure_stops_without_suites(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, merge_base_failed=True, merge_base_failed_output="fetch: network unreachable")
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "merge_base_failed"
+    assert "run_suites" not in ops.calls
+    assert "merge_pr" not in ops.calls
+    assert "release_seat" in ops.calls
+    assert "stop_seat" in ops.calls
+    assert "dispatch_recovery" not in ops.calls
+    state = integrator.read_recovery_state(cfg["local_root"], "wf-1")
+    assert state["rounds_used"] == 0
+
+
+def test_run_one_merge_base_conflict_stops_once_recovery_rounds_exhausted(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_recovery_rounds=1)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {"rounds_used": 1})
+    ops = FakeOps(tmp_path, merge_base_conflict=True, merge_base_conflict_paths=["src/x.py"])
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "stopped"
+    assert "run_suites" not in ops.calls
+    assert "release_seat" in ops.calls
+    assert "stop_seat" in ops.calls
+    assert "dispatch_recovery" not in ops.calls
 
 
 def test_run_one_findings_recover_without_merging(tmp_path):
@@ -1106,6 +1184,76 @@ def test_clear_recovery_round_state_resets_rounds_and_records_who_and_why(tmp_pa
     assert integrator.read_recovery_state(local_root, "wf-1") == state
 
 
+def test_clear_recovery_round_state_clears_pending_activation_marker(tmp_path):
+    """wf-276 finding 3: a stuck handoff order cleared by a person must not
+    leave a pending-activation marker for the external activator to act on
+    outside this pass."""
+    local_root = str(tmp_path / "local")
+    integrator.write_pending_activation(local_root, "wf-1", {
+        "task_id": "wf-1", "project": "workforce", "version": "1.0.1",
+        "release_root": "/releases/1.0.1", "requested_at": "2026-01-01T00:00:00Z",
+    })
+    integrator.clear_recovery_round_state(local_root, "wf-1", "you", "reset for a fresh attempt")
+    assert integrator.read_pending_activation(local_root, "wf-1") is None
+
+
+def test_clear_recovery_state_clears_pending_activation_marker(tmp_path):
+    local_root = str(tmp_path / "local")
+    integrator.write_pending_activation(local_root, "wf-1", {
+        "task_id": "wf-1", "project": "workforce", "version": "1.0.1",
+        "release_root": "/releases/1.0.1", "requested_at": "2026-01-01T00:00:00Z",
+    })
+    integrator.clear_recovery_state(local_root, "wf-1")
+    assert integrator.read_pending_activation(local_root, "wf-1") is None
+
+
+def test_clear_recovery_state_clears_external_activator_pending_file(tmp_path):
+    """wf-276 recovery round 2, finding 2: ``wf-activate.sh`` leaves
+    ``<version>.pending`` in the same directory for ``wf-activator.sh`` to
+    consume outside any pass. Clearing only the integrator's own
+    ``<task-id>.json`` bookkeeping marker left that restart signal behind
+    for a stuck order a person just reset or abandoned. The pending file is
+    named from the raw release basename (``V=$(basename "$REL")`` in
+    ``wf-activate.sh``, not a sanitized form) -- WorkForce's own local-suffix
+    versions contain ``+`` (wf-276 recovery round 3, finding 1), so this must
+    be covered with such a version, not just a plain one."""
+    local_root = str(tmp_path / "local")
+    version = "0.1.9+consolidation.31"
+    integrator.write_pending_activation(local_root, "wf-1", {
+        "task_id": "wf-1", "project": "workforce", "version": version,
+        "release_root": "/releases/%s" % version, "requested_at": "2026-01-01T00:00:00Z",
+    })
+    pending_dir = os.path.join(local_root, "state", "integrator-activate")
+    os.makedirs(pending_dir, exist_ok=True)
+    pending_file = os.path.join(pending_dir, "%s.pending" % version)
+    with open(pending_file, "w", encoding="utf-8") as fh:
+        fh.write("/releases/%s\n" % version)
+
+    integrator.clear_recovery_state(local_root, "wf-1")
+
+    assert integrator.read_pending_activation(local_root, "wf-1") is None
+    assert not os.path.exists(pending_file)
+
+
+def test_clear_recovery_round_state_clears_external_activator_pending_file(tmp_path):
+    local_root = str(tmp_path / "local")
+    version = "0.1.9+consolidation.31"
+    integrator.write_pending_activation(local_root, "wf-1", {
+        "task_id": "wf-1", "project": "workforce", "version": version,
+        "release_root": "/releases/%s" % version, "requested_at": "2026-01-01T00:00:00Z",
+    })
+    pending_dir = os.path.join(local_root, "state", "integrator-activate")
+    os.makedirs(pending_dir, exist_ok=True)
+    pending_file = os.path.join(pending_dir, "%s.pending" % version)
+    with open(pending_file, "w", encoding="utf-8") as fh:
+        fh.write("/releases/%s\n" % version)
+
+    integrator.clear_recovery_round_state(local_root, "wf-1", "you", "reset for a fresh attempt")
+
+    assert integrator.read_pending_activation(local_root, "wf-1") is None
+    assert not os.path.exists(pending_file)
+
+
 def test_run_one_stop_after_a_human_clear_reports_who_cleared_it(tmp_path):
     roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
     cfg = base_config(tmp_path, roster_path, max_recovery_rounds=1)
@@ -1465,24 +1613,84 @@ def _write_live_lock(local_root, worker):
 
 def test_seat_in_flight_true_for_live_lock(tmp_path):
     local_root = str(tmp_path / "local")
+    worker = make_worker(tmp_path, name="some-seat")
+    workers = {worker.name: worker}
     _write_live_lock(local_root, "some-seat")
-    assert integrator.seat_in_flight(local_root) is True
+    assert integrator.seat_in_flight(local_root, workers) is True
 
 
 def test_seat_in_flight_true_for_open_ledger_shift(tmp_path):
     local_root = str(tmp_path / "local")
+    worker = make_worker(tmp_path, name="some-seat")
+    workers = {worker.name: worker}
     ledger_dir = os.path.join(local_root, "ledger")
     os.makedirs(ledger_dir, exist_ok=True)
     with open(os.path.join(ledger_dir, "some-seat.log"), "w") as fh:
         fh.write("%s START queue=ready budget_secs=600\n" % integrator._utc_iso_z())
-    assert integrator.seat_in_flight(local_root) is True
+    assert integrator.seat_in_flight(local_root, workers) is True
 
 
 def test_seat_in_flight_false_when_no_locks_or_open_shifts(tmp_path):
-    assert integrator.seat_in_flight(str(tmp_path / "local")) is False
+    worker = make_worker(tmp_path, name="tester")
+    assert integrator.seat_in_flight(str(tmp_path / "local"), {worker.name: worker}) is False
 
 
-def test_run_one_skips_activate_when_seat_in_flight(tmp_path):
+def test_seat_in_flight_legacy_one_arg_fails_safe_on_any_lock(tmp_path):
+    local_root = str(tmp_path / "local")
+    _write_live_lock(local_root, "any-seat")
+    assert integrator.seat_in_flight(local_root) is True
+
+
+def test_seat_in_flight_legacy_one_arg_fails_safe_on_open_shift(tmp_path):
+    local_root = str(tmp_path / "local")
+    ledger_dir = os.path.join(local_root, "ledger")
+    os.makedirs(ledger_dir, exist_ok=True)
+    with open(os.path.join(ledger_dir, "any-seat.log"), "w") as fh:
+        fh.write("%s START queue=ready budget_secs=600\n" % integrator._utc_iso_z())
+    assert integrator.seat_in_flight(local_root) is True
+
+
+def test_seat_in_flight_ignores_retired_identity_ledger(tmp_path):
+    local_root = str(tmp_path / "local")
+    worker = make_worker(tmp_path, name="active-seat")
+    ledger_dir = os.path.join(local_root, "ledger")
+    os.makedirs(ledger_dir, exist_ok=True)
+    with open(os.path.join(ledger_dir, "retired-seat.log"), "w") as fh:
+        fh.write("%s START queue=ready budget_secs=600\n" % integrator._utc_iso_z())
+    assert integrator.seat_in_flight(local_root, {worker.name: worker}) is False
+
+
+def test_seat_in_flight_ignores_stale_open_shift(tmp_path):
+    local_root = str(tmp_path / "local")
+    worker = make_worker(tmp_path, name="some-seat")
+    workers = {worker.name: worker}
+    ledger_dir = os.path.join(local_root, "ledger")
+    os.makedirs(ledger_dir, exist_ok=True)
+    stale_ts = integrator._utc_iso_z(
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=120),
+    )
+    with open(os.path.join(ledger_dir, "some-seat.log"), "w") as fh:
+        fh.write("%s START queue=ready budget_secs=60\n" % stale_ts)
+    assert integrator.seat_in_flight(local_root, workers) is False
+
+
+def test_run_one_merges_but_skips_activate_while_seat_locked(tmp_path):
+    """Merge/bump/stage proceed while the seat is busy; activate waits."""
+    worker = make_worker(tmp_path, name="tester")
+    roster_path = write_roster(tmp_path, [worker])
+    cfg = base_config(tmp_path, roster_path)
+    _write_live_lock(cfg["local_root"], "tester")
+    ops = FakeOps(tmp_path)
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "activate_skipped"
+    assert "merge_pr" in ops.calls
+    assert "write_version" in ops.calls
+    assert "run_stage" in ops.calls
+    assert "run_activate" not in ops.calls
+    assert "close_order" not in ops.calls
+
+
+def test_run_one_skips_activate_when_other_seat_in_flight(tmp_path):
     roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
     cfg = base_config(tmp_path, roster_path)
     _write_live_lock(cfg["local_root"], "tester")  # the roster lane; a non-lane lock is not a seat (wf-275)
@@ -1491,19 +1699,11 @@ def test_run_one_skips_activate_when_seat_in_flight(tmp_path):
     assert result["outcome"] == "activate_skipped"
     assert "run_activate" not in ops.calls
     assert "close_order" not in ops.calls
-    # merge/version/stage already happened this pass
     assert "write_version" in ops.calls
     assert "run_stage" in ops.calls
 
 
 def test_run_one_resumes_from_activate_after_seat_in_flight_without_remerging(tmp_path):
-    """Second-pass review finding 1: activate_skipped must be resumable.
-
-    A pass parked at ``activate_skipped`` persists merged/bumped/staged
-    state; once the blocking seat clears, the next ``run_one`` call for the
-    same order must finish from activate — never re-running suites, review,
-    or ``merge_pr``.
-    """
     roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
     cfg = base_config(tmp_path, roster_path)
     _write_live_lock(cfg["local_root"], "tester")  # the roster lane; a non-lane lock is not a seat (wf-275)
@@ -1526,6 +1726,181 @@ def test_run_one_resumes_from_activate_after_seat_in_flight_without_remerging(tm
     assert "run_activate" in ops.calls
     assert "close_order" in ops.calls
     assert second["version"] == {"from": "1.0.0", "to": "1.0.1"}
+
+
+def test_run_one_suite_recovery_seat_busy_leaves_rounds_unchanged(tmp_path):
+    worker = make_worker(tmp_path, name="tester")
+    roster_path = write_roster(tmp_path, [worker])
+    cfg = base_config(tmp_path, roster_path)
+    _write_live_lock(cfg["local_root"], "tester")
+    ops = FakeOps(tmp_path, suite_rc=1)
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "seat_busy"
+    assert result["seat"] == "tester"
+    assert "dispatch_recovery" not in ops.calls
+    assert "release_seat" not in ops.calls
+    assert integrator.read_recovery_state(cfg["local_root"], "wf-1")["rounds_used"] == 0
+
+
+def test_run_one_findings_stop_after_recovery_rounds_exhausted_releases_seat(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_recovery_rounds=1)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {"rounds_used": 1})
+    ops = FakeOps(tmp_path, review_findings=["fix the thing"])
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "stopped"
+    assert "release_seat" in ops.calls
+    assert "stop_seat" in ops.calls
+    assert "merge_pr" not in ops.calls
+
+
+def test_run_one_findings_recovery_seat_busy_leaves_rounds_unchanged(tmp_path):
+    worker = make_worker(tmp_path, name="tester")
+    roster_path = write_roster(tmp_path, [worker])
+    cfg = base_config(tmp_path, roster_path)
+    _write_live_lock(cfg["local_root"], "tester")
+    ops = FakeOps(tmp_path, review_findings=["fix the thing"])
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "seat_busy"
+    assert result["seat"] == "tester"
+    assert "dispatch_recovery" not in ops.calls
+    assert "release_seat" not in ops.calls
+    assert integrator.read_recovery_state(cfg["local_root"], "wf-1")["rounds_used"] == 0
+
+
+def test_run_one_findings_recovery_seat_busy_on_open_shift_without_lock(tmp_path):
+    """Open ledger shift without a lock must still defer recovery."""
+    worker = make_worker(tmp_path, name="tester")
+    roster_path = write_roster(tmp_path, [worker])
+    cfg = base_config(tmp_path, roster_path)
+    ledger_dir = os.path.join(cfg["local_root"], "ledger")
+    os.makedirs(ledger_dir, exist_ok=True)
+    with open(os.path.join(ledger_dir, "tester.log"), "w") as fh:
+        fh.write("%s START queue=ready budget_secs=600\n" % integrator._utc_iso_z())
+    ops = FakeOps(tmp_path, review_findings=["fix the thing"])
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "seat_busy"
+    assert result["seat"] == "tester"
+    assert "dispatch_recovery" not in ops.calls
+    assert "release_seat" not in ops.calls
+    assert integrator.read_recovery_state(cfg["local_root"], "wf-1")["rounds_used"] == 0
+
+
+# --------------------------------------------------------------------------
+# wf-276 — activation_mode "handoff": never restart the daemon in-pass
+# --------------------------------------------------------------------------
+
+
+def test_run_one_handoff_writes_pending_marker_and_never_activates(tmp_path):
+    """``activate_cmd`` (``wf-activate.sh`` in production) never restarts the
+    daemon itself — it either confirms the release is already active or
+    leaves its own pending marker and exits nonzero. Calling it from a
+    handoff pass is safe; a nonzero rc here means "handed off"."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, activation_mode="handoff")
+    ops = FakeOps(tmp_path, activate_rc=1)
+    order = make_order()
+
+    result = integrator.run_one(order, cfg, ops.as_dict())
+
+    assert result["outcome"] == "activation_handoff"
+    assert "run_activate" in ops.calls
+    assert "close_order" not in ops.calls
+    marker = integrator.read_pending_activation(cfg["local_root"], order["task_id"])
+    assert marker is not None
+    assert marker["version"] == "1.0.1"
+    assert marker["release_root"] == os.path.join(cfg["release_root"], "1.0.1")
+
+
+def test_run_one_handoff_pending_retries_without_stop_or_park(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, activation_mode="handoff")
+    ops = FakeOps(tmp_path, activate_rc=1, verify_ok=False)
+    order = make_order()
+
+    first = integrator.run_one(order, cfg, ops.as_dict())
+    assert first["outcome"] == "activation_handoff"
+
+    # activate_cmd still reports the release pending; the scheduled
+    # activator has not restarted yet.
+    second = integrator.run_one(order, cfg, ops.as_dict())
+    assert second["outcome"] == "activation_pending"
+    assert "close_order" not in ops.calls
+    assert "post_comment" not in ops.calls
+    assert "park_seat" not in ops.calls
+    assert "stop_seat" not in ops.calls
+    marker = integrator.read_pending_activation(cfg["local_root"], order["task_id"])
+    assert marker is not None
+
+
+def test_run_one_handoff_closes_once_marker_is_already_active(tmp_path):
+    """Done-when: a pass with a marker for an already-active release closes."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, activation_mode="handoff")
+    ops = FakeOps(tmp_path, activate_rc=1, verify_ok=False)
+    order = make_order()
+
+    first = integrator.run_one(order, cfg, ops.as_dict())
+    assert first["outcome"] == "activation_handoff"
+    assert "run_activate" in ops.calls
+
+    # The scheduled activator restarted the daemon between passes;
+    # activate_cmd now confirms the release is already active.
+    ops.activate_rc = 0
+    ops.verify_ok = True
+    second = integrator.run_one(order, cfg, ops.as_dict())
+
+    assert second["outcome"] == "closed"
+    assert "run_activate" in ops.calls
+    assert "close_order" in ops.calls
+    assert integrator.read_pending_activation(cfg["local_root"], order["task_id"]) is None
+
+
+def test_run_one_handoff_stops_and_parks_when_activate_ok_but_verify_fails(tmp_path):
+    """wf-276 recovery round 2, finding 1: when ``activate_cmd`` reports rc 0
+    (already active) it has, per its own contract, already removed the
+    external ``.pending`` marker — there is no restart signal left anywhere
+    for a later pass to wait on. Retrying would just re-call activate_cmd
+    and repeat the same rc-0/verify-fail outcome forever, so this must stop
+    and park for a person instead of recording ``activation_pending``."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, activation_mode="handoff")
+    ops = FakeOps(tmp_path, activate_rc=0, verify_ok=False, verify_observed="1.0.0")
+    order = make_order()
+
+    result = integrator.run_one(order, cfg, ops.as_dict())
+
+    assert result["outcome"] == "install_not_verified"
+    assert "close_order" not in ops.calls
+    assert "post_comment" in ops.calls
+    assert "park_seat" in ops.calls
+
+
+def test_run_one_handoff_never_restarts_when_seat_in_flight(tmp_path):
+    """The handoff call is not gated on seat_in_flight — activate_cmd itself
+    is the thing that never restarts from inside a pass."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, activation_mode="handoff")
+    _write_live_lock(cfg["local_root"], "tester")
+    ops = FakeOps(tmp_path, activate_rc=1)
+    order = make_order()
+
+    result = integrator.run_one(order, cfg, ops.as_dict())
+
+    assert result["outcome"] == "activation_handoff"
+    assert "run_activate" in ops.calls
+
+
+def test_load_config_rejects_unknown_activation_mode(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    with pytest.raises(integrator.IntegratorError):
+        base_config(tmp_path, roster_path, activation_mode="restart")
+
+
+def test_load_config_defaults_activation_mode_to_in_pass(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    assert cfg["activation_mode"] == "in_pass"
 
 
 # --------------------------------------------------------------------------
@@ -2708,6 +3083,7 @@ def test_run_one_stops_with_checkout_missing_when_suites_cannot_start(tmp_path, 
     ops = {
         "checkout_head_sha": checkout_head_sha,
         "run_suites": run_suites,
+        "merge_base_into_branch": lambda checkout, branch, base: {"ok": True, "conflict": False, "sha": ""},
         "post_comment": lambda tid, body: posted.append((tid, body)),
         "stop_seat": stop_seat,
     }
@@ -2748,6 +3124,125 @@ def test_parse_reviewer_findings_fenced_json_after_prose_counts_entries():
         "Finding 4 is closed.\n"
     )
     assert integrator.parse_reviewer_findings(text) == ["first defect", "second defect"]
+
+
+# --------------------------------------------------------------------------
+# wf-274 follow-up: default_ops.merge_base_into_branch against real git, not
+# just FakeOps stubs — already-up-to-date, a clean merge that pushes, a
+# conflicting merge that aborts and leaves the seat's commit intact, and a
+# non-conflict merge failure (unknown base ref).
+# --------------------------------------------------------------------------
+
+
+def _run_git(args, cwd):
+    return subprocess.run(
+        ["git"] + args, cwd=str(cwd), capture_output=True, text=True,
+    )
+
+
+def _run_git_ok(args, cwd):
+    result = _run_git(args, cwd)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result
+
+
+def _init_origin_and_feature_branch(tmp_path, base="main"):
+    """A bare origin with *base* seeded, and a checkout on branch "feature"
+    cut from that same commit, mirroring how a seat branch is cut at
+    dispatch time."""
+    origin = tmp_path / "origin.git"
+    _run_git_ok(["init", "--bare", "-b", base, str(origin)], tmp_path)
+
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _run_git_ok(["init", "-b", base], seed)
+    _run_git_ok(["config", "user.email", "t@example.com"], seed)
+    _run_git_ok(["config", "user.name", "Test"], seed)
+    (seed / "shared.txt").write_text("base line\n")
+    _run_git_ok(["add", "."], seed)
+    _run_git_ok(["commit", "-m", "seed"], seed)
+    _run_git_ok(["remote", "add", "origin", str(origin)], seed)
+    _run_git_ok(["push", "origin", base], seed)
+
+    checkout = tmp_path / "checkout"
+    _run_git_ok(["clone", str(origin), str(checkout)], tmp_path)
+    _run_git_ok(["config", "user.email", "t@example.com"], checkout)
+    _run_git_ok(["config", "user.name", "Test"], checkout)
+    _run_git_ok(["checkout", "-b", "feature", base], checkout)
+    return origin, seed, checkout
+
+
+def _push_base_commit(seed, base, filename, contents):
+    """Land a further commit on *base* through the seed clone, so origin's
+    base tip diverges from what the seat's checkout was cut from."""
+    (seed / filename).write_text(contents)
+    _run_git_ok(["add", "."], seed)
+    _run_git_ok(["commit", "-m", "base moves"], seed)
+    _run_git_ok(["push", "origin", base], seed)
+
+
+def _default_ops(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    return integrator.default_ops(cfg)
+
+
+def test_default_ops_merge_base_into_branch_already_up_to_date(tmp_path):
+    origin, seed, checkout = _init_origin_and_feature_branch(tmp_path)
+    ops = _default_ops(tmp_path)
+    result = ops["merge_base_into_branch"](str(checkout), "feature", "main")
+    assert result["ok"] is True
+    assert result["conflict"] is False
+    ls_remote = _run_git(["ls-remote", str(origin), "refs/heads/feature"], tmp_path)
+    assert ls_remote.stdout.strip() == ""
+
+
+def test_default_ops_merge_base_into_branch_clean_merge_pushes(tmp_path):
+    origin, seed, checkout = _init_origin_and_feature_branch(tmp_path)
+    (checkout / "seat.txt").write_text("seat work\n")
+    _run_git_ok(["add", "."], checkout)
+    _run_git_ok(["commit", "-m", "seat commit"], checkout)
+    seat_sha = _run_git_ok(["rev-parse", "HEAD"], checkout).stdout.strip()
+    _push_base_commit(seed, "main", "base_only.txt", "base moved on\n")
+
+    ops = _default_ops(tmp_path)
+    result = ops["merge_base_into_branch"](str(checkout), "feature", "main")
+    assert result["ok"] is True
+    assert result["conflict"] is False
+    assert result["sha"] and result["sha"] != seat_sha
+    ls_remote = _run_git_ok(["ls-remote", str(origin), "refs/heads/feature"], tmp_path)
+    assert result["sha"] in ls_remote.stdout
+    log = _run_git_ok(["log", "--oneline", "-1"], checkout).stdout
+    assert "Merge main into feature (integrator)" in _run_git_ok(["log", "-1", "--format=%B"], checkout).stdout
+    parents = _run_git_ok(["log", "-1", "--format=%P"], checkout).stdout.split()
+    assert seat_sha in parents
+
+
+def test_default_ops_merge_base_into_branch_conflict_aborts_and_keeps_seat_commit(tmp_path):
+    origin, seed, checkout = _init_origin_and_feature_branch(tmp_path)
+    (checkout / "shared.txt").write_text("seat line\n")
+    _run_git_ok(["add", "."], checkout)
+    _run_git_ok(["commit", "-m", "seat commit"], checkout)
+    seat_sha = _run_git_ok(["rev-parse", "HEAD"], checkout).stdout.strip()
+    _push_base_commit(seed, "main", "shared.txt", "base line changed\n")
+
+    ops = _default_ops(tmp_path)
+    result = ops["merge_base_into_branch"](str(checkout), "feature", "main")
+    assert result["ok"] is False
+    assert result["conflict"] is True
+    assert result["paths"] == ["shared.txt"]
+    status = _run_git_ok(["status", "--porcelain=v2"], checkout).stdout
+    assert "unmerged" not in status.lower() and "MERGE_HEAD" not in status
+    assert _run_git_ok(["rev-parse", "HEAD"], checkout).stdout.strip() == seat_sha
+
+
+def test_default_ops_merge_base_into_branch_non_conflict_failure_is_not_reported_as_conflict(tmp_path):
+    origin, seed, checkout = _init_origin_and_feature_branch(tmp_path)
+    ops = _default_ops(tmp_path)
+    result = ops["merge_base_into_branch"](str(checkout), "feature", "no-such-base-branch")
+    assert result["ok"] is False
+    assert result["conflict"] is False
+    assert result["paths"] == []
 
 
 # --------------------------------------------------------------------------
@@ -2865,6 +3360,7 @@ def test_run_one_checkout_missing_skips_stop_ledger_row_when_repark_fails(tmp_pa
     ops = {
         "checkout_head_sha": checkout_head_sha,
         "run_suites": run_suites,
+        "merge_base_into_branch": lambda checkout, branch, base: {"ok": True, "conflict": False, "sha": ""},
         "post_comment": lambda tid, body: None,
         "stop_seat": stop_seat,
     }
@@ -2897,6 +3393,7 @@ def test_run_one_checkout_missing_logs_stop_when_repark_succeeds(tmp_path):
     ops = {
         "checkout_head_sha": checkout_head_sha,
         "run_suites": run_suites,
+        "merge_base_into_branch": lambda checkout, branch, base: {"ok": True, "conflict": False, "sha": ""},
         "post_comment": lambda tid, body: None,
         "stop_seat": stop_seat,
     }
@@ -3081,6 +3578,8 @@ def test_finish_after_stage_close_failed_keeps_state_and_skips_prune(tmp_path, m
         "pr": {"number": 1, "url": "http://pr/1"},
         "reviewer": "cursor-reviewer",
         "version": {"from": "1.0.0", "to": "1.0.1"},
+        "merge_sha": "abc1234567890",
+        "version_sha": "def9876543210",
     }
     integrator.write_post_merge_state(cfg["local_root"], "wf-1", post_merge)
     integrator.write_recovery_state(cfg["local_root"], "wf-1", {"rounds_used": 1})
@@ -3092,6 +3591,8 @@ def test_finish_after_stage_close_failed_keeps_state_and_skips_prune(tmp_path, m
     }
     out = integrator._finish_after_stage("wf-1", "workforce", cfg, ops.as_dict(), post_merge, result)
     assert out["outcome"] == "close_failed"
+    assert "abc1234567890" in ops.close_evidence["links"]
+    assert "def9876543210" in ops.close_evidence["links"]
     assert "park_seat" in ops.calls
     assert prune_calls == []
     assert integrator.read_post_merge_state(cfg["local_root"], "wf-1") == post_merge
@@ -3113,6 +3614,8 @@ def test_finish_after_stage_confirmed_close_prunes_and_clears_state(tmp_path, mo
         "pr": {"number": 1, "url": "http://pr/1"},
         "reviewer": "cursor-reviewer",
         "version": {"from": "1.0.0", "to": "1.0.1"},
+        "merge_sha": "abc1234567890",
+        "version_sha": "def9876543210",
     }
     integrator.write_post_merge_state(cfg["local_root"], "wf-1", post_merge)
     integrator.write_recovery_state(cfg["local_root"], "wf-1", {"rounds_used": 1})
@@ -3127,6 +3630,8 @@ def test_finish_after_stage_confirmed_close_prunes_and_clears_state(tmp_path, mo
     }
     out = integrator._finish_after_stage("wf-1", "workforce", cfg, ops.as_dict(), post_merge, result)
     assert out["outcome"] == "closed"
+    assert "abc1234567890" in ops.close_evidence["links"]
+    assert "def9876543210" in ops.close_evidence["links"]
     assert prune_calls == [("tester", "wf-1")]
     assert integrator.read_post_merge_state(cfg["local_root"], "wf-1") is None
     assert integrator.read_recovery_state(cfg["local_root"], "wf-1") == {"rounds_used": 0}
