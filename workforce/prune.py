@@ -381,7 +381,15 @@ def apply_prune(
     checkout_planned = any(a.get("kind") == "checkout" for a in plan.get("actions") or [])
     checkout_cleared = not checkout_planned
 
-    for action in plan.get("actions") or []:
+    # Task-run cleanup is gated on the checkout having been removed, so the
+    # checkout action must run first whatever order the plan lists them in
+    # (a plan read back from JSON or built by hand may not be ordered).
+    _order = {"branch": 0, "checkout": 1, "task_run": 2}
+    ordered_actions = sorted(
+        plan.get("actions") or [], key=lambda a: _order.get(a.get("kind"), 99),
+    )
+
+    for action in ordered_actions:
         kind = action.get("kind")
         if kind == "branch":
             branch = action["branch"]

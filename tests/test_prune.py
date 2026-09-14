@@ -1,5 +1,6 @@
 """Seat branch/checkout pruning (wf-267)."""
 
+import shutil
 import json
 import os
 import subprocess
@@ -330,3 +331,39 @@ def test_prune_ledger_event_allowed(tmp_path):
         ticket="wf-1", worker="tester", target="branch",
     )
     assert " PRUNE " in line
+
+
+def test_apply_prune_cleans_task_run_when_listed_before_checkout(tmp_path):
+    """Round-3 finding: a plan that lists task_run before checkout must still
+    clean the task-run once the worktree removal succeeds."""
+    workspace = tmp_path / "ws"
+    task_run = workspace / "local" / "task-runs" / "tester" / "wf-9"
+    checkout = task_run / "checkout"
+    checkout.mkdir(parents=True)
+    (task_run / "preparation.json").write_text("{}\n")
+    (task_run / "prompt.md").write_text("prompt\n")
+    cfg = {
+        "pr_base": "main",
+        "checkout_template": "local/task-runs/{worker}/{task_id}/checkout",
+        "workspace_root": str(workspace),
+        "branch_template": "workforce/task/{worker}/{task_id}",
+        "local_root": str(workspace / "local"),
+        "project": "workforce",
+    }
+    ops = FakePruneOps()
+    ops_dict = ops.as_dict()
+
+    def ok_remove_worktree(path):
+        ops.removed_worktrees.append(path)
+        shutil.rmtree(path, ignore_errors=True)
+        return {"rc": 0, "output": ""}
+
+    ops_dict["remove_worktree"] = ok_remove_worktree
+    plan = prune.evaluate_prune(cfg, "tester", "wf-9", ops_dict, task_status="done")
+    plan["actions"] = sorted(
+        plan["actions"], key=lambda a: {"task_run": 0, "checkout": 1, "branch": 2}[a["kind"]],
+    )
+    receipt = prune.apply_prune(cfg, plan, ops_dict)
+    assert not (task_run / "prompt.md").exists()
+    assert (task_run / "preparation.json").exists()
+    assert any(item.get("kind") == "task_run" for item in receipt["removed"])
