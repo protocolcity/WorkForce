@@ -1903,8 +1903,10 @@ def test_shift_finalize_skips_when_not_ff_able(tmp_path):
     from workforce.engine import Ledger, _finalize_shift_workdir
 
     led = Ledger(str(tmp_path / "local" / "ledger"), "tester")
-    kv = _finalize_shift_workdir(w, str(wt), led)
+    kv, note = _finalize_shift_workdir(w, str(wt), led)
     assert kv == {}
+    assert note is not None
+    assert "not ff-able" in note
     text = (tmp_path / "local" / "ledger" / "tester.log").read_text()
     assert "not ff-able" in text
     # Primary unchanged (still founder tip).
