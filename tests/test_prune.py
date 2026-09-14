@@ -209,6 +209,54 @@ def test_prune_after_close_assumes_merged(tmp_path):
     assert any(item["kind"] == "checkout" for item in receipt["removed"])
 
 
+def test_discover_local_reservations_skips_cross_project_reservations(tmp_path):
+    """wf-273 — the shared local/task-runs root holds every seat's
+    reservations; a config for one project must not plan another
+    project's leftovers, only report them as skipped."""
+    cfg, main, checkout, task_run, branch = _seat_layout(tmp_path)  # tester/wf-9, roster seat product=workforce
+    task_runs_root = checkout.parent.parent.parent  # .../local/task-runs
+
+    # Unknown seat, task id carries a foreign project prefix — excluded via prefix.
+    foreign = task_runs_root / "ts-cursor-implementer" / "ts-12" / "checkout"
+    foreign.mkdir(parents=True)
+    (foreign.parent / "preparation.json").write_text(json.dumps({"task_id": "ts-12"}))
+
+    # Unknown seat, task id carries this project's own prefix — included via prefix.
+    unknown_own = task_runs_root / "wf-mystery" / "wf-77" / "checkout"
+    unknown_own.mkdir(parents=True)
+    (unknown_own.parent / "preparation.json").write_text(json.dumps({"task_id": "wf-77"}))
+
+    # Roster seat resolved to a *different* project decisively excludes it,
+    # even though its task id happens to carry this project's own prefix.
+    cross_worker = make_worker(tmp_path, name="cross-worker")
+    cross_worker = cross_worker.__class__(
+        **{**{f: getattr(cross_worker, f) for f in cross_worker.__dataclass_fields__},
+           "queue_url": "http://desk.test/api/admin/tasks/ready?product=tradeos&label=worker:cross-worker"},
+    )
+    roster_raw = json.loads(open(cfg["roster_path"]).read())
+    roster_raw["workers"]["cross-worker"] = {
+        f: getattr(cross_worker, f) for f in cross_worker.__dataclass_fields__ if f != "name"
+    }
+    with open(cfg["roster_path"], "w") as fh:
+        json.dump(roster_raw, fh)
+    cross_dir = task_runs_root / "cross-worker" / "wf-55" / "checkout"
+    cross_dir.mkdir(parents=True)
+    (cross_dir.parent / "preparation.json").write_text(json.dumps({"task_id": "wf-55"}))
+
+    rows = prune.discover_local_reservations(cfg)
+    keys = {(r["worker"], r["task_id"]) for r in rows}
+    assert ("tester", "wf-9") in keys
+    assert ("wf-mystery", "wf-77") in keys
+    assert ("ts-cursor-implementer", "ts-12") not in keys
+    assert ("cross-worker", "wf-55") not in keys
+
+    ledger_path = os.path.join(cfg["local_root"], "ledger", "integrator-%s.log" % cfg["project"])
+    with open(ledger_path) as fh:
+        ledger_text = fh.read()
+    assert "ticket=ts-12" in ledger_text and "skipped=cross_project" in ledger_text
+    assert "ticket=wf-55" in ledger_text
+
+
 def test_prune_pass_discovers_local_reservation(tmp_path):
     cfg, main, checkout, task_run, branch = _seat_layout(tmp_path)
     ops = FakePruneOps()
