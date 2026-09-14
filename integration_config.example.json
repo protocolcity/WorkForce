@@ -32,6 +32,7 @@
   },
   "merge_method": "merge",
   "max_recovery_rounds": 2,
+  "max_findings_per_round": 3,
   "coordinator_lock_path": "/path/to/OneSeo/local/COORDINATOR.lock",
   "coordinator_lock_ttl_secs": 900,
   "checkout_template": "local/task-runs/{worker}/{task_id}/checkout",

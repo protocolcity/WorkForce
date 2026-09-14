@@ -342,6 +342,15 @@ class FakeOps:
         self.activate_ctx = None
         self.verify_ctx = None
         self.screenshot_ctx = None
+        self._head_sha_calls = 0
+        self.head_shas = overrides.get("head_shas", ["sha-head-1", "sha-head-2", "sha-head-3"])
+        self.close_evidence = None
+        self.sha_exists_val = overrides.get("sha_exists_val", True)
+        self.sha_reachable_val = overrides.get("sha_reachable_val", True)
+        self.diff_text_val = overrides.get(
+            "diff_text_val", "diff --git a/src/x.py b/src/x.py\n+1\n",
+        )
+        self.diff_text_bases = []
 
     def _record(self, name, *a, **kw):
         self.calls.append(name)
@@ -356,7 +365,25 @@ class FakeOps:
 
     def diff_text(self, checkout, base):
         self._record("diff_text")
-        return "diff --git a/src/x.py b/src/x.py\n+1\n"
+        self.diff_text_base = base
+        self.diff_text_bases.append(base)
+        if isinstance(self.diff_text_val, dict):
+            return self.diff_text_val.get(base, "diff --git a/src/x.py b/src/x.py\n+1\n")
+        return self.diff_text_val
+
+    def checkout_head_sha(self, checkout):
+        self._record("checkout_head_sha")
+        idx = min(self._head_sha_calls, len(self.head_shas) - 1)
+        self._head_sha_calls += 1
+        return self.head_shas[idx]
+
+    def sha_exists(self, checkout, sha):
+        self._record("sha_exists")
+        return self.sha_exists_val
+
+    def sha_reachable(self, checkout, sha):
+        self._record("sha_reachable")
+        return self.sha_reachable_val
 
     def push_branch(self, checkout, branch):
         self._record("push_branch")
@@ -451,6 +478,7 @@ class FakeOps:
 
     def close_order(self, task_id, evidence):
         self._record("close_order")
+        self.close_evidence = evidence
         return {"ok": True}
 
     def as_dict(self):
@@ -458,6 +486,9 @@ class FakeOps:
             "run_suites": self.run_suites,
             "checkout_clean": self.checkout_clean_fn,
             "diff_text": self.diff_text,
+            "checkout_head_sha": self.checkout_head_sha,
+            "sha_exists": self.sha_exists,
+            "sha_reachable": self.sha_reachable,
             "push_branch": self.push_branch,
             "open_or_update_pr": self.open_or_update_pr,
             "ci_status": self.ci_status_fn,
@@ -670,6 +701,389 @@ def test_run_one_review_stale_stops_with_blocked_comment_and_never_merges(tmp_pa
     assert "post_comment" in ops.calls
     assert "merge_pr" not in ops.calls
     assert "close_order" not in ops.calls
+
+
+# --------------------------------------------------------------------------
+# wf-268 — review rounds converge: correction-delta review, capped findings,
+# JSON-numbered-list splitting, recovery rounds since last human clear
+# --------------------------------------------------------------------------
+
+
+def test_build_reviewer_prompt_round_one_reviews_whole_diff():
+    order = make_order()
+    prompt = integrator.build_reviewer_prompt(order, "diff --git a/x b/x\n+1\n")
+    assert "correction" not in prompt.lower()
+    assert "--- diff (tests excluded) ---" in prompt
+    assert "top 3" in prompt
+
+
+def test_build_reviewer_prompt_correction_round_scopes_to_delta_and_prior_findings():
+    order = make_order()
+    prompt = integrator.build_reviewer_prompt(
+        order, "diff --git a/x b/x\n+2\n",
+        previous_findings=["finding one", "finding two"],
+        max_findings=2,
+    )
+    assert "correction round" in prompt.lower()
+    assert "1. finding one" in prompt
+    assert "2. finding two" in prompt
+    assert "--- correction diff (tests excluded) ---" in prompt
+    assert "not the" in prompt.lower() and "whole pr" in prompt.lower()
+    assert "top 2" in prompt
+
+
+def test_cap_findings_splits_blocking_and_later():
+    findings = ["a", "b", "c", "d", "e"]
+    blocking, later = integrator.cap_findings(findings, 3)
+    assert blocking == ["a", "b", "c"]
+    assert later == ["d", "e"]
+
+
+def test_cap_findings_under_cap_has_no_later():
+    blocking, later = integrator.cap_findings(["a"], 3)
+    assert blocking == ["a"]
+    assert later == []
+
+
+def test_parse_reviewer_findings_splits_numbered_list_inside_one_json_entry():
+    """pc-1492 rehearsal round 6: the reviewer folded five numbered items into
+    one findings[] string; the ledger count must equal the five items, not one."""
+    body = json.dumps({
+        "findings": [
+            "1. first issue\n2. second issue\n3. third issue\n4. fourth issue\n5. fifth issue",
+        ],
+    })
+    findings = integrator.parse_reviewer_findings(body)
+    assert len(findings) == 5
+    assert findings[0].startswith("1.")
+    assert findings[-1].startswith("5.")
+
+
+def test_parse_reviewer_findings_json_array_entries_without_numbering_stay_whole():
+    body = json.dumps({"findings": ["plain finding a", "plain finding b"]})
+    assert integrator.parse_reviewer_findings(body) == ["plain finding a", "plain finding b"]
+
+
+def test_run_one_round_one_reviews_full_pr_diff(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path)
+    integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert ops.diff_text_base == cfg["pr_base"]
+
+
+def test_run_one_correction_round_reviews_delta_since_prior_review_only(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_recovery_rounds=3)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {
+        "rounds_used": 1,
+        "last_review": {"sha": "sha-round-1", "findings": ["fix the thing"]},
+    })
+    ops = FakeOps(tmp_path)  # clean pass: closes the finding
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert ops.diff_text_base == "sha-round-1"
+    assert result["outcome"] == "closed"
+
+
+def test_run_one_findings_recovery_records_last_review_sha_and_findings_for_next_round(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, review_findings=["fix x"], head_shas=["sha-a"])
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "recovering"
+    state = integrator.read_recovery_state(cfg["local_root"], "wf-1")
+    assert state["last_review"] == {"sha": "sha-a", "findings": ["fix x"]}
+    assert state["rounds_used"] == 1
+
+
+# --------------------------------------------------------------------------
+# wf-268 cursor-reviewer follow-up findings (PR 28):
+# 1. a stale last_review.sha must not produce an empty correction delta
+# 2. later findings must accumulate across rounds, never be dropped
+# 3. capped findings must reach the ledger, at cap time and at close
+# --------------------------------------------------------------------------
+
+
+def test_run_one_stale_last_review_sha_falls_back_to_full_pr_base_review(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_recovery_rounds=3)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {
+        "rounds_used": 1,
+        "last_review": {"sha": "sha-gone", "findings": ["fix the thing"]},
+    })
+    ops = FakeOps(tmp_path, sha_exists_val=False)
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert "sha_exists" in ops.calls
+    assert ops.diff_text_base == cfg["pr_base"]
+    assert result["outcome"] == "closed"
+
+
+def test_run_one_live_last_review_sha_still_scopes_to_delta(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_recovery_rounds=3)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {
+        "rounds_used": 1,
+        "last_review": {"sha": "sha-round-1", "findings": ["fix the thing"]},
+    })
+    ops = FakeOps(tmp_path, sha_exists_val=True)
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert ops.diff_text_base == "sha-round-1"
+    assert result["outcome"] == "closed"
+
+
+def test_run_one_accumulates_later_findings_across_recovery_rounds(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_findings_per_round=1, max_recovery_rounds=3)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {
+        "rounds_used": 1,
+        "last_review": {"sha": "sha-round-1", "findings": ["blocker one"]},
+        "later_findings": ["earlier later a"],
+    })
+    ops = FakeOps(tmp_path, review_findings=["blocker two", "new later b"])
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "recovering"
+    assert result["later_findings"] == ["earlier later a", "new later b"]
+    state = integrator.read_recovery_state(cfg["local_root"], "wf-1")
+    assert state["later_findings"] == ["earlier later a", "new later b"]
+
+
+def test_run_one_accumulated_later_findings_reach_close_follow_ups(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_findings_per_round=1, max_recovery_rounds=3)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {
+        "rounds_used": 1,
+        "last_review": {"sha": "sha-round-1", "findings": []},
+        "later_findings": ["earlier later a"],
+    })
+    ops = FakeOps(tmp_path)  # clean pass: no new findings, proceeds to merge
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "closed"
+    assert ops.close_evidence["follow_ups"] == "earlier later a"
+
+
+def test_run_one_writes_later_ledger_row_when_findings_are_capped(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_findings_per_round=2)
+    ops = FakeOps(tmp_path, review_findings=["a", "b", "c", "d"])
+    integrator.run_one(make_order(), cfg, ops.as_dict())
+    log_path = os.path.join(cfg["local_root"], "ledger", "integrator-workforce.log")
+    with open(log_path) as fh:
+        log = fh.read()
+    assert " LATER " in log
+    assert "count=2" in log
+
+
+def test_finish_after_stage_writes_later_ledger_row_at_close(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path)
+    post_merge = {
+        "pr": {"number": 1, "url": "http://pr/1"},
+        "reviewer": "cursor-reviewer",
+        "version": {"from": "1.0.0", "to": "1.0.1"},
+        "later_findings": ["earlier later a", "new later b"],
+    }
+    result = {
+        "generated_at": integrator._utc_iso_z(), "task_id": "wf-1", "worker": "tester",
+        "dry_run": False, "outcome": None,
+    }
+    integrator._finish_after_stage("wf-1", "workforce", cfg, ops.as_dict(), post_merge, result)
+    log_path = os.path.join(cfg["local_root"], "ledger", "integrator-workforce.log")
+    with open(log_path) as fh:
+        log = fh.read()
+    assert " LATER " in log
+    assert "count=2" in log
+
+
+def test_run_one_caps_findings_and_records_the_rest_as_later(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_findings_per_round=2)
+    ops = FakeOps(tmp_path, review_findings=["a", "b", "c", "d"])
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["findings"] == ["a", "b"]
+    assert result["later_findings"] == ["c", "d"]
+    assert result["outcome"] == "recovering"
+    state = integrator.read_recovery_state(cfg["local_root"], "wf-1")
+    assert state["last_review"]["findings"] == ["a", "b"]
+
+
+def test_finish_after_stage_records_later_findings_as_close_follow_ups(tmp_path):
+    """Findings below the cap's severity are recorded on the order as a
+    follow-up note at close, never as a blocker (wf-268)."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path)
+    post_merge = {
+        "pr": {"number": 1, "url": "http://pr/1"},
+        "reviewer": "cursor-reviewer",
+        "version": {"from": "1.0.0", "to": "1.0.1"},
+        "later_findings": ["minor nit"],
+    }
+    result = {
+        "generated_at": integrator._utc_iso_z(), "task_id": "wf-1", "worker": "tester",
+        "dry_run": False, "outcome": None,
+    }
+    out = integrator._finish_after_stage("wf-1", "workforce", cfg, ops.as_dict(), post_merge, result)
+    assert out["outcome"] == "closed"
+    assert ops.close_evidence["follow_ups"] == "minor nit"
+
+
+def test_clear_recovery_round_state_resets_rounds_and_records_who_and_why(tmp_path):
+    local_root = str(tmp_path / "local")
+    integrator.write_recovery_state(local_root, "wf-1", {"rounds_used": 2})
+    state = integrator.clear_recovery_round_state(local_root, "wf-1", "you", "seat fixed everything by hand")
+    assert state["rounds_used"] == 0
+    assert state["cleared_by"] == "you"
+    assert state["cleared_reason"] == "seat fixed everything by hand"
+    assert state["cleared_at"]
+    assert integrator.read_recovery_state(local_root, "wf-1") == state
+
+
+def test_run_one_stop_after_a_human_clear_reports_who_cleared_it(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_recovery_rounds=1)
+    integrator.clear_recovery_round_state(cfg["local_root"], "wf-1", "you", "cleared for a fresh attempt")
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {
+        "rounds_used": 1, "cleared_by": "you", "cleared_reason": "cleared for a fresh attempt",
+        "cleared_at": "2026-01-01T00:00:00Z",
+    })
+    ops = FakeOps(tmp_path, review_findings=["still broken"])
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "stopped"
+    assert result["last_cleared"]["by"] == "you"
+    assert result["last_cleared"]["reason"] == "cleared for a fresh attempt"
+
+
+# --------------------------------------------------------------------------
+# wf-268 second-pass cursor-reviewer findings (PR 28 re-review):
+# 1. later_findings must de-duplicate across rounds on normalised text
+# 2. a human clear must preserve later_findings and last_review
+# 3. an unreachable (not just missing) sha, or an empty correction diff,
+#    must fall back to a full pr_base review
+# --------------------------------------------------------------------------
+
+
+def test_dedupe_findings_drops_repeats_on_normalised_text_first_seen_order():
+    items = ["Fix the thing.", "other finding", "  fix the thing.  ", "FIX THE THING."]
+    assert integrator._dedupe_findings(items) == ["Fix the thing.", "other finding"]
+
+
+def test_run_one_accumulated_later_findings_deduplicate_on_normalised_text(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_findings_per_round=1, max_recovery_rounds=3)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {
+        "rounds_used": 1,
+        "last_review": {"sha": "sha-round-1", "findings": ["blocker one"]},
+        "later_findings": ["earlier later a"],
+    })
+    ops = FakeOps(tmp_path, review_findings=["blocker two", "  Earlier Later A  "])
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "recovering"
+    assert result["later_findings"] == ["earlier later a"]
+    state = integrator.read_recovery_state(cfg["local_root"], "wf-1")
+    assert state["later_findings"] == ["earlier later a"]
+
+
+def test_run_one_accumulated_later_findings_reach_close_without_duplicates(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_findings_per_round=1, max_recovery_rounds=3)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {
+        "rounds_used": 1,
+        "last_review": {"sha": "sha-round-1", "findings": []},
+        "later_findings": ["earlier later a", "earlier later a"],
+    })
+    ops = FakeOps(tmp_path)  # clean pass: no new findings, proceeds to merge
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "closed"
+    assert ops.close_evidence["follow_ups"] == "earlier later a"
+
+
+def test_clear_recovery_round_state_preserves_later_findings_and_last_review(tmp_path):
+    local_root = str(tmp_path / "local")
+    integrator.write_recovery_state(local_root, "wf-1", {
+        "rounds_used": 2,
+        "later_findings": ["earlier later a"],
+        "last_review": {"sha": "sha-round-1", "findings": ["still open"]},
+    })
+    state = integrator.clear_recovery_round_state(local_root, "wf-1", "you", "seat fixed everything by hand")
+    assert state["rounds_used"] == 0
+    assert state["cleared_by"] == "you"
+    assert state["later_findings"] == ["earlier later a"]
+    assert state["last_review"] == {"sha": "sha-round-1", "findings": ["still open"]}
+    assert integrator.read_recovery_state(local_root, "wf-1") == state
+
+
+def test_clear_recovery_round_state_with_no_prior_state_has_no_later_findings(tmp_path):
+    local_root = str(tmp_path / "local")
+    state = integrator.clear_recovery_round_state(local_root, "wf-1", "you", "first clear")
+    assert state["rounds_used"] == 0
+    assert "later_findings" not in state
+    assert "last_review" not in state
+
+
+def test_run_one_unreachable_last_review_sha_falls_back_to_full_pr_base_review(tmp_path):
+    """sha_exists alone is existence-only: a rebased-away commit can still
+    exist as an unreachable object. sha_reachable (merge-base
+    --is-ancestor) must catch this and fall back to a full review."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_recovery_rounds=3)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {
+        "rounds_used": 1,
+        "last_review": {"sha": "sha-unreachable", "findings": ["fix the thing"]},
+    })
+    ops = FakeOps(tmp_path, sha_exists_val=True, sha_reachable_val=False)
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert "sha_reachable" in ops.calls
+    assert ops.diff_text_base == cfg["pr_base"]
+    assert result["outcome"] == "closed"
+
+
+def test_run_one_empty_correction_diff_falls_back_to_full_pr_base_review(tmp_path):
+    """A non-zero diff rc and a truly empty correction diff collapse to the
+    same empty string; either way it must never look like "no non-test
+    changes" to the reviewer and skip re-auditing."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_recovery_rounds=3)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {
+        "rounds_used": 1,
+        "last_review": {"sha": "sha-round-1", "findings": ["fix the thing"]},
+    })
+    ops = FakeOps(tmp_path, diff_text_val={
+        "sha-round-1": "",
+        cfg["pr_base"]: "diff --git a/src/x.py b/src/x.py\n+1\n",
+    })
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert ops.diff_text_bases == ["sha-round-1", cfg["pr_base"]]
+    assert result["outcome"] == "closed"
+
+
+def test_main_clear_recovery_cli_resets_state(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg_raw = dict(
+        local_root=str(tmp_path / "local"),
+        roster_path=roster_path,
+        project="workforce",
+        test_cmd=["/bin/sh", "-c", "exit 0"],
+        pr_base="main",
+        version_bump="patch",
+        version_file="VERSION.json",
+        stage_cmd=["/bin/sh", "-c", "exit 0"],
+        activate_cmd=["/bin/sh", "-c", "exit 0"],
+        main_checkout=str(tmp_path / "main_checkout"),
+    )
+    (tmp_path / "main_checkout").mkdir(exist_ok=True)
+    cfg_path = tmp_path / "integration_config.json"
+    cfg_path.write_text(json.dumps(cfg_raw))
+    local_root = cfg_raw["local_root"]
+    integrator.write_recovery_state(local_root, "wf-1", {"rounds_used": 2})
+    rc = integrator.main([
+        "--config", str(cfg_path), "--clear-recovery", "wf-1",
+        "--cleared-by", "you", "--reason", "seat fixed by hand",
+    ])
+    assert rc == 0
+    state = integrator.read_recovery_state(local_root, "wf-1")
+    assert state["rounds_used"] == 0
+    assert state["cleared_by"] == "you"
 
 
 # --------------------------------------------------------------------------
@@ -2049,3 +2463,15 @@ def test_run_one_stops_with_checkout_missing_when_suites_cannot_start(tmp_path, 
     result = integrator.run_one(order, cfg, ops)
     assert result["outcome"] == "checkout_missing"
     assert posted and posted[0][0] == "wf-9"
+
+
+def test_test_only_correction_delta_falls_back_to_full_review():
+    """wf-268 third pass: a correction delta that only touches tests must not
+    satisfy the previous round's blockers; run_one must treat it like an empty
+    delta and review the full base."""
+    import inspect
+    from workforce import integrator as I
+    src = inspect.getsource(I.run_one)
+    assert "not strip_test_hunks_from_diff(diff).strip()" in src
+    diff = "diff --git a/tests/test_x.py b/tests/test_x.py\n--- a/tests/test_x.py\n+++ b/tests/test_x.py\n@@ -1 +1,2 @@\n+def test_y(): pass\n"
+    assert not I.strip_test_hunks_from_diff(diff).strip()
