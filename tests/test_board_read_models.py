@@ -716,6 +716,8 @@ def test_non_api_get_points_at_map_not_api_only_escape(tmp_path):
     import urllib.error
     import urllib.request
 
+    from workforce.board.paths import SUITE_URL
+
     local = _html_retired_setup(tmp_path)
     httpd, port, t = _one_shot_board(local)
     try:
@@ -735,7 +737,7 @@ def test_non_api_get_points_at_map_not_api_only_escape(tmp_path):
         t.join(timeout=3)
 
     assert code == 410
-    assert "8801/roster" in body
+    assert "%s/roster" % SUITE_URL in body
     assert "WORKFORCE_API_ONLY=0" not in body
     assert "legacy board" not in body.lower()
 
@@ -773,6 +775,8 @@ def test_api_only_zero_does_not_serve_html(tmp_path, monkeypatch, capsys):
     import urllib.error
     import urllib.request
 
+    from workforce.board.paths import SUITE_URL
+
     monkeypatch.setenv("WORKFORCE_API_ONLY", "0")
     local = _html_retired_setup(tmp_path)
     httpd, port, t = _one_shot_board(local)
@@ -796,7 +800,7 @@ def test_api_only_zero_does_not_serve_html(tmp_path, monkeypatch, capsys):
     assert "WORKFORCE_API_ONLY=0 is not supported" in err
     assert "/roster" in err
     assert code == 410
-    assert "8801/roster" in body
+    assert "%s/roster" % SUITE_URL in body
     assert "legacy board" not in body.lower()
 
 
