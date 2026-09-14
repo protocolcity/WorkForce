@@ -1355,7 +1355,7 @@ def test_seat_in_flight_false_when_no_locks_or_open_shifts(tmp_path):
 def test_run_one_skips_activate_when_seat_in_flight(tmp_path):
     roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
     cfg = base_config(tmp_path, roster_path)
-    _write_live_lock(cfg["local_root"], "other-seat")
+    _write_live_lock(cfg["local_root"], "tester")  # the roster lane; a non-lane lock is not a seat (wf-275)
     ops = FakeOps(tmp_path)
     result = integrator.run_one(make_order(), cfg, ops.as_dict())
     assert result["outcome"] == "activate_skipped"
@@ -1376,7 +1376,7 @@ def test_run_one_resumes_from_activate_after_seat_in_flight_without_remerging(tm
     """
     roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
     cfg = base_config(tmp_path, roster_path)
-    _write_live_lock(cfg["local_root"], "other-seat")
+    _write_live_lock(cfg["local_root"], "tester")  # the roster lane; a non-lane lock is not a seat (wf-275)
     ops = FakeOps(tmp_path)
     order = make_order()
 
@@ -2849,3 +2849,14 @@ def test_seat_in_flight_ignores_job_and_retired_ledgers_with_roster(tmp_path):
     assert integrator.seat_in_flight(local_root, roster_path=roster_path) is True
     # legacy call without a roster still reads every ledger
     assert integrator.seat_in_flight(local_root) is True
+
+
+def test_seat_in_flight_ignores_a_job_lock_with_roster(tmp_path):
+    """The integrator's own live lock (or any job's) is not a seat in flight."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path, name="tester")])
+    local_root = str(tmp_path / "local")
+    _write_live_lock(local_root, "integrator")
+    assert integrator.seat_in_flight(local_root, roster_path=roster_path) is False
+    assert integrator.seat_in_flight(local_root) is True
+    _write_live_lock(local_root, "tester")
+    assert integrator.seat_in_flight(local_root, roster_path=roster_path) is True
