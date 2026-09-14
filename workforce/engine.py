@@ -1575,60 +1575,35 @@ def _finalize_shift_workdir(
     }, no_note
 
 
-def _park_seat_order_at_shift_end(
+def _park_one_task_at_shift_end(
     worker: Worker,
     shift_cwd: str,
-    out_path: str,
-    recovery_task_id: Optional[str],
+    desk: str,
+    product: str,
+    task_id: str,
+    identity: str,
     ledger: Ledger,
 ) -> dict:
-    """wf-273 — a shift that ends DONE without the seat parking its own
-    order leaves it in_progress under the seat identity: the integrator
-    drains only in_review, the supervisor skips claimed orders, and the
-    order is invisible until someone notices.
+    """Park a single order still in_progress under *identity* at shift end.
 
-    Called after every successful shift end. If the order this pass worked
-    is still in_progress under this identity, push any unpushed commits on
-    the shift's own branch (or record why not) and post a ``Parked:`` note
-    — the same lifecycle-heading convention :func:`_release_stranded_ticket`
-    uses for ``Blocked:`` — so the desk moves it to in_review itself. A
-    ledger row is appended per action (push, park) so a receipt is never
-    silent.
+    PATCHes the desk's status to ``in_review`` first — a ``Parked:`` comment
+    heading alone is not one of the lifecycle transitions the desk's own
+    comment-lifecycle auto-applies (only ``Completed:``/``Blocked:`` are;
+    see ``worklane.trackers.sqlite._apply_comment_lifecycle``), so without an
+    explicit status write the order stays ``in_progress`` and remains
+    invisible to the integrator, same as :func:`wl_park` in the MCP handler.
     """
-    from .capacity import hermetic_dry_run
-
-    receipt: Dict[str, object] = {"action": "skipped"}
-    task_id = recovery_task_id
-    if not task_id:
-        ref = _task_ref_from_pass_output(out_path, 0)
-        if ref:
-            task_id = ref[1]
-    if not task_id:
-        receipt["skipped"] = "no_task_ref"
-        return receipt
-    product = product_from_queue_url(worker.queue_url) or ""
-    if not product:
-        receipt["skipped"] = "no_product"
-        return receipt
-    desk = desk_origin_from_queue_url(worker.queue_url or "")
-    if not desk:
-        receipt["skipped"] = "no_desk"
-        return receipt
-    dry_run, hermetic_block = hermetic_dry_run(False)
-    if dry_run:
-        receipt["skipped"] = "hermetic" if hermetic_block else "dry_run"
-        return receipt
-
+    receipt: Dict[str, object] = {"task_id": task_id, "action": "skipped"}
     try:
         task = _fetch_task(desk, product, task_id)
     except Exception as exc:
+        receipt["action"] = "fetch_failed"
         receipt["error"] = "fetch: %s" % exc
         return receipt
     if not task or str(task.get("status") or "").lower() != "in_progress":
         receipt["skipped"] = "not_in_progress"
         return receipt
     owner = latest_owner_id(task.get("comments") or [])
-    identity = (worker.identity or worker.name).strip()
     if owner not in (identity, worker.name):
         receipt["skipped"] = "owner_mismatch"
         return receipt
@@ -1649,24 +1624,106 @@ def _park_seat_order_at_shift_end(
     ledger.append("WARN", reason="engine-park-at-shift-end push", task=task_id, push=push_result)
     receipt["push"] = push_result
 
+    q = urllib.parse.urlencode({"product": product})
+    patch_url = "%s/api/admin/tasks/%s?%s" % (
+        desk.rstrip("/"), urllib.parse.quote(task_id, safe=""), q,
+    )
+    patch_out = _http_json("PATCH", patch_url, {"status": "in_review", "author": identity})
+    patch_ok = patch_out.get("ok") is not False and not patch_out.get("error")
+    receipt["patch"] = patch_out
+    if not patch_ok:
+        receipt["action"] = "patch_failed"
+        ledger.append(
+            "WARN", reason="engine-park-at-shift-end patch", task=task_id,
+            error=str(patch_out.get("error") or patch_out),
+        )
+        return receipt
+
     body = (
         "Parked: parked by the engine at shift end (seat did not park)\n"
         "Push: %s" % push_result
     )
-    q = urllib.parse.urlencode({"product": product})
     url = "%s/api/admin/tasks/%s/comments?%s" % (
         desk.rstrip("/"), urllib.parse.quote(task_id, safe=""), q,
     )
     out = _http_json("POST", url, {"body": body, "author": identity})
     ok = out.get("ok") is not False and not out.get("error")
     receipt["action"] = "parked" if ok else "park_failed"
-    receipt["task_id"] = task_id
     receipt["api"] = out
     ledger.append(
         "WARN" if not ok else "STOP",
         reason="engine-park-at-shift-end", task=task_id,
         action=receipt["action"],
     )
+    return receipt
+
+
+def _park_seat_order_at_shift_end(
+    worker: Worker,
+    shift_cwd: str,
+    out_path: str,
+    recovery_task_id: Optional[str],
+    ledger: Ledger,
+) -> dict:
+    """wf-273 — a shift that ends DONE without the seat parking its own
+    order leaves it in_progress under the seat identity: the integrator
+    drains only in_review, the supervisor skips claimed orders, and the
+    order is invisible until someone notices.
+
+    Called after every successful shift end. Every order this shift's passes
+    prepared (via task_runner receipts — a multi-pass drain claims a fresh
+    one per pass, and an earlier pass that itself failed to park would
+    otherwise leave a stray order uncovered, wf-273 second review) is
+    checked: if still in_progress under this identity, push any unpushed
+    commits on the shift's own branch (or record why not), PATCH the desk
+    status to in_review, and post a ``Parked:`` note. A ledger row is
+    appended per action (push, patch, park) so a receipt is never silent.
+    """
+    from .capacity import hermetic_dry_run
+
+    task_ids: List[str] = []
+    if recovery_task_id:
+        task_ids = [recovery_task_id]
+    else:
+        task_ids = [ref[1] for ref in _all_task_refs_from_pass_output(out_path)]
+    if not task_ids:
+        return {"action": "skipped", "skipped": "no_task_ref", "results": []}
+
+    product = product_from_queue_url(worker.queue_url) or ""
+    if not product:
+        return {"action": "skipped", "skipped": "no_product", "results": []}
+    desk = desk_origin_from_queue_url(worker.queue_url or "")
+    if not desk:
+        return {"action": "skipped", "skipped": "no_desk", "results": []}
+    dry_run, hermetic_block = hermetic_dry_run(False)
+    if dry_run:
+        return {
+            "action": "skipped",
+            "skipped": "hermetic" if hermetic_block else "dry_run",
+            "results": [],
+        }
+
+    identity = (worker.identity or worker.name).strip()
+    results = [
+        _park_one_task_at_shift_end(worker, shift_cwd, desk, product, task_id, identity, ledger)
+        for task_id in task_ids
+    ]
+    if len(results) == 1:
+        overall = results[0]["action"]
+    else:
+        actions = {r["action"] for r in results}
+        if actions == {"skipped"}:
+            overall = "skipped"
+        elif actions == {"parked"}:
+            overall = "parked"
+        elif "parked" in actions:
+            overall = "partial"
+        else:
+            overall = "park_failed"
+    receipt: Dict[str, object] = {"action": overall, "results": results}
+    if len(results) == 1:
+        for key, value in results[0].items():
+            receipt.setdefault(key, value)
     return receipt
 
 
@@ -1916,6 +1973,29 @@ def _task_ref_from_pass_output(out_path: str, offset: int) -> Optional[Tuple[str
     return None
 
 
+def _all_task_refs_from_pass_output(out_path: str) -> List[Tuple[str, str]]:
+    """Every distinct (project, task_id) task_runner prepared this shift.
+
+    Reads every receipt this shift's output carries (wf-273 second review),
+    not only the last one, and de-dupes while keeping first-seen order.
+    """
+    refs: List[Tuple[str, str]] = []
+    seen = set()
+    for receipt_path in _all_receipt_paths(out_path, 0):
+        try:
+            data = json.loads(Path(receipt_path).read_text())
+        except (OSError, ValueError):
+            continue
+        project, task_id = data.get("project"), data.get("task_id")
+        if not (isinstance(project, str) and project and isinstance(task_id, str) and task_id):
+            continue
+        ref = (project, task_id)
+        if ref not in seen:
+            seen.add(ref)
+            refs.append(ref)
+    return refs
+
+
 def _task_still_in_progress(desk: str, project: str, task_id: str) -> bool:
     """True unless the desk positively confirms the order left in_progress.
 
@@ -2081,14 +2161,25 @@ def _last_receipt_path(out_path: str, offset: int) -> str:
     — such a pass cannot be auto-continued through task_runner's own
     recovery path, so the caller must give up honestly rather than guess.
     """
+    matches = _all_receipt_paths(out_path, offset)
+    return matches[-1] if matches else ""
+
+
+def _all_receipt_paths(out_path: str, offset: int) -> List[str]:
+    """Every task_runner receipt path printed in ``out_path`` from *offset*.
+
+    A multi-pass shift re-spawns task_runner once per claimed order, each
+    printing its own "Prepared ...; Receipt: ..." line — so the whole file
+    can carry receipts for several distinct orders this shift touched, not
+    only the most recent one (wf-273 second review).
+    """
     try:
         with open(out_path, "r", encoding="utf-8", errors="replace") as fh:
             fh.seek(offset)
             chunk = fh.read(2 * 1024 * 1024)
     except OSError:
-        return ""
-    matches = _PREPARED_RECEIPT_RE.findall(chunk)
-    return matches[-1] if matches else ""
+        return []
+    return _PREPARED_RECEIPT_RE.findall(chunk)
 
 
 def _scope_check(worker: Worker, ledger: Ledger) -> bool:
