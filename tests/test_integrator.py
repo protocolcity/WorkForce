@@ -345,6 +345,7 @@ class FakeOps:
         self._head_sha_calls = 0
         self.head_shas = overrides.get("head_shas", ["sha-head-1", "sha-head-2", "sha-head-3"])
         self.close_evidence = None
+        self.sha_exists_val = overrides.get("sha_exists_val", True)
 
     def _record(self, name, *a, **kw):
         self.calls.append(name)
@@ -367,6 +368,10 @@ class FakeOps:
         idx = min(self._head_sha_calls, len(self.head_shas) - 1)
         self._head_sha_calls += 1
         return self.head_shas[idx]
+
+    def sha_exists(self, checkout, sha):
+        self._record("sha_exists")
+        return self.sha_exists_val
 
     def push_branch(self, checkout, branch):
         self._record("push_branch")
@@ -470,6 +475,7 @@ class FakeOps:
             "checkout_clean": self.checkout_clean_fn,
             "diff_text": self.diff_text,
             "checkout_head_sha": self.checkout_head_sha,
+            "sha_exists": self.sha_exists,
             "push_branch": self.push_branch,
             "open_or_update_pr": self.open_or_update_pr,
             "ci_status": self.ci_status_fn,
@@ -775,6 +781,105 @@ def test_run_one_findings_recovery_records_last_review_sha_and_findings_for_next
     state = integrator.read_recovery_state(cfg["local_root"], "wf-1")
     assert state["last_review"] == {"sha": "sha-a", "findings": ["fix x"]}
     assert state["rounds_used"] == 1
+
+
+# --------------------------------------------------------------------------
+# wf-268 cursor-reviewer follow-up findings (PR 28):
+# 1. a stale last_review.sha must not produce an empty correction delta
+# 2. later findings must accumulate across rounds, never be dropped
+# 3. capped findings must reach the ledger, at cap time and at close
+# --------------------------------------------------------------------------
+
+
+def test_run_one_stale_last_review_sha_falls_back_to_full_pr_base_review(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_recovery_rounds=3)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {
+        "rounds_used": 1,
+        "last_review": {"sha": "sha-gone", "findings": ["fix the thing"]},
+    })
+    ops = FakeOps(tmp_path, sha_exists_val=False)
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert "sha_exists" in ops.calls
+    assert ops.diff_text_base == cfg["pr_base"]
+    assert result["outcome"] == "closed"
+
+
+def test_run_one_live_last_review_sha_still_scopes_to_delta(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_recovery_rounds=3)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {
+        "rounds_used": 1,
+        "last_review": {"sha": "sha-round-1", "findings": ["fix the thing"]},
+    })
+    ops = FakeOps(tmp_path, sha_exists_val=True)
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert ops.diff_text_base == "sha-round-1"
+    assert result["outcome"] == "closed"
+
+
+def test_run_one_accumulates_later_findings_across_recovery_rounds(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_findings_per_round=1, max_recovery_rounds=3)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {
+        "rounds_used": 1,
+        "last_review": {"sha": "sha-round-1", "findings": ["blocker one"]},
+        "later_findings": ["earlier later a"],
+    })
+    ops = FakeOps(tmp_path, review_findings=["blocker two", "new later b"])
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "recovering"
+    assert result["later_findings"] == ["earlier later a", "new later b"]
+    state = integrator.read_recovery_state(cfg["local_root"], "wf-1")
+    assert state["later_findings"] == ["earlier later a", "new later b"]
+
+
+def test_run_one_accumulated_later_findings_reach_close_follow_ups(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_findings_per_round=1, max_recovery_rounds=3)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {
+        "rounds_used": 1,
+        "last_review": {"sha": "sha-round-1", "findings": []},
+        "later_findings": ["earlier later a"],
+    })
+    ops = FakeOps(tmp_path)  # clean pass: no new findings, proceeds to merge
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "closed"
+    assert ops.close_evidence["follow_ups"] == "earlier later a"
+
+
+def test_run_one_writes_later_ledger_row_when_findings_are_capped(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_findings_per_round=2)
+    ops = FakeOps(tmp_path, review_findings=["a", "b", "c", "d"])
+    integrator.run_one(make_order(), cfg, ops.as_dict())
+    log_path = os.path.join(cfg["local_root"], "ledger", "integrator-workforce.log")
+    with open(log_path) as fh:
+        log = fh.read()
+    assert " LATER " in log
+    assert "count=2" in log
+
+
+def test_finish_after_stage_writes_later_ledger_row_at_close(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path)
+    post_merge = {
+        "pr": {"number": 1, "url": "http://pr/1"},
+        "reviewer": "cursor-reviewer",
+        "version": {"from": "1.0.0", "to": "1.0.1"},
+        "later_findings": ["earlier later a", "new later b"],
+    }
+    result = {
+        "generated_at": integrator._utc_iso_z(), "task_id": "wf-1", "worker": "tester",
+        "dry_run": False, "outcome": None,
+    }
+    integrator._finish_after_stage("wf-1", "workforce", cfg, ops.as_dict(), post_merge, result)
+    log_path = os.path.join(cfg["local_root"], "ledger", "integrator-workforce.log")
+    with open(log_path) as fh:
+        log = fh.read()
+    assert " LATER " in log
+    assert "count=2" in log
 
 
 def test_run_one_caps_findings_and_records_the_rest_as_later(tmp_path):
