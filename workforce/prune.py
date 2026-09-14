@@ -20,6 +20,78 @@ from .routing_hygiene import is_terminal_status
 _TASK_BRANCH_RE = re.compile(r"^workforce/task/([^/]+)/([^/]+)$")
 _KEEP_TASK_RUN_NAMES = frozenset({"preparation.json", "attempts"})
 
+# wf-273 — desk project-store slug -> task id prefix family. The admin API
+# does not expose this mapping, and the shared local/task-runs root holds
+# every seat's reservations regardless of project, so a task id prefix is
+# the only project signal available when a seat is not (or no longer) in
+# this config's own roster. Keep in sync with the workspace project
+# registry (root AGENTS.md) if new projects are added; a config may also
+# set "task_id_prefixes" explicitly to override/extend this table.
+_PROJECT_TASK_ID_PREFIXES: Dict[str, Tuple[str, ...]] = {
+    "career": ("career",),
+    "comms": ("comms",),
+    "connector": ("conn",),
+    "gridfinity": ("gf",),
+    "oneseo-pos": ("osp",),
+    "presentations": ("pr",),
+    "protocolcity": ("pc",),
+    "recipes": ("rc",),
+    "socials": ("so",),
+    "tradeos": ("ts",),
+    "workforce": ("wf",),
+    "worklane": ("wl",),
+}
+
+
+def _task_id_prefixes_for_project(config: Dict[str, Any]) -> Tuple[str, ...]:
+    configured = config.get("task_id_prefixes")
+    if configured:
+        return tuple(str(p) for p in configured)
+    return _PROJECT_TASK_ID_PREFIXES.get(str(config.get("project") or ""), ())
+
+
+def _task_id_matches_project(task_id: str, prefixes: Tuple[str, ...]) -> bool:
+    for prefix in prefixes:
+        if task_id == prefix or task_id.startswith(prefix + "-"):
+            return True
+    return False
+
+
+def _load_scope_roster(config: Dict[str, Any]) -> Optional[Any]:
+    from . import roster as roster_mod
+
+    path = config.get("roster_path")
+    if not path:
+        return None
+    try:
+        return roster_mod.load(path=path)
+    except Exception:
+        return None
+
+
+def _reservation_in_scope(
+    config: Dict[str, Any], worker: str, task_id: str,
+    roster: Optional[Any], prefixes: Tuple[str, ...],
+) -> bool:
+    """True when *worker*'s own seat belongs to config's project (roster
+    queue product) or *task_id* carries the project's task id prefix.
+
+    A reservation matching neither is another project's leftover in the
+    shared task-runs root — never planned, only reported as skipped."""
+    from .engine import product_from_queue_url
+
+    if roster is not None:
+        w = roster.workers.get(worker)
+        if w is not None:
+            product = product_from_queue_url(w.queue_url or "")
+            if product == config.get("project"):
+                return True
+            if product:
+                # Seat resolved to a *different* project: decisive, not a
+                # fallback case — a stale/renamed prefix must not override it.
+                return False
+    return _task_id_matches_project(task_id, prefixes)
+
 
 class PruneError(RuntimeError):
     pass
@@ -90,7 +162,15 @@ def _task_run_scan_roots(config: Dict[str, Any]) -> List[str]:
 
 
 def discover_local_reservations(config: Dict[str, Any]) -> List[Dict[str, str]]:
-    """Seat task-run folders that still exist under configured scan roots."""
+    """Seat task-run folders that still exist under configured scan roots.
+
+    wf-273 — the scan roots (notably ``local/task-runs``) are shared across
+    every project's seats, so a reservation is only returned when it belongs
+    to *this* config's project (see :func:`_reservation_in_scope`); anything
+    else is a cross-project leftover, reported via a DISCOVER ledger row and
+    never planned for prune."""
+    roster = _load_scope_roster(config)
+    prefixes = _task_id_prefixes_for_project(config)
     found: Dict[Tuple[str, str], Dict[str, str]] = {}
     for root in _task_run_scan_roots(config):
         try:
@@ -111,6 +191,13 @@ def discover_local_reservations(config: Dict[str, Any]) -> List[Dict[str, str]]:
                     continue
                 key = (worker, task_id)
                 if key in found:
+                    continue
+                if not _reservation_in_scope(config, worker, task_id, roster, prefixes):
+                    if config.get("local_root") and config.get("project"):
+                        append_ledger_row(
+                            config["local_root"], config["project"], "DISCOVER",
+                            ticket=task_id, worker=worker, skipped="cross_project",
+                        )
                     continue
                 found[key] = {
                     "worker": worker,
