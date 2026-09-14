@@ -304,6 +304,60 @@ def test_discover_candidates_bounds_to_headroom(tmp_path):
     assert candidates[0]["task_id"] == "wf-1"
 
 
+def test_discover_candidates_orders_oldest_parked_first_not_by_task_id(tmp_path):
+    """wf-273 — desk list order with --limit 1 let a newer order keep
+    winning while an older parked one (wf-271) starved; oldest updated_at
+    within a priority tier must come first regardless of task id order."""
+    workers = [make_worker(tmp_path, name="a"), make_worker(tmp_path, name="b")]
+    roster_path = write_roster(tmp_path, workers)
+    cfg = make_config(tmp_path, roster_path, active_implementation_cap=5)
+    tasks = [
+        {"id": "wf-9", "labels": ["worker:a"], "title": "newer", "updated_at": "2026-09-14T04:13:00Z"},
+        {"id": "wf-2", "labels": ["worker:b"], "title": "older", "updated_at": "2026-09-14T02:00:00Z"},
+    ]
+
+    def fake_http(method, url, body=None, timeout=15.0):
+        return {"ok": True, "tasks": tasks}
+
+    candidates = integrator.discover_candidates(cfg, http=fake_http)
+    assert [c["task_id"] for c in candidates] == ["wf-2", "wf-9"]
+
+
+def test_discover_candidates_orders_by_priority_before_age(tmp_path):
+    workers = [make_worker(tmp_path, name="a"), make_worker(tmp_path, name="b")]
+    roster_path = write_roster(tmp_path, workers)
+    cfg = make_config(tmp_path, roster_path, active_implementation_cap=5)
+    tasks = [
+        {"id": "wf-1", "labels": ["worker:a"], "title": "old-low-priority",
+         "priority": 4, "updated_at": "2026-09-14T01:00:00Z"},
+        {"id": "wf-2", "labels": ["worker:b"], "title": "newer-urgent",
+         "priority": 1, "updated_at": "2026-09-14T05:00:00Z"},
+    ]
+
+    def fake_http(method, url, body=None, timeout=15.0):
+        return {"ok": True, "tasks": tasks}
+
+    candidates = integrator.discover_candidates(cfg, http=fake_http)
+    assert [c["task_id"] for c in candidates] == ["wf-2", "wf-1"]
+
+
+def test_discover_candidates_unknown_age_sorts_last_within_tier(tmp_path):
+    workers = [make_worker(tmp_path, name="a"), make_worker(tmp_path, name="b")]
+    roster_path = write_roster(tmp_path, workers)
+    cfg = make_config(tmp_path, roster_path, active_implementation_cap=5)
+    tasks = [
+        {"id": "wf-1", "labels": ["worker:a"], "title": "no-timestamp"},
+        {"id": "wf-2", "labels": ["worker:b"], "title": "known-timestamp",
+         "updated_at": "2026-09-14T05:00:00Z"},
+    ]
+
+    def fake_http(method, url, body=None, timeout=15.0):
+        return {"ok": True, "tasks": tasks}
+
+    candidates = integrator.discover_candidates(cfg, http=fake_http)
+    assert [c["task_id"] for c in candidates] == ["wf-2", "wf-1"]
+
+
 # --------------------------------------------------------------------------
 # run_one orchestration — fake ops, disposable checkout
 # --------------------------------------------------------------------------
@@ -323,6 +377,7 @@ class FakeOps:
         self.review_retry = overrides.get("review_retry", False)
         self.review_empty = overrides.get("review_empty", False)
         self.review_stale = overrides.get("review_stale", False)
+        self.review_dispatch_failed = overrides.get("review_dispatch_failed", False)
         self.ci_status = overrides.get("ci_status", "success")
         self.checkout_clean = overrides.get("checkout_clean_val", True)
         self.merge_rc = overrides.get("merge_rc", 0)
@@ -357,6 +412,7 @@ class FakeOps:
         self.merge_base_sha = overrides.get("merge_base_sha", "")
         self.merge_base_failed = overrides.get("merge_base_failed", False)
         self.merge_base_failed_output = overrides.get("merge_base_failed_output", "fetch failed")
+        self.last_prompt = None
 
     def _record(self, name, *a, **kw):
         self.calls.append(name)
@@ -413,12 +469,15 @@ class FakeOps:
 
     def dispatch_reviewer(self, reviewer, prompt):
         self._record("dispatch_reviewer")
+        self.last_prompt = prompt
         if self.review_retry:
             return {"ok": False, "retry": True, "output": "reviewer dispatch skipped (lock held)"}
         if self.review_empty:
             return {"ok": False, "empty": True, "output": "reviewer output was empty after DONE"}
         if self.review_stale:
             return {"ok": False, "stale": True, "output": "reviewer output was unchanged after DONE (stale)"}
+        if self.review_dispatch_failed:
+            return {"ok": False, "output": "reviewer dispatch failed: rc 1"}
         output = self.review_output
         if output is None:
             output = json.dumps({"findings": self.review_findings})
@@ -490,6 +549,16 @@ class FakeOps:
         self._record("release_seat")
         return {"ok": True}
 
+    def park_seat(self, task_id):
+        self._record("park_seat")
+        return {"ok": True}
+
+    def stop_seat(self, task_id, reason):
+        self._record("stop_seat")
+        self._record("post_comment")
+        self._record("park_seat")
+        return {"ok": True}
+
     def close_order(self, task_id, evidence):
         self._record("close_order")
         self.close_evidence = evidence
@@ -522,6 +591,8 @@ class FakeOps:
             "capture_screenshots": self.capture_screenshots,
             "post_comment": self.post_comment,
             "release_seat": self.release_seat,
+            "park_seat": self.park_seat,
+            "stop_seat": self.stop_seat,
             "close_order": self.close_order,
         }
 
@@ -767,6 +838,30 @@ def test_run_one_review_stale_stops_with_blocked_comment_and_never_merges(tmp_pa
     assert "close_order" not in ops.calls
 
 
+def test_run_one_review_dispatch_failure_retries_and_is_never_cached(tmp_path):
+    """A dispatch failure (ledger error, non-zero reviewer rc, etc.) is not a
+    review verdict — it must not be recorded as last_review for this SHA, or
+    an unchanged head would reuse the synthetic failure findings forever
+    instead of retrying the review (wf-271 second-pass finding 1)."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, review_dispatch_failed=True, head_shas=["sha-x"], ci_status="failure")
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "review_retry"
+    assert "release_seat" not in ops.calls
+    assert "dispatch_recovery" not in ops.calls
+    assert "merge_pr" not in ops.calls
+    state = integrator.read_recovery_state(cfg["local_root"], "wf-1")
+    assert state.get("rounds_used", 0) == 0
+    assert "last_review" not in state
+
+    ops.review_dispatch_failed = False
+    ops.review_findings = []
+    second = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert second["outcome"] == "waiting"
+    assert ops.calls.count("dispatch_reviewer") == 2
+
+
 # --------------------------------------------------------------------------
 # wf-268 — review rounds converge: correction-delta review, capped findings,
 # JSON-numbered-list splitting, recovery rounds since last human clear
@@ -792,8 +887,49 @@ def test_build_reviewer_prompt_correction_round_scopes_to_delta_and_prior_findin
     assert "1. finding one" in prompt
     assert "2. finding two" in prompt
     assert "--- correction diff (tests excluded) ---" in prompt
-    assert "not the" in prompt.lower() and "whole pr" in prompt.lower()
+    assert "do not re-audit the branch context" in prompt.lower()
     assert "top 2" in prompt
+
+
+def test_build_reviewer_prompt_correction_round_includes_branch_diff_and_suite_result():
+    """wf-272: a finding closed by an earlier commit outside the correction
+    delta must be visible to the reviewer as the full branch diff, and a
+    green suite run must be stated so it cannot be contradicted."""
+    order = make_order()
+    prompt = integrator.build_reviewer_prompt(
+        order, "diff --git a/x b/x\n+2\n",
+        previous_findings=["fix the thing"],
+        branch_diff="diff --git a/y b/y\n+earlier fix\n",
+        suite_rc=0,
+        suite_output="",
+    )
+    assert "--- full branch diff vs pr base" in prompt.lower()
+    assert "+earlier fix" in prompt
+    assert "suites in this pass: green" in prompt.lower()
+    assert "mark a finding above closed if the branch as a whole addresses it" in prompt.lower()
+
+
+def test_build_reviewer_prompt_correction_round_states_red_suite_with_tail():
+    order = make_order()
+    prompt = integrator.build_reviewer_prompt(
+        order, "diff --git a/x b/x\n+2\n",
+        previous_findings=["fix the thing"],
+        branch_diff="diff --git a/y b/y\n+1\n",
+        suite_rc=1,
+        suite_output="FAILED tests/test_x.py::test_y",
+    )
+    assert "suites in this pass: red (rc 1)" in prompt.lower()
+    assert "FAILED tests/test_x.py::test_y" in prompt
+
+
+def test_suite_result_summary_green():
+    assert integrator.suite_result_summary(0, "") == "Suites in this pass: green (rc 0)."
+
+
+def test_suite_result_summary_red_includes_tail():
+    summary = integrator.suite_result_summary(1, "boom")
+    assert summary.startswith("Suites in this pass: red (rc 1)")
+    assert "boom" in summary
 
 
 def test_cap_findings_splits_blocking_and_later():
@@ -845,7 +981,30 @@ def test_run_one_correction_round_reviews_delta_since_prior_review_only(tmp_path
     })
     ops = FakeOps(tmp_path)  # clean pass: closes the finding
     result = integrator.run_one(make_order(), cfg, ops.as_dict())
-    assert ops.diff_text_base == "sha-round-1"
+    assert ops.diff_text_bases == ["sha-round-1", cfg["pr_base"]]
+    assert result["outcome"] == "closed"
+
+
+def test_run_one_correction_round_passes_branch_diff_and_suite_result_to_prompt(tmp_path):
+    """wf-269/wf-272: the finding was fixed in an earlier commit outside the
+    correction delta; the delta-round prompt must carry the full branch diff
+    and the same-pass green suite result so the reviewer closes it instead of
+    restating it as still open."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_recovery_rounds=3)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {
+        "rounds_used": 1,
+        "last_review": {"sha": "sha-round-1", "findings": ["fix the thing"]},
+    })
+    ops = FakeOps(tmp_path, diff_text_val={
+        "sha-round-1": "diff --git a/README.md b/README.md\n+docs only\n",
+        cfg["pr_base"]: "diff --git a/src/x.py b/src/x.py\n+earlier fix for the thing\n",
+    }, suite_rc=0)
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert ops.diff_text_bases == ["sha-round-1", cfg["pr_base"]]
+    prompt = ops.last_prompt
+    assert "+earlier fix for the thing" in prompt
+    assert "suites in this pass: green" in prompt.lower()
     assert result["outcome"] == "closed"
 
 
@@ -891,7 +1050,7 @@ def test_run_one_live_last_review_sha_still_scopes_to_delta(tmp_path):
     })
     ops = FakeOps(tmp_path, sha_exists_val=True)
     result = integrator.run_one(make_order(), cfg, ops.as_dict())
-    assert ops.diff_text_base == "sha-round-1"
+    assert ops.diff_text_bases == ["sha-round-1", cfg["pr_base"]]
     assert result["outcome"] == "closed"
 
 
@@ -1075,6 +1234,76 @@ def test_clear_recovery_round_state_preserves_later_findings_and_last_review(tmp
     assert state["later_findings"] == ["earlier later a"]
     assert state["last_review"] == {"sha": "sha-round-1", "findings": ["still open"]}
     assert integrator.read_recovery_state(local_root, "wf-1") == state
+
+
+# --------------------------------------------------------------------------
+# wf-271: a clean/findings verdict is a fact about a SHA, not about a pass —
+# a later pass on an unchanged head must skip suites and review, not turn a
+# non-deterministic reviewer loose on the same commit again.
+# --------------------------------------------------------------------------
+
+
+def test_run_one_same_sha_repeated_pass_reviews_and_suites_once_while_waiting(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, ci_status="failure", head_shas=["sha-x"])
+    order = make_order()
+
+    first = integrator.run_one(order, cfg, ops.as_dict())
+    assert first["outcome"] == "waiting"
+    second = integrator.run_one(order, cfg, ops.as_dict())
+    assert second["outcome"] == "waiting"
+
+    assert ops.calls.count("run_suites") == 1
+    assert ops.calls.count("dispatch_reviewer") == 1
+    state = integrator.read_recovery_state(cfg["local_root"], "wf-1")
+    assert state["suites_ok_sha"] == "sha-x"
+    assert state["last_review"] == {"sha": "sha-x", "findings": []}
+
+
+def test_run_one_new_commit_after_waiting_triggers_a_fresh_delta_review(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, ci_status="failure", head_shas=["sha-x", "sha-y"])
+    order = make_order()
+
+    integrator.run_one(order, cfg, ops.as_dict())
+    second = integrator.run_one(order, cfg, ops.as_dict())
+
+    assert second["outcome"] == "waiting"
+    assert ops.calls.count("run_suites") == 2
+    assert ops.calls.count("dispatch_reviewer") == 2
+    # the delta review diffs against the last reviewed sha; wf-272 also reads
+    # the whole branch diff (pr_base) for context, so both bases are asked for
+    assert "sha-x" in ops.diff_text_bases[-2:]
+    state = integrator.read_recovery_state(cfg["local_root"], "wf-1")
+    assert state["suites_ok_sha"] == "sha-y"
+    assert state["last_review"] == {"sha": "sha-y", "findings": []}
+
+
+def test_run_one_recorded_findings_with_no_new_commit_reposts_without_reviewing(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_recovery_rounds=3)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {
+        "rounds_used": 1,
+        "suites_ok_sha": "sha-x",
+        "last_review": {"sha": "sha-x", "findings": ["fix the thing"]},
+    })
+    ops = FakeOps(tmp_path, head_shas=["sha-x"])
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+
+    # Reposting recorded findings for an unchanged SHA must not re-charge the
+    # recovery budget or touch the seat again — that was already done in the
+    # pass that discovered them (wf-271 second-pass finding 2).
+    assert result["outcome"] == "waiting_on_findings"
+    assert result["findings"] == ["fix the thing"]
+    assert "dispatch_reviewer" not in ops.calls
+    assert "run_suites" not in ops.calls
+    assert "post_comment" in ops.calls
+    assert "release_seat" not in ops.calls
+    assert "dispatch_recovery" not in ops.calls
+    state = integrator.read_recovery_state(cfg["local_root"], "wf-1")
+    assert state["rounds_used"] == 1
 
 
 def test_clear_recovery_round_state_with_no_prior_state_has_no_later_findings(tmp_path):
@@ -1312,7 +1541,7 @@ def test_seat_in_flight_false_when_no_locks_or_open_shifts(tmp_path):
 def test_run_one_skips_activate_when_seat_in_flight(tmp_path):
     roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
     cfg = base_config(tmp_path, roster_path)
-    _write_live_lock(cfg["local_root"], "other-seat")
+    _write_live_lock(cfg["local_root"], "tester")  # the roster lane; a non-lane lock is not a seat (wf-275)
     ops = FakeOps(tmp_path)
     result = integrator.run_one(make_order(), cfg, ops.as_dict())
     assert result["outcome"] == "activate_skipped"
@@ -1333,7 +1562,7 @@ def test_run_one_resumes_from_activate_after_seat_in_flight_without_remerging(tm
     """
     roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
     cfg = base_config(tmp_path, roster_path)
-    _write_live_lock(cfg["local_root"], "other-seat")
+    _write_live_lock(cfg["local_root"], "tester")  # the roster lane; a non-lane lock is not a seat (wf-275)
     ops = FakeOps(tmp_path)
     order = make_order()
 
@@ -2514,23 +2743,36 @@ def test_checkout_templates_override_per_worker(tmp_path):
 
 
 def test_run_one_stops_with_checkout_missing_when_suites_cannot_start(tmp_path, monkeypatch):
-    """A missing checkout raises FileNotFoundError from the real run_suites; the
-    pass must stop the order with checkout_missing, not die."""
+    """A missing checkout raises FileNotFoundError from the real
+    checkout_head_sha/run_suites; the pass must stop the order with
+    checkout_missing, not die."""
     w = make_worker(tmp_path, name="tester", command=["claude", "-p", "x"])
     roster_path = write_roster(tmp_path, [w])
     cfg = make_config(tmp_path, roster_path)
     posted = []
+    parked = []
+    def checkout_head_sha(checkout):
+        raise FileNotFoundError(checkout)
     def run_suites(checkout):
         raise FileNotFoundError(checkout)
+    def stop_seat(tid, reason):
+        posted.append((tid, integrator.stopped_comment_body(
+            reason, config_path=cfg["config_path"], task_id=tid,
+        )))
+        parked.append(tid)
+        return {"ok": True}
     ops = {
+        "checkout_head_sha": checkout_head_sha,
         "run_suites": run_suites,
         "merge_base_into_branch": lambda checkout, branch, base: {"ok": True, "conflict": False, "sha": ""},
         "post_comment": lambda tid, body: posted.append((tid, body)),
+        "stop_seat": stop_seat,
     }
     order = {"task_id": "wf-9", "worker": "tester", "provider": "claude", "title": "t", "checkout_override": None}
     result = integrator.run_one(order, cfg, ops)
     assert result["outcome"] == "checkout_missing"
     assert posted and posted[0][0] == "wf-9"
+    assert parked == ["wf-9"]
 
 
 def test_test_only_correction_delta_falls_back_to_full_review():
@@ -2684,6 +2926,209 @@ def test_default_ops_merge_base_into_branch_non_conflict_failure_is_not_reported
     assert result["paths"] == []
 
 
+# --------------------------------------------------------------------------
+# wf-270 recovery round 4 — reviewer findings
+# --------------------------------------------------------------------------
+
+
+def test_strip_provider_scratch_handles_quoted_and_bare_directory_entries():
+    """git quotes porcelain paths with special characters in double quotes,
+    and reports some untracked directories as a bare entry with no trailing
+    slash; both forms must still be recognised as provider scratch, not read
+    as "checkout is not clean" (finding 3)."""
+    porcelain = "\n".join([
+        "?? .cursor",
+        '?? ".cursor/config.json"',
+        "?? .grok/",
+        "?? real_file.py",
+    ])
+    assert integrator._strip_provider_scratch(porcelain) == "?? real_file.py"
+
+
+def test_default_ops_stop_seat_escalates_when_repark_patch_fails(tmp_path, monkeypatch):
+    """A failed re-park PATCH after the stop comment must not silently read as
+    a clean STOP — stop_seat posts an escalation comment and logs a distinct
+    PARK_FAILED ledger row instead of leaving the order invisible in backlog
+    (finding 1)."""
+    from workforce import capacity as capacity_mod
+
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    local_root = str(tmp_path / "local")
+    cfg = base_config(tmp_path, roster_path, local_root=local_root)
+
+    calls = []
+
+    def fake_req(method, url, body=None, timeout=20.0):
+        calls.append((method, body))
+        if method == "PATCH":
+            return {"ok": False, "error": "desk unreachable"}
+        return {"ok": True}
+
+    monkeypatch.setenv("WORKFORCE_ALLOW_DESK", "1")
+    monkeypatch.setattr(capacity_mod, "_req", fake_req)
+    ops = integrator.default_ops(cfg)
+
+    result = ops["stop_seat"]("wf-1", "suites failed")
+    assert result["park"]["ok"] is False
+
+    patches = [c for c in calls if c[0] == "PATCH"]
+    posts = [c for c in calls if c[0] == "POST"]
+    assert len(patches) == 1
+    assert len(posts) == 2
+    assert "re-park to in_review failed" in posts[-1][1]["body"]
+
+    ledger_path = os.path.join(local_root, "ledger", "integrator-workforce.log")
+    with open(ledger_path, encoding="utf-8") as fh:
+        ledger_text = fh.read()
+    assert "PARK_FAILED" in ledger_text
+    assert "wf-1" in ledger_text
+
+
+def test_clear_recovery_round_state_reparks_when_park_seat_given(tmp_path):
+    """--clear-recovery must not only reset local recovery JSON — it must
+    also re-park the order to in_review, or a ticket already fallen to
+    backlog (pre-fix stop or a failed park_seat) stays invisible to
+    discover_candidates even after a human runs the posted clear command
+    (finding 2)."""
+    local_root = str(tmp_path / "local")
+    integrator.write_recovery_state(local_root, "wf-1", {"rounds_used": 2})
+
+    parked = []
+
+    def fake_park_seat(task_id):
+        parked.append(task_id)
+        return {"ok": True, "task": {"id": task_id, "status": "in_review"}}
+
+    state = integrator.clear_recovery_round_state(
+        local_root, "wf-1", "you", "seat fixed by hand", park_seat=fake_park_seat,
+    )
+    assert parked == ["wf-1"]
+    assert state["park"]["ok"] is True
+    assert state["rounds_used"] == 0
+
+
+def test_clear_recovery_round_state_without_park_seat_has_no_park_key(tmp_path):
+    """Backward compatible: omitting park_seat (existing direct callers)
+    leaves the returned state exactly as before."""
+    local_root = str(tmp_path / "local")
+    state = integrator.clear_recovery_round_state(local_root, "wf-1", "you", "first clear")
+    assert "park" not in state
+
+
+# --------------------------------------------------------------------------
+# wf-270 recovery round 5 — a failed re-park must not also log STOP
+# --------------------------------------------------------------------------
+
+
+def test_run_one_checkout_missing_skips_stop_ledger_row_when_repark_fails(tmp_path):
+    """stop_seat already escalates a failed re-park with its own PARK_FAILED
+    row; run_one must not additionally log a plain STOP on top of that, or
+    the ledger reads as if the order stayed safely parked when it is really
+    still exposed in backlog (round 4 finding 1, not fully closed)."""
+    w = make_worker(tmp_path, name="tester", command=["claude", "-p", "x"])
+    roster_path = write_roster(tmp_path, [w])
+    cfg = make_config(tmp_path, roster_path)
+
+    def checkout_head_sha(checkout):
+        raise FileNotFoundError(checkout)
+
+    def run_suites(checkout):
+        raise FileNotFoundError(checkout)
+
+    def stop_seat(tid, reason):
+        return {"ok": True, "park": {"ok": False, "error": "desk unreachable"}}
+
+    ops = {
+        "checkout_head_sha": checkout_head_sha,
+        "run_suites": run_suites,
+        "merge_base_into_branch": lambda checkout, branch, base: {"ok": True, "conflict": False, "sha": ""},
+        "post_comment": lambda tid, body: None,
+        "stop_seat": stop_seat,
+    }
+    order = {"task_id": "wf-9", "worker": "tester", "provider": "claude", "title": "t", "checkout_override": None}
+    result = integrator.run_one(order, cfg, ops)
+    assert result["outcome"] == "checkout_missing"
+
+    log_path = os.path.join(cfg["local_root"], "ledger", "integrator-workforce.log")
+    with open(log_path, encoding="utf-8") as fh:
+        ledger_text = fh.read()
+    assert "STOP" not in ledger_text
+    assert "DISCOVER" in ledger_text
+
+
+def test_run_one_checkout_missing_logs_stop_when_repark_succeeds(tmp_path):
+    """The normal case: a successful re-park still logs STOP as before."""
+    w = make_worker(tmp_path, name="tester", command=["claude", "-p", "x"])
+    roster_path = write_roster(tmp_path, [w])
+    cfg = make_config(tmp_path, roster_path)
+
+    def checkout_head_sha(checkout):
+        raise FileNotFoundError(checkout)
+
+    def run_suites(checkout):
+        raise FileNotFoundError(checkout)
+
+    def stop_seat(tid, reason):
+        return {"ok": True, "park": {"ok": True}}
+
+    ops = {
+        "checkout_head_sha": checkout_head_sha,
+        "run_suites": run_suites,
+        "merge_base_into_branch": lambda checkout, branch, base: {"ok": True, "conflict": False, "sha": ""},
+        "post_comment": lambda tid, body: None,
+        "stop_seat": stop_seat,
+    }
+    order = {"task_id": "wf-9", "worker": "tester", "provider": "claude", "title": "t", "checkout_override": None}
+    result = integrator.run_one(order, cfg, ops)
+    assert result["outcome"] == "checkout_missing"
+
+    log_path = os.path.join(cfg["local_root"], "ledger", "integrator-workforce.log")
+    with open(log_path, encoding="utf-8") as fh:
+        ledger_text = fh.read()
+    assert "STOP" in ledger_text
+
+
+def test_finish_after_stage_install_not_verified_skips_stop_row_when_repark_fails(tmp_path, monkeypatch):
+    """The install_not_verified path in _finish_after_stage has the same
+    failure class as stop_seat and must not log STOP when park_seat fails."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    local_root = str(tmp_path / "local")
+    cfg = base_config(tmp_path, roster_path, local_root=local_root)
+
+    posted = []
+
+    def post_comment(tid, body):
+        posted.append((tid, body))
+        return {"ok": True}
+
+    def park_seat(tid):
+        return {"ok": False, "error": "desk unreachable"}
+
+    def verify_installed_version(*a, **k):
+        return {"ok": False, "observed": "0.0.0"}
+
+    ops = {
+        "post_comment": post_comment,
+        "park_seat": park_seat,
+        "run_activate": lambda ctx: {"rc": 0},
+        "verify_installed_version": verify_installed_version,
+        "capture_screenshots": lambda ctx: [],
+    }
+    post_merge = {
+        "task_id": "wf-9", "pr": {"url": "http://x"}, "reviewer": "cursor-reviewer",
+        "version": {"from": "1.2.2", "to": "1.2.3"},
+    }
+    result = {"generated_at": integrator._utc_iso_z(), "task_id": "wf-9", "outcome": None}
+    out = integrator._finish_after_stage("wf-9", "workforce", cfg, ops, post_merge, result)
+    assert out["outcome"] == "install_not_verified"
+
+    log_path = os.path.join(local_root, "ledger", "integrator-workforce.log")
+    with open(log_path, encoding="utf-8") as fh:
+        ledger_text = fh.read()
+    assert "STOP" not in ledger_text
+    assert "PARK_FAILED" in ledger_text
+
+
 def test_ci_state_from_check_rows_buckets():
     f = integrator.ci_state_from_check_rows
     assert f([{"bucket": "pass", "state": "SUCCESS"}, {"bucket": "skipping", "state": "SKIPPED"}]) == "success"
@@ -2693,3 +3138,33 @@ def test_ci_state_from_check_rows_buckets():
     assert f([]) == "pending"
     assert f([{"state": "SUCCESS"}]) == "success"
     assert f([{"state": "IN_PROGRESS"}]) == "pending"
+
+
+def test_seat_in_flight_ignores_job_and_retired_ledgers_with_roster(tmp_path):
+    """The integrator's own ledger is open for the whole pass that asks; jobs
+    and retired identities are not implementation seats."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path, name="tester")])
+    local_root = str(tmp_path / "local")
+    ledger_dir = os.path.join(local_root, "ledger")
+    os.makedirs(ledger_dir, exist_ok=True)
+    now = integrator._utc_iso_z()
+    for name in ("integrator.log", "bp-supervisor.log", "retired-citizen.log"):
+        with open(os.path.join(ledger_dir, name), "w") as fh:
+            fh.write("%s START queue=ready budget_secs=600\n" % now)
+    assert integrator.seat_in_flight(local_root, roster_path=roster_path) is False
+    with open(os.path.join(ledger_dir, "tester.log"), "w") as fh:
+        fh.write("%s START queue=ready budget_secs=600\n" % now)
+    assert integrator.seat_in_flight(local_root, roster_path=roster_path) is True
+    # legacy call without a roster still reads every ledger
+    assert integrator.seat_in_flight(local_root) is True
+
+
+def test_seat_in_flight_ignores_a_job_lock_with_roster(tmp_path):
+    """The integrator's own live lock (or any job's) is not a seat in flight."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path, name="tester")])
+    local_root = str(tmp_path / "local")
+    _write_live_lock(local_root, "integrator")
+    assert integrator.seat_in_flight(local_root, roster_path=roster_path) is False
+    assert integrator.seat_in_flight(local_root) is True
+    _write_live_lock(local_root, "tester")
+    assert integrator.seat_in_flight(local_root, roster_path=roster_path) is True
