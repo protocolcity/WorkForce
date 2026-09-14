@@ -711,11 +711,13 @@ def _one_shot_board(local_root):
     return httpd, port, t
 
 
-def test_non_api_get_points_at_map_not_api_only_escape(tmp_path):
+def test_non_api_get_points_at_map_not_api_only_escape(tmp_path, monkeypatch):
     """GET / is gone — one line at Map; no WORKFORCE_API_ONLY=0 hint."""
     import urllib.error
     import urllib.request
 
+    import workforce.board as _board_mod
+    monkeypatch.setattr(_board_mod, "SUITE_URL", "http://127.0.0.1:8801")
     local = _html_retired_setup(tmp_path)
     httpd, port, t = _one_shot_board(local)
     try:
@@ -774,6 +776,8 @@ def test_api_only_zero_does_not_serve_html(tmp_path, monkeypatch, capsys):
     import urllib.request
 
     monkeypatch.setenv("WORKFORCE_API_ONLY", "0")
+    import workforce.board as _board_mod
+    monkeypatch.setattr(_board_mod, "SUITE_URL", "http://127.0.0.1:8801")
     local = _html_retired_setup(tmp_path)
     httpd, port, t = _one_shot_board(local)
     err = capsys.readouterr().err
