@@ -67,7 +67,6 @@ from ..api.roster import (  # noqa: F401
 
 from .paths import (  # noqa: F401
     API_ONLY,
-    SUITE_URL,
     _days_param,
     _html_escape_requested,
     _limit_param,
@@ -75,6 +74,7 @@ from .paths import (  # noqa: F401
     _out_path,
     _refuse_html_escape,
     _safe_worker_name,
+    _suite_url,
 )
 from .handler import _Handler  # noqa: F401
 from .server import make_server, serve  # noqa: F401
@@ -118,6 +118,17 @@ for _name, _val in list(vars(_Handler).items()):
 _Handler.__module__ = __name__
 
 del _name, _val, _adopt, types
+
+
+def __getattr__(name: str):
+    # Keep workforce.board.SUITE_URL live (see .paths.__getattr__) rather
+    # than snapshotting it at package-import time.
+    if name == "SUITE_URL":
+        from . import paths
+
+        return paths.SUITE_URL
+    raise AttributeError("module %r has no attribute %r" % (__name__, name))
+
 
 __all__ = [
     "API_ONLY",

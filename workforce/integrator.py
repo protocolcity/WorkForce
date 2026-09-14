@@ -966,8 +966,13 @@ def _json_findings_array(body: str) -> Optional[List[str]]:
     start = body.find("{")
     if start < 0:
         return None
+    # raw_decode: the object is usually inside a ```json fence and followed
+    # by the closing fence or a closing remark. json.loads would refuse the
+    # trailing text and the whole reply would count as one finding, which
+    # turned every cursor-reviewer verdict, clean ones included, into a
+    # recovery round (pc-1496 / wf-269, 2026-09-14).
     try:
-        data = json.loads(body[start:])
+        data, _end = json.JSONDecoder().raw_decode(body[start:])
     except (ValueError, TypeError):
         return None
     if not isinstance(data, dict):
@@ -1164,7 +1169,7 @@ def clear_post_merge_state(local_root: str, task_id: str) -> None:
 
 _LEDGER_EVENTS = (
     "DISCOVER", "SUITES", "RECOVER", "STOP", "REVIEW", "FINDINGS", "LATER",
-    "WAIT_CI", "MERGE", "STAGE", "ACTIVATE", "CLOSE", "DRY_RUN", "SKIP",
+    "WAIT_CI", "MERGE", "STAGE", "ACTIVATE", "CLOSE", "PRUNE", "DRY_RUN", "SKIP",
 )
 
 
@@ -1803,6 +1808,11 @@ def _finish_after_stage(
     if later_findings:
         append_ledger_row(config["local_root"], project, "LATER", ticket=task_id, count=len(later_findings))
     append_ledger_row(config["local_root"], project, "CLOSE", ticket=task_id)
+    worker = result.get("worker")
+    if worker:
+        from .prune import prune_after_close
+
+        result["prune"] = prune_after_close(config, worker, task_id)
     clear_recovery_state(config["local_root"], task_id)
     clear_post_merge_state(config["local_root"], task_id)
     result["outcome"] = "closed"
