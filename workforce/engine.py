@@ -1047,7 +1047,15 @@ def startup_reconcile(
 
 def _preflight(worker: Worker) -> Tuple[Optional[int], List[dict]]:
     """Pre-dispatch checks. Returns (ready count, ready task dicts)."""
-    if _free_mb(worker.workdir) < worker.min_free_mb:
+    try:
+        free_mb = _free_mb(worker.workdir)
+    except OSError as exc:
+        # A stale/misconfigured roster workdir must not raise a bare OSError
+        # past dispatch()'s InfraError handling — that would skip the
+        # worker's own ERROR ledger row entirely and surface only as an
+        # opaque "exception" string in the supervisor's receipt.
+        raise InfraError("workdir unreadable: %s" % exc)
+    if free_mb < worker.min_free_mb:
         raise _Skip("low disk (<%dMB free)" % worker.min_free_mb)
     # Resolution mirrors subprocess argv[0] rules so both this check and the
     # spawn agree: absolute paths checked directly; path-like commands
