@@ -899,6 +899,32 @@ def _flatten_finding_entries(entries: Sequence[Any]) -> List[str]:
     return out
 
 
+def ci_state_from_check_rows(rows: Any) -> str:
+    """Fold `gh pr checks --json bucket,state` rows into success/failure/pending.
+
+    bucket is pass, fail, pending, skipping or cancel; state is the raw
+    GitHub state (SUCCESS, FAILURE, PENDING, ...). Any failing or cancelled
+    check is a failure; any pending check keeps the PR pending; skipped
+    checks count as done; an empty list (no checks at all) is pending, never
+    an implicit success.
+    """
+    if not isinstance(rows, list) or not rows:
+        return "pending"
+    failing = {"fail", "cancel"}
+    pending_states = {"pending", "queued", "in_progress", "waiting", "requested", "expected"}
+    seen_pending = False
+    for row in rows:
+        if not isinstance(row, dict):
+            return "pending"
+        bucket = str(row.get("bucket") or "").lower()
+        state = str(row.get("state") or "").lower()
+        if bucket in failing or state in ("failure", "error", "cancelled", "timed_out", "action_required"):
+            return "failure"
+        if bucket == "pending" or (not bucket and state in pending_states) or (not bucket and not state):
+            seen_pending = True
+    return "pending" if seen_pending else "success"
+
+
 def parse_reviewer_findings(output_text: str) -> List[str]:
     """Parse a reviewer job's raw stdout into a findings list; empty means clean.
 
@@ -1468,19 +1494,17 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
         return {"number": None, "url": url, "action": "opened", "rc": create["rc"]}
 
     def ci_status(checkout: str, pr_number: Any) -> str:
-        r = _run(["gh", "pr", "checks", str(pr_number), "--json", "conclusion"], cwd=checkout)
+        # `gh pr checks --json` exposes bucket/state, not conclusion; asking
+        # for an unknown field exits 1 and every PR read as pending forever
+        # (no unattended merge ever happened before 2026-09-14 07:30Z).
+        r = _run(["gh", "pr", "checks", str(pr_number), "--json", "bucket,state"], cwd=checkout)
         if r["rc"] != 0:
             return "pending"
         try:
             rows = json.loads(r["output"])
         except json.JSONDecodeError:
             return "pending"
-        conclusions = [str(row.get("conclusion") or "").lower() for row in rows]
-        if any(c in ("failure", "cancelled", "timed_out") for c in conclusions):
-            return "failure"
-        if any(c == "" for c in conclusions):
-            return "pending"
-        return "success"
+        return ci_state_from_check_rows(rows)
 
     def dispatch_reviewer(reviewer: str, prompt: str) -> Dict[str, Any]:
         if not config.get("reviewer_dispatch_cmd"):
