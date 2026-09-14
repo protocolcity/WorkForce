@@ -48,6 +48,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import time
@@ -1706,6 +1707,182 @@ def _pass_result_json(out_path: str, offset: int) -> Optional[dict]:
     return last_obj
 
 
+# wf-266 — a vendor CLI's own process (cursor-agent observed) can keep
+# running well after it has printed its pass's terminal result and
+# WorkLane already shows the order it worked parked or released. Poll
+# instead of one blocking wait() so a confirmed linger can end the pass
+# early instead of riding the full shift budget to a false "killed at
+# budget" ERROR on a shift whose work was actually done.
+_LINGER_POLL_SECS = 2.0
+
+
+def _terminate_process_group(proc: "subprocess.Popen") -> None:
+    """Kill a spawned provider and every descendant it left behind.
+
+    Every provider Popen in this module is started with
+    ``start_new_session=True``, so ``proc.pid`` is also its process group id
+    — killing the group (not just the direct child) reaches a vendor CLI's
+    own children even after an ordinary kill lets them be reparented to
+    launchd/init (wf-266 — cursor-agent orphans observed surviving
+    ``proc.kill()`` for up to two hours).
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, AttributeError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _task_ref_from_pass_output(out_path: str, offset: int) -> Optional[Tuple[str, str]]:
+    """Return (project, task_id) task_runner prepared for this pass, or None.
+
+    None means either nothing has been prepared yet this pass, or this
+    worker's command never routes through task_runner.py (a hand-built seat
+    invoking a vendor CLI directly) — such a pass has no WorkLane order to
+    confirm parked/released, so linger detection never engages for it.
+    """
+    receipt_path = _last_receipt_path(out_path, offset)
+    if not receipt_path:
+        return None
+    try:
+        data = json.loads(Path(receipt_path).read_text())
+    except (OSError, ValueError):
+        return None
+    project, task_id = data.get("project"), data.get("task_id")
+    if isinstance(project, str) and project and isinstance(task_id, str) and task_id:
+        return project, task_id
+    return None
+
+
+def _task_still_in_progress(desk: str, project: str, task_id: str) -> bool:
+    """True unless the desk positively confirms the order left in_progress.
+
+    An unreachable desk or a malformed response is treated as still
+    in_progress — a lingering provider is only ever force-ended on a
+    positive confirmation that its own order was parked or released, never
+    on an inconclusive read.
+    """
+    try:
+        task = _fetch_task(desk, project, task_id)
+    except Exception:
+        return True
+    if not isinstance(task, dict):
+        return True
+    return str(task.get("status") or "").lower() == "in_progress"
+
+
+def _is_terminal_result(worker: Worker, obj: Optional[dict]) -> bool:
+    """True when ``obj`` is a verified terminal result, per the adapter's own
+    completion contract — never the mere presence of a last parsed JSON
+    object, which can be an intermediate NDJSON diagnostic or a partially
+    flushed final line still being written (wf-266 review).
+
+    Two independent recognitions, either is sufficient: a generic
+    ``type == "end"`` or ``type == "result"`` wrapper (covers both a normal
+    end_turn NDJSON tail and grok's ``--output-format json`` shape), or —
+    for a worker that opted into wf-262 stop-reason verification — its own
+    ``completion_field`` resolving to *any* string value, not only one of
+    ``completion_values`` (wf-266 second review — grok's real cancelled turn
+    is a bare ``{"stopReason": "cancelled", ...}`` with no ``type`` field at
+    all; requiring membership in ``completion_values`` here would leave that
+    genuinely terminal denial unrecognized and never armed for linger, so a
+    hang after it would still ride to a bare budget kill instead of the
+    ``denied: cancelled`` classification dispatch runs once the linger
+    exits). Whether the resolved value actually counts as *complete* is
+    ``_classify_completion``'s job, run on exit, not this arming check's. A
+    worker that never opts in and whose output carries no recognizable
+    ``type`` is never treated as terminal by this check alone.
+    """
+    if not isinstance(obj, dict):
+        return False
+    if obj.get("type") in ("end", "result"):
+        return True
+    if worker.completion_field:
+        try:
+            value = _dig(obj, worker.completion_field)
+        except KeyError:
+            return False
+        return isinstance(value, str) and bool(value)
+    return False
+
+
+def _run_pass(
+    argv: List[str], shift_cwd: str, env: Dict[str, str], outfh, out_path: str,
+    pass_offset: int, deadline: float, worker: Worker,
+) -> Tuple[Optional[int], Optional[str]]:
+    """Spawn one pass and wait for it, ending early on a confirmed linger.
+
+    Returns ``(rc, linger_reason)``. ``rc`` is the real exit code when the
+    process left on its own; ``rc is None`` means this call force-ended the
+    process — ``linger_reason`` is ``None`` for the existing plain budget
+    deadline ("killed at budget" unchanged) or a string once the provider's
+    terminal result has appeared and WorkLane confirms its order is no
+    longer held by this identity (grace period ``worker.linger_grace_secs``
+    before the force-end).
+    """
+    proc = subprocess.Popen(argv, cwd=shift_cwd, env=env, stdin=subprocess.DEVNULL,
+                            stdout=outfh, stderr=subprocess.STDOUT, start_new_session=True)
+    desk = desk_origin_from_queue_url(worker.queue_url or "")
+    task_ref: Optional[Tuple[str, str]] = None
+    linger_since: Optional[float] = None
+    # wf-266 second review — a terminal result already on disk, before the
+    # desk has confirmed the order left in_progress (a slow park/release),
+    # still means the provider's own work is done; budget expiry in that
+    # window must not fall through to the bare "killed at budget" ERROR.
+    terminal_result_seen = False
+    terminal_seen_at = None
+    while True:
+        remain = deadline - time.monotonic()
+        if linger_since is not None:
+            # wf-266 review — once the linger is armed, budget expiry must
+            # still end the pass with the linger reason, never fall through
+            # to a bare "killed at budget" ERROR for a shift whose work is
+            # already confirmed done.
+            grace_remain = worker.linger_grace_secs - (time.monotonic() - linger_since)
+            if remain <= 0 or grace_remain <= 0:
+                _terminate_process_group(proc)
+                return None, "provider lingered after result"
+            wait_for = min(_LINGER_POLL_SECS, remain, grace_remain)
+        else:
+            # A verified terminal result without a desk park yet: bound the
+            # pre-park wait by the same grace as the post-park linger, not by
+            # the remaining shift budget (wf-266 third-pass finding).
+            if terminal_result_seen and terminal_seen_at is not None:
+                pending = time.monotonic() - terminal_seen_at
+                if pending >= worker.linger_grace_secs:
+                    _terminate_process_group(proc)
+                    return None, "provider lingered after result"
+            if remain <= 0:
+                _terminate_process_group(proc)
+                if terminal_result_seen:
+                    return None, "provider lingered after result"
+                return None, None
+            wait_for = min(_LINGER_POLL_SECS, remain)
+        try:
+            rc = proc.wait(timeout=max(wait_for, 0.01))
+            return rc, None
+        except subprocess.TimeoutExpired:
+            pass
+        if desk and linger_since is None:
+            if task_ref is None:
+                task_ref = _task_ref_from_pass_output(out_path, pass_offset)
+            if task_ref is not None and _is_terminal_result(
+                worker, _pass_result_json(out_path, pass_offset),
+            ):
+                terminal_result_seen = True
+                if terminal_seen_at is None:
+                    terminal_seen_at = time.monotonic()
+                project, task_id = task_ref
+                if not _task_still_in_progress(desk, project, task_id):
+                    linger_since = time.monotonic()
+
+
 def _classify_completion(
     worker: Worker, out_path: str, offset: int,
 ) -> Tuple[bool, bool, str]:
@@ -2092,18 +2269,39 @@ def dispatch(
         # drain loop can never re-spawn the recovery argv a second time.
         pass_ceiling = 1 if recover_receipt else effective_pass_ceiling(worker)
         while True:
-            remain = deadline - time.monotonic()
             outfh.write("--- pass %d ---\n" % (passes + 1))
             outfh.flush()
             pass_offset = outfh.tell()  # telemetry reads this pass's slice only
             pass_t0 = time.monotonic()
-            proc = subprocess.Popen(argv, cwd=shift_cwd, env=env,
-                                    stdout=outfh, stderr=subprocess.STDOUT)
-            try:
-                rc = proc.wait(timeout=max(remain, 0.1))
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+            rc, linger_reason = _run_pass(
+                argv, shift_cwd, env, outfh, out_path, pass_offset, deadline, worker,
+            )
+            if rc is None:
+                if linger_reason:
+                    # wf-266 review — a confirmed linger is not automatically
+                    # a completed turn; run the same wf-262 stop-reason
+                    # classification the normal rc==0 path uses, so a Grok
+                    # pass that printed stopReason cancelled before parking
+                    # still records the real denial instead of a false DONE.
+                    configured, complete, stop_value = _classify_completion(
+                        worker, out_path, pass_offset,
+                    )
+                    if configured and not complete:
+                        # wf-266 second review — any configured-and-incomplete
+                        # outcome is terminal, exactly as the rc==0 path
+                        # treats it, not only the "cancelled" denial: a
+                        # linger is never allowed to paper over an
+                        # unrecognized/incomplete stop value as DONE.
+                        if stop_value == "cancelled":
+                            ledger.append("ERROR", reason="denied: cancelled",
+                                          on_pass=passes + 1, **recovery_kv)
+                        else:
+                            ledger.append("ERROR", reason="incomplete: " + stop_value,
+                                          on_pass=passes + 1, **recovery_kv)
+                        return 1
+                    ledger.append("DONE", reason=linger_reason, rc=0, on_pass=passes + 1,
+                                  secs=int(time.monotonic() - pass_t0), **recovery_kv)
+                    return _stop_ok(linger_reason)
                 ledger.append("ERROR", reason="killed at budget",
                               budget_secs=worker.budget_secs, on_pass=passes + 1, **recovery_kv)
                 return 1
@@ -2127,12 +2325,12 @@ def dispatch(
                     fb_pass_offset = outfh.tell()
                     fb_t0 = time.monotonic()
                     fb_proc = subprocess.Popen(fallback_argv, cwd=shift_cwd, env=env,
-                                               stdout=outfh, stderr=subprocess.STDOUT)
+                                               stdin=subprocess.DEVNULL, stdout=outfh,
+                                               stderr=subprocess.STDOUT, start_new_session=True)
                     try:
                         fb_rc = fb_proc.wait(timeout=max(deadline - time.monotonic(), 0.1))
                     except subprocess.TimeoutExpired:
-                        fb_proc.kill()
-                        fb_proc.wait()
+                        _terminate_process_group(fb_proc)
                         ledger.append("ERROR", reason="killed at budget (fallback)",
                                       budget_secs=worker.budget_secs, **recovery_kv)
                         return 1
@@ -2214,12 +2412,12 @@ def dispatch(
                 outfh.flush()
                 final_offset = outfh.tell()
                 cont_proc = subprocess.Popen(cont_argv, cwd=shift_cwd, env=env,
-                                             stdout=outfh, stderr=subprocess.STDOUT)
+                                             stdin=subprocess.DEVNULL, stdout=outfh,
+                                             stderr=subprocess.STDOUT, start_new_session=True)
                 try:
                     rc = cont_proc.wait(timeout=max(cont_remain, 0.1))
                 except subprocess.TimeoutExpired:
-                    cont_proc.kill()
-                    cont_proc.wait()
+                    _terminate_process_group(cont_proc)
                     ledger.append("ERROR", reason="killed at budget",
                                   budget_secs=worker.budget_secs, on_pass=passes + 1,
                                   continuations=continuations, **recovery_kv)
