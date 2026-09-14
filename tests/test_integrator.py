@@ -1345,6 +1345,21 @@ def test_seat_in_flight_false_when_no_locks_or_open_shifts(tmp_path):
     assert integrator.seat_in_flight(str(tmp_path / "local"), {worker.name: worker}) is False
 
 
+def test_seat_in_flight_legacy_one_arg_fails_safe_on_any_lock(tmp_path):
+    local_root = str(tmp_path / "local")
+    _write_live_lock(local_root, "any-seat")
+    assert integrator.seat_in_flight(local_root) is True
+
+
+def test_seat_in_flight_legacy_one_arg_fails_safe_on_open_shift(tmp_path):
+    local_root = str(tmp_path / "local")
+    ledger_dir = os.path.join(local_root, "ledger")
+    os.makedirs(ledger_dir, exist_ok=True)
+    with open(os.path.join(ledger_dir, "any-seat.log"), "w") as fh:
+        fh.write("%s START queue=ready budget_secs=600\n" % integrator._utc_iso_z())
+    assert integrator.seat_in_flight(local_root) is True
+
+
 def test_seat_in_flight_ignores_retired_identity_ledger(tmp_path):
     local_root = str(tmp_path / "local")
     worker = make_worker(tmp_path, name="active-seat")
@@ -1369,18 +1384,58 @@ def test_seat_in_flight_ignores_stale_open_shift(tmp_path):
     assert integrator.seat_in_flight(local_root, workers) is False
 
 
-def test_run_one_merges_and_closes_while_seat_locked(tmp_path):
-    """Landing does not need the seat free — only recovery does."""
+def test_run_one_merges_but_skips_activate_while_seat_locked(tmp_path):
+    """Merge/bump/stage proceed while the seat is busy; activate waits."""
     worker = make_worker(tmp_path, name="tester")
     roster_path = write_roster(tmp_path, [worker])
     cfg = base_config(tmp_path, roster_path)
     _write_live_lock(cfg["local_root"], "tester")
     ops = FakeOps(tmp_path)
     result = integrator.run_one(make_order(), cfg, ops.as_dict())
-    assert result["outcome"] == "closed"
+    assert result["outcome"] == "activate_skipped"
     assert "merge_pr" in ops.calls
+    assert "write_version" in ops.calls
+    assert "run_stage" in ops.calls
+    assert "run_activate" not in ops.calls
+    assert "close_order" not in ops.calls
+
+
+def test_run_one_skips_activate_when_other_seat_in_flight(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    _write_live_lock(cfg["local_root"], "other-seat")
+    ops = FakeOps(tmp_path)
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "activate_skipped"
+    assert "run_activate" not in ops.calls
+    assert "close_order" not in ops.calls
+    assert "write_version" in ops.calls
+    assert "run_stage" in ops.calls
+
+
+def test_run_one_resumes_from_activate_after_seat_in_flight_without_remerging(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    _write_live_lock(cfg["local_root"], "other-seat")
+    ops = FakeOps(tmp_path)
+    order = make_order()
+
+    first = integrator.run_one(order, cfg, ops.as_dict())
+    assert first["outcome"] == "activate_skipped"
+    assert ops.calls.count("merge_pr") == 1
+    assert "run_activate" not in ops.calls
+
+    shutil.rmtree(os.path.join(cfg["local_root"], "locks"))
+    second = integrator.run_one(order, cfg, ops.as_dict())
+    assert second["outcome"] == "closed"
+    assert ops.calls.count("merge_pr") == 1
+    assert ops.calls.count("run_suites") == 1
+    assert ops.calls.count("dispatch_reviewer") == 1
+    assert ops.calls.count("write_version") == 1
+    assert ops.calls.count("run_stage") == 1
     assert "run_activate" in ops.calls
     assert "close_order" in ops.calls
+    assert second["version"] == {"from": "1.0.0", "to": "1.0.1"}
 
 
 def test_run_one_findings_recovery_seat_busy_leaves_rounds_unchanged(tmp_path):
@@ -1388,6 +1443,24 @@ def test_run_one_findings_recovery_seat_busy_leaves_rounds_unchanged(tmp_path):
     roster_path = write_roster(tmp_path, [worker])
     cfg = base_config(tmp_path, roster_path)
     _write_live_lock(cfg["local_root"], "tester")
+    ops = FakeOps(tmp_path, review_findings=["fix the thing"])
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "seat_busy"
+    assert result["seat"] == "tester"
+    assert "dispatch_recovery" not in ops.calls
+    assert "release_seat" not in ops.calls
+    assert integrator.read_recovery_state(cfg["local_root"], "wf-1")["rounds_used"] == 0
+
+
+def test_run_one_findings_recovery_seat_busy_on_open_shift_without_lock(tmp_path):
+    """Open ledger shift without a lock must still defer recovery."""
+    worker = make_worker(tmp_path, name="tester")
+    roster_path = write_roster(tmp_path, [worker])
+    cfg = base_config(tmp_path, roster_path)
+    ledger_dir = os.path.join(cfg["local_root"], "ledger")
+    os.makedirs(ledger_dir, exist_ok=True)
+    with open(os.path.join(ledger_dir, "tester.log"), "w") as fh:
+        fh.write("%s START queue=ready budget_secs=600\n" % integrator._utc_iso_z())
     ops = FakeOps(tmp_path, review_findings=["fix the thing"])
     result = integrator.run_one(make_order(), cfg, ops.as_dict())
     assert result["outcome"] == "seat_busy"

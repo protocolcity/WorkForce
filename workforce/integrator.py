@@ -1297,18 +1297,69 @@ def _any_open_ledger_shift(
     return False
 
 
+def _legacy_any_open_ledger_shift(local_root: str) -> bool:
+    """Legacy one-arg path: any worker ledger with a running shift counts."""
+    from . import ledger as ledger_mod
+
+    ledger_dir = os.path.join(local_root, "ledger")
+    if not os.path.isdir(ledger_dir):
+        return False
+    for name in os.listdir(ledger_dir):
+        if not name.endswith(".log") or name.startswith("integrator-"):
+            continue
+        try:
+            with open(os.path.join(ledger_dir, name), "r", encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        shifts = ledger_mod.parse_shifts(text, limit=1)
+        if shifts and shifts[0].get("outcome") == "running":
+            return True
+    return False
+
+
+def _seat_open_ledger_shift(local_root: str, seat: str, worker: Any) -> bool:
+    """True when this seat's ledger has a non-stale open shift."""
+    from . import ledger as ledger_mod
+
+    ledger_path = os.path.join(local_root, "ledger", "%s.log" % seat)
+    if not os.path.isfile(ledger_path):
+        return False
+    budget = int(getattr(worker, "budget_secs", 0) or 0) or 1500
+    try:
+        with open(ledger_path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return False
+    shifts = ledger_mod.parse_shifts(text, limit=1)
+    if not shifts or shifts[0].get("outcome") != "running":
+        return False
+    started = _parse_iso_z(shifts[0]["ts"])
+    if started is not None and (_utcnow() - started).total_seconds() > budget:
+        return False
+    return True
+
+
 def seat_in_flight(local_root: str, workers: Optional[Dict[str, Any]] = None) -> bool:
-    """True when a roster lane seat holds a live lock or a non-stale open shift."""
+    """True when a roster lane seat holds a live lock or a non-stale open shift.
+
+    With no *workers*, any live lock or open ledger shift is in-flight (legacy
+    fail-safe for callers that still use the one-arg form).
+    """
     from . import provider_qualification as pq_mod
 
-    roster_workers = workers or {}
-    implementation_seats = _implementation_seats(roster_workers)
+    if not workers:
+        if pq_mod.scan_active_locks(local_root):
+            return True
+        return _legacy_any_open_ledger_shift(local_root)
+
+    implementation_seats = _implementation_seats(workers)
     if not implementation_seats:
         return False
     for row in pq_mod.scan_active_locks(local_root):
         if row["worker"] in implementation_seats:
             return True
-    return _any_open_ledger_shift(local_root, roster_workers, implementation_seats)
+    return _any_open_ledger_shift(local_root, workers, implementation_seats)
 
 
 def _seat_has_active_lock(local_root: str, seat: str) -> bool:
@@ -1320,15 +1371,28 @@ def _seat_has_active_lock(local_root: str, seat: str) -> bool:
     )
 
 
+def _seat_in_flight(local_root: str, seat: str, workers: Dict[str, Any]) -> bool:
+    """True when *seat* holds a live lock or a non-stale open shift."""
+    if seat not in _implementation_seats(workers):
+        return False
+    if _seat_has_active_lock(local_root, seat):
+        return True
+    worker = workers.get(seat)
+    if worker is None:
+        return False
+    return _seat_open_ledger_shift(local_root, seat, worker)
+
+
 def _defer_recovery_if_seat_busy(
     local_root: str,
     project: str,
     task_id: str,
     seat: str,
+    workers: Dict[str, Any],
     result: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
     """Park recovery when the seat is mid-shift; do not consume a round."""
-    if not _seat_has_active_lock(local_root, seat):
+    if not _seat_in_flight(local_root, seat, workers):
         return None
     append_ledger_row(local_root, project, "SKIP", ticket=task_id, reason="seat_busy", worker=seat)
     result["outcome"] = "seat_busy"
@@ -1836,6 +1900,15 @@ def _finish_after_stage(
     result["version"] = {"from": current_version, "to": new_version}
     ctx = {"version": new_version, "checkout": config["main_checkout"]}
 
+    # Activation restarts the install any live seat is running under — use the
+    # legacy fail-safe scan (any lock or open shift), not roster-scoped only.
+    if seat_in_flight(config["local_root"]):
+        append_ledger_row(config["local_root"], project, "SKIP", ticket=task_id, reason="seat_in_flight")
+        result["outcome"] = "activate_skipped"
+        result["reason"] = "an implementation seat is in flight; retry activation next pass"
+        write_receipt(config["local_root"], project, result)
+        return result
+
     activate = ops["run_activate"](ctx)
     append_ledger_row(config["local_root"], project, "ACTIVATE", ticket=task_id, rc=activate["rc"])
     if activate["rc"] != 0:
@@ -1928,6 +2001,10 @@ def run_one(
     if post_merge is not None:
         return _finish_after_stage(task_id, project, config, ops, post_merge, result)
 
+    from . import roster as roster_mod
+
+    roster_workers = roster_mod.load(path=config["roster_path"]).workers
+
     checkout = _checkout_path(config, order)
     branch = _branch_name(config, order)
     reviewer = reviewer_for_provider(order["provider"], config["reviewer_by_provider"])
@@ -1984,7 +2061,7 @@ def run_one(
 
     if decision["action"] == "recover":
         deferred = _defer_recovery_if_seat_busy(
-            config["local_root"], project, task_id, order["worker"], result,
+            config["local_root"], project, task_id, order["worker"], roster_workers, result,
         )
         if deferred is not None:
             return deferred
@@ -2160,7 +2237,7 @@ def run_one(
             result["outcome"] = "stopped"
         else:
             deferred = _defer_recovery_if_seat_busy(
-                config["local_root"], project, task_id, order["worker"], result,
+                config["local_root"], project, task_id, order["worker"], roster_workers, result,
             )
             if deferred is not None:
                 return deferred
