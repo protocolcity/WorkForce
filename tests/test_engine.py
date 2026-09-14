@@ -628,6 +628,74 @@ def test_budget_kill_is_infra_error(tmp_path):
     assert "killed at budget" in ledger_text(tmp_path)
 
 
+def _fake_provider_argv(receipt_path):
+    """A task_runner-shaped provider: prints the receipt line + a terminal
+    JSON result, then hangs (wf-266 — cursor-agent observed doing exactly
+    this after its own turn actually finished)."""
+    script = (
+        "import sys, time\n"
+        "print('Prepared wf-1; not yet claimed. Receipt: %s'); sys.stdout.flush()\n"
+        "print('{\"type\": \"result\", \"done\": true}'); sys.stdout.flush()\n"
+        "time.sleep(30)\n"
+    ) % receipt_path
+    return [sys.executable, "-c", script]
+
+
+def test_provider_lingering_after_parked_result_ends_as_done(tmp_path, monkeypatch):
+    """wf-266: a provider that prints its terminal result then keeps running,
+    once WorkLane shows its order left in_progress, ends the shift as DONE
+    with the linger reason (not a budget-kill ERROR), well inside the grace
+    period, and releases the lock."""
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text(json.dumps({"project": "workforce", "task_id": "wf-1"}))
+    w = make_worker(
+        tmp_path,
+        command=_fake_provider_argv(receipt),
+        queue_url="http://desk.test/api/admin/tasks/ready?product=workforce&label=worker:tester",
+        budget_secs=20,
+        linger_grace_secs=1,
+    )
+    monkeypatch.setattr(engine, "_LINGER_POLL_SECS", 0.2)
+    monkeypatch.setattr(engine, "_http_get_json", lambda *a, **k: {"count": 1})
+
+    def fake_http(method, url, body=None, timeout=8.0):
+        assert method == "GET" and "/wf-1" in url
+        return {"ok": True, "task": {"id": "wf-1", "status": "in_review"}}
+
+    monkeypatch.setattr(engine, "_http_json", fake_http)
+
+    t0 = time.monotonic()
+    assert engine.dispatch(w, local(tmp_path)) == 0
+    elapsed = time.monotonic() - t0
+    assert elapsed < 10  # well within budget_secs=20; grace is 1s
+    text = ledger_text(tmp_path)
+    assert "DONE" in text and "provider lingered after result" in text
+    assert "killed at budget" not in text
+    assert not (tmp_path / "local" / "locks" / "tester.lock").exists()
+
+
+def test_provider_that_never_prints_a_result_keeps_budget_kill(tmp_path, monkeypatch):
+    """wf-266: without a receipt/result to confirm ownership left this
+    identity, the existing budget-kill ERROR is unchanged — the desk is
+    never even contacted."""
+    w = make_worker(
+        tmp_path,
+        command=["/bin/sh", "-c", "sleep 30"],
+        queue_url="http://desk.test/api/admin/tasks/ready?product=workforce&label=worker:tester",
+        budget_secs=1,
+        linger_grace_secs=1,
+    )
+    monkeypatch.setattr(engine, "_LINGER_POLL_SECS", 0.2)
+    monkeypatch.setattr(engine, "_http_get_json", lambda *a, **k: {"count": 1})
+
+    def boom(*a, **k):
+        raise AssertionError("desk must not be contacted without a task reference")
+
+    monkeypatch.setattr(engine, "_http_json", boom)
+    assert engine.dispatch(w, local(tmp_path)) == 1
+    assert "killed at budget" in ledger_text(tmp_path)
+
+
 def test_lock_released_after_shift(tmp_path):
     w = make_worker(tmp_path)
     engine.dispatch(w, local(tmp_path))

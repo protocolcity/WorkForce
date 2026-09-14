@@ -117,6 +117,14 @@ class Worker:
     completion_field: str = ""          # dot-path into the pass's JSON result naming its stop reason
     completion_values: List[str] = field(default_factory=list)  # values of completion_field meaning "actually done"
     continuation_attempts: int = 0      # bounded auto-recoveries tried before giving up honestly (0 = none)
+    # wf-266 — some vendor CLIs (cursor-agent) keep running after printing
+    # their pass's own terminal result object (sandbox proxy / MCP session /
+    # stdin never closing). Once that result has appeared AND the WorkLane
+    # order it worked is no longer held in_progress by this identity (parked
+    # or released), the engine gives the process this many more seconds to
+    # exit on its own before it force-ends the pass as a lingering DONE
+    # instead of riding the full budget to an ERROR "killed at budget".
+    linger_grace_secs: int = 60
 
     @property
     def worker_type(self) -> str:
@@ -201,6 +209,10 @@ class Worker:
         if int(self.continuation_attempts) > 0 and not self.completion_field:
             raise RosterError(
                 "worker %r continuation_attempts requires completion_field" % self.name
+            )
+        if int(self.linger_grace_secs) < 0:
+            raise RosterError(
+                "worker %r linger_grace_secs must be >= 0" % self.name
             )
 
 
