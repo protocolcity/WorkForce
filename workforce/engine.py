@@ -1681,11 +1681,14 @@ def _park_seat_order_at_shift_end(
     """
     from .capacity import hermetic_dry_run
 
+    refs = [ref[1] for ref in _all_task_refs_from_pass_output(out_path)]
     task_ids: List[str] = []
     if recovery_task_id:
-        task_ids = [recovery_task_id]
+        # Recovery shifts still carry receipts for every order this pass
+        # prepared; park them all, not only the recovery target (wf-275).
+        task_ids = list(dict.fromkeys([recovery_task_id] + refs))
     else:
-        task_ids = [ref[1] for ref in _all_task_refs_from_pass_output(out_path)]
+        task_ids = refs
     if not task_ids:
         return {"action": "skipped", "skipped": "no_task_ref", "results": []}
 
