@@ -4,6 +4,7 @@ import datetime
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -406,10 +407,23 @@ class FakeOps:
             "diff_text_val", "diff --git a/src/x.py b/src/x.py\n+1\n",
         )
         self.diff_text_bases = []
+        self.merge_base_conflict = overrides.get("merge_base_conflict", False)
+        self.merge_base_conflict_paths = overrides.get("merge_base_conflict_paths", ["src/x.py"])
+        self.merge_base_sha = overrides.get("merge_base_sha", "")
+        self.merge_base_failed = overrides.get("merge_base_failed", False)
+        self.merge_base_failed_output = overrides.get("merge_base_failed_output", "fetch failed")
         self.last_prompt = None
 
     def _record(self, name, *a, **kw):
         self.calls.append(name)
+
+    def merge_base_into_branch(self, checkout, branch, base):
+        self._record("merge_base_into_branch")
+        if self.merge_base_conflict:
+            return {"ok": False, "conflict": True, "paths": self.merge_base_conflict_paths, "output": ""}
+        if self.merge_base_failed:
+            return {"ok": False, "conflict": False, "paths": [], "output": self.merge_base_failed_output}
+        return {"ok": True, "conflict": False, "paths": [], "sha": self.merge_base_sha, "output": ""}
 
     def run_suites(self, checkout):
         self._record("run_suites")
@@ -553,6 +567,7 @@ class FakeOps:
     def as_dict(self):
         return {
             "run_suites": self.run_suites,
+            "merge_base_into_branch": self.merge_base_into_branch,
             "checkout_clean": self.checkout_clean_fn,
             "diff_text": self.diff_text,
             "checkout_head_sha": self.checkout_head_sha,
@@ -641,6 +656,55 @@ def test_run_one_suite_failure_stops_after_recovery_rounds_exhausted(tmp_path):
     assert "release_seat" in ops.calls
     assert "stop_seat" in ops.calls
     assert "merge_pr" not in ops.calls
+
+
+def test_run_one_merges_base_before_suites(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, merge_base_sha="sha-merged")
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "closed"
+    assert ops.calls.index("merge_base_into_branch") < ops.calls.index("run_suites")
+
+
+def test_run_one_merge_base_conflict_dispatches_recovery_without_running_suites(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, merge_base_conflict=True, merge_base_conflict_paths=["src/x.py", "src/y.py"])
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "merge_base_conflict"
+    assert result["conflict_paths"] == ["src/x.py", "src/y.py"]
+    assert "run_suites" not in ops.calls
+    assert "merge_pr" not in ops.calls
+    assert len(ops.recovery_calls) == 1
+    assert "src/x.py" in ops.recovery_calls[0][2]
+    state = integrator.read_recovery_state(cfg["local_root"], "wf-1")
+    assert state["rounds_used"] == 1
+
+
+def test_run_one_merge_base_operational_failure_stops_without_suites(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, merge_base_failed=True, merge_base_failed_output="fetch: network unreachable")
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "merge_base_failed"
+    assert "run_suites" not in ops.calls
+    assert "merge_pr" not in ops.calls
+    assert "release_seat" not in ops.calls
+    assert "dispatch_recovery" not in ops.calls
+    state = integrator.read_recovery_state(cfg["local_root"], "wf-1")
+    assert state["rounds_used"] == 0
+
+
+def test_run_one_merge_base_conflict_stops_once_recovery_rounds_exhausted(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_recovery_rounds=1)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {"rounds_used": 1})
+    ops = FakeOps(tmp_path, merge_base_conflict=True, merge_base_conflict_paths=["src/x.py"])
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "stopped"
+    assert "run_suites" not in ops.calls
+    assert "dispatch_recovery" not in ops.calls
 
 
 def test_run_one_findings_recover_without_merging(tmp_path):
@@ -2812,6 +2876,7 @@ def test_run_one_stops_with_checkout_missing_when_suites_cannot_start(tmp_path, 
     ops = {
         "checkout_head_sha": checkout_head_sha,
         "run_suites": run_suites,
+        "merge_base_into_branch": lambda checkout, branch, base: {"ok": True, "conflict": False, "sha": ""},
         "post_comment": lambda tid, body: posted.append((tid, body)),
         "stop_seat": stop_seat,
     }
@@ -2852,6 +2917,125 @@ def test_parse_reviewer_findings_fenced_json_after_prose_counts_entries():
         "Finding 4 is closed.\n"
     )
     assert integrator.parse_reviewer_findings(text) == ["first defect", "second defect"]
+
+
+# --------------------------------------------------------------------------
+# wf-274 follow-up: default_ops.merge_base_into_branch against real git, not
+# just FakeOps stubs — already-up-to-date, a clean merge that pushes, a
+# conflicting merge that aborts and leaves the seat's commit intact, and a
+# non-conflict merge failure (unknown base ref).
+# --------------------------------------------------------------------------
+
+
+def _run_git(args, cwd):
+    return subprocess.run(
+        ["git"] + args, cwd=str(cwd), capture_output=True, text=True,
+    )
+
+
+def _run_git_ok(args, cwd):
+    result = _run_git(args, cwd)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result
+
+
+def _init_origin_and_feature_branch(tmp_path, base="main"):
+    """A bare origin with *base* seeded, and a checkout on branch "feature"
+    cut from that same commit, mirroring how a seat branch is cut at
+    dispatch time."""
+    origin = tmp_path / "origin.git"
+    _run_git_ok(["init", "--bare", "-b", base, str(origin)], tmp_path)
+
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _run_git_ok(["init", "-b", base], seed)
+    _run_git_ok(["config", "user.email", "t@example.com"], seed)
+    _run_git_ok(["config", "user.name", "Test"], seed)
+    (seed / "shared.txt").write_text("base line\n")
+    _run_git_ok(["add", "."], seed)
+    _run_git_ok(["commit", "-m", "seed"], seed)
+    _run_git_ok(["remote", "add", "origin", str(origin)], seed)
+    _run_git_ok(["push", "origin", base], seed)
+
+    checkout = tmp_path / "checkout"
+    _run_git_ok(["clone", str(origin), str(checkout)], tmp_path)
+    _run_git_ok(["config", "user.email", "t@example.com"], checkout)
+    _run_git_ok(["config", "user.name", "Test"], checkout)
+    _run_git_ok(["checkout", "-b", "feature", base], checkout)
+    return origin, seed, checkout
+
+
+def _push_base_commit(seed, base, filename, contents):
+    """Land a further commit on *base* through the seed clone, so origin's
+    base tip diverges from what the seat's checkout was cut from."""
+    (seed / filename).write_text(contents)
+    _run_git_ok(["add", "."], seed)
+    _run_git_ok(["commit", "-m", "base moves"], seed)
+    _run_git_ok(["push", "origin", base], seed)
+
+
+def _default_ops(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    return integrator.default_ops(cfg)
+
+
+def test_default_ops_merge_base_into_branch_already_up_to_date(tmp_path):
+    origin, seed, checkout = _init_origin_and_feature_branch(tmp_path)
+    ops = _default_ops(tmp_path)
+    result = ops["merge_base_into_branch"](str(checkout), "feature", "main")
+    assert result["ok"] is True
+    assert result["conflict"] is False
+    ls_remote = _run_git(["ls-remote", str(origin), "refs/heads/feature"], tmp_path)
+    assert ls_remote.stdout.strip() == ""
+
+
+def test_default_ops_merge_base_into_branch_clean_merge_pushes(tmp_path):
+    origin, seed, checkout = _init_origin_and_feature_branch(tmp_path)
+    (checkout / "seat.txt").write_text("seat work\n")
+    _run_git_ok(["add", "."], checkout)
+    _run_git_ok(["commit", "-m", "seat commit"], checkout)
+    seat_sha = _run_git_ok(["rev-parse", "HEAD"], checkout).stdout.strip()
+    _push_base_commit(seed, "main", "base_only.txt", "base moved on\n")
+
+    ops = _default_ops(tmp_path)
+    result = ops["merge_base_into_branch"](str(checkout), "feature", "main")
+    assert result["ok"] is True
+    assert result["conflict"] is False
+    assert result["sha"] and result["sha"] != seat_sha
+    ls_remote = _run_git_ok(["ls-remote", str(origin), "refs/heads/feature"], tmp_path)
+    assert result["sha"] in ls_remote.stdout
+    log = _run_git_ok(["log", "--oneline", "-1"], checkout).stdout
+    assert "Merge main into feature (integrator)" in _run_git_ok(["log", "-1", "--format=%B"], checkout).stdout
+    parents = _run_git_ok(["log", "-1", "--format=%P"], checkout).stdout.split()
+    assert seat_sha in parents
+
+
+def test_default_ops_merge_base_into_branch_conflict_aborts_and_keeps_seat_commit(tmp_path):
+    origin, seed, checkout = _init_origin_and_feature_branch(tmp_path)
+    (checkout / "shared.txt").write_text("seat line\n")
+    _run_git_ok(["add", "."], checkout)
+    _run_git_ok(["commit", "-m", "seat commit"], checkout)
+    seat_sha = _run_git_ok(["rev-parse", "HEAD"], checkout).stdout.strip()
+    _push_base_commit(seed, "main", "shared.txt", "base line changed\n")
+
+    ops = _default_ops(tmp_path)
+    result = ops["merge_base_into_branch"](str(checkout), "feature", "main")
+    assert result["ok"] is False
+    assert result["conflict"] is True
+    assert result["paths"] == ["shared.txt"]
+    status = _run_git_ok(["status", "--porcelain=v2"], checkout).stdout
+    assert "unmerged" not in status.lower() and "MERGE_HEAD" not in status
+    assert _run_git_ok(["rev-parse", "HEAD"], checkout).stdout.strip() == seat_sha
+
+
+def test_default_ops_merge_base_into_branch_non_conflict_failure_is_not_reported_as_conflict(tmp_path):
+    origin, seed, checkout = _init_origin_and_feature_branch(tmp_path)
+    ops = _default_ops(tmp_path)
+    result = ops["merge_base_into_branch"](str(checkout), "feature", "no-such-base-branch")
+    assert result["ok"] is False
+    assert result["conflict"] is False
+    assert result["paths"] == []
 
 
 # --------------------------------------------------------------------------
@@ -2969,6 +3153,7 @@ def test_run_one_checkout_missing_skips_stop_ledger_row_when_repark_fails(tmp_pa
     ops = {
         "checkout_head_sha": checkout_head_sha,
         "run_suites": run_suites,
+        "merge_base_into_branch": lambda checkout, branch, base: {"ok": True, "conflict": False, "sha": ""},
         "post_comment": lambda tid, body: None,
         "stop_seat": stop_seat,
     }
@@ -3001,6 +3186,7 @@ def test_run_one_checkout_missing_logs_stop_when_repark_succeeds(tmp_path):
     ops = {
         "checkout_head_sha": checkout_head_sha,
         "run_suites": run_suites,
+        "merge_base_into_branch": lambda checkout, branch, base: {"ok": True, "conflict": False, "sha": ""},
         "post_comment": lambda tid, body: None,
         "stop_seat": stop_seat,
     }
