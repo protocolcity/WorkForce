@@ -1167,6 +1167,76 @@ def test_clear_recovery_round_state_resets_rounds_and_records_who_and_why(tmp_pa
     assert integrator.read_recovery_state(local_root, "wf-1") == state
 
 
+def test_clear_recovery_round_state_clears_pending_activation_marker(tmp_path):
+    """wf-276 finding 3: a stuck handoff order cleared by a person must not
+    leave a pending-activation marker for the external activator to act on
+    outside this pass."""
+    local_root = str(tmp_path / "local")
+    integrator.write_pending_activation(local_root, "wf-1", {
+        "task_id": "wf-1", "project": "workforce", "version": "1.0.1",
+        "release_root": "/releases/1.0.1", "requested_at": "2026-01-01T00:00:00Z",
+    })
+    integrator.clear_recovery_round_state(local_root, "wf-1", "you", "reset for a fresh attempt")
+    assert integrator.read_pending_activation(local_root, "wf-1") is None
+
+
+def test_clear_recovery_state_clears_pending_activation_marker(tmp_path):
+    local_root = str(tmp_path / "local")
+    integrator.write_pending_activation(local_root, "wf-1", {
+        "task_id": "wf-1", "project": "workforce", "version": "1.0.1",
+        "release_root": "/releases/1.0.1", "requested_at": "2026-01-01T00:00:00Z",
+    })
+    integrator.clear_recovery_state(local_root, "wf-1")
+    assert integrator.read_pending_activation(local_root, "wf-1") is None
+
+
+def test_clear_recovery_state_clears_external_activator_pending_file(tmp_path):
+    """wf-276 recovery round 2, finding 2: ``wf-activate.sh`` leaves
+    ``<version>.pending`` in the same directory for ``wf-activator.sh`` to
+    consume outside any pass. Clearing only the integrator's own
+    ``<task-id>.json`` bookkeeping marker left that restart signal behind
+    for a stuck order a person just reset or abandoned. The pending file is
+    named from the raw release basename (``V=$(basename "$REL")`` in
+    ``wf-activate.sh``, not a sanitized form) -- WorkForce's own local-suffix
+    versions contain ``+`` (wf-276 recovery round 3, finding 1), so this must
+    be covered with such a version, not just a plain one."""
+    local_root = str(tmp_path / "local")
+    version = "0.1.9+consolidation.31"
+    integrator.write_pending_activation(local_root, "wf-1", {
+        "task_id": "wf-1", "project": "workforce", "version": version,
+        "release_root": "/releases/%s" % version, "requested_at": "2026-01-01T00:00:00Z",
+    })
+    pending_dir = os.path.join(local_root, "state", "integrator-activate")
+    os.makedirs(pending_dir, exist_ok=True)
+    pending_file = os.path.join(pending_dir, "%s.pending" % version)
+    with open(pending_file, "w", encoding="utf-8") as fh:
+        fh.write("/releases/%s\n" % version)
+
+    integrator.clear_recovery_state(local_root, "wf-1")
+
+    assert integrator.read_pending_activation(local_root, "wf-1") is None
+    assert not os.path.exists(pending_file)
+
+
+def test_clear_recovery_round_state_clears_external_activator_pending_file(tmp_path):
+    local_root = str(tmp_path / "local")
+    version = "0.1.9+consolidation.31"
+    integrator.write_pending_activation(local_root, "wf-1", {
+        "task_id": "wf-1", "project": "workforce", "version": version,
+        "release_root": "/releases/%s" % version, "requested_at": "2026-01-01T00:00:00Z",
+    })
+    pending_dir = os.path.join(local_root, "state", "integrator-activate")
+    os.makedirs(pending_dir, exist_ok=True)
+    pending_file = os.path.join(pending_dir, "%s.pending" % version)
+    with open(pending_file, "w", encoding="utf-8") as fh:
+        fh.write("/releases/%s\n" % version)
+
+    integrator.clear_recovery_round_state(local_root, "wf-1", "you", "reset for a fresh attempt")
+
+    assert integrator.read_pending_activation(local_root, "wf-1") is None
+    assert not os.path.exists(pending_file)
+
+
 def test_run_one_stop_after_a_human_clear_reports_who_cleared_it(tmp_path):
     roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
     cfg = base_config(tmp_path, roster_path, max_recovery_rounds=1)
@@ -1697,6 +1767,123 @@ def test_run_one_findings_recovery_seat_busy_on_open_shift_without_lock(tmp_path
     assert "dispatch_recovery" not in ops.calls
     assert "release_seat" not in ops.calls
     assert integrator.read_recovery_state(cfg["local_root"], "wf-1")["rounds_used"] == 0
+
+
+# --------------------------------------------------------------------------
+# wf-276 — activation_mode "handoff": never restart the daemon in-pass
+# --------------------------------------------------------------------------
+
+
+def test_run_one_handoff_writes_pending_marker_and_never_activates(tmp_path):
+    """``activate_cmd`` (``wf-activate.sh`` in production) never restarts the
+    daemon itself — it either confirms the release is already active or
+    leaves its own pending marker and exits nonzero. Calling it from a
+    handoff pass is safe; a nonzero rc here means "handed off"."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, activation_mode="handoff")
+    ops = FakeOps(tmp_path, activate_rc=1)
+    order = make_order()
+
+    result = integrator.run_one(order, cfg, ops.as_dict())
+
+    assert result["outcome"] == "activation_handoff"
+    assert "run_activate" in ops.calls
+    assert "close_order" not in ops.calls
+    marker = integrator.read_pending_activation(cfg["local_root"], order["task_id"])
+    assert marker is not None
+    assert marker["version"] == "1.0.1"
+    assert marker["release_root"] == os.path.join(cfg["release_root"], "1.0.1")
+
+
+def test_run_one_handoff_pending_retries_without_stop_or_park(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, activation_mode="handoff")
+    ops = FakeOps(tmp_path, activate_rc=1, verify_ok=False)
+    order = make_order()
+
+    first = integrator.run_one(order, cfg, ops.as_dict())
+    assert first["outcome"] == "activation_handoff"
+
+    # activate_cmd still reports the release pending; the scheduled
+    # activator has not restarted yet.
+    second = integrator.run_one(order, cfg, ops.as_dict())
+    assert second["outcome"] == "activation_pending"
+    assert "close_order" not in ops.calls
+    assert "post_comment" not in ops.calls
+    assert "park_seat" not in ops.calls
+    assert "stop_seat" not in ops.calls
+    marker = integrator.read_pending_activation(cfg["local_root"], order["task_id"])
+    assert marker is not None
+
+
+def test_run_one_handoff_closes_once_marker_is_already_active(tmp_path):
+    """Done-when: a pass with a marker for an already-active release closes."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, activation_mode="handoff")
+    ops = FakeOps(tmp_path, activate_rc=1, verify_ok=False)
+    order = make_order()
+
+    first = integrator.run_one(order, cfg, ops.as_dict())
+    assert first["outcome"] == "activation_handoff"
+    assert "run_activate" in ops.calls
+
+    # The scheduled activator restarted the daemon between passes;
+    # activate_cmd now confirms the release is already active.
+    ops.activate_rc = 0
+    ops.verify_ok = True
+    second = integrator.run_one(order, cfg, ops.as_dict())
+
+    assert second["outcome"] == "closed"
+    assert "run_activate" in ops.calls
+    assert "close_order" in ops.calls
+    assert integrator.read_pending_activation(cfg["local_root"], order["task_id"]) is None
+
+
+def test_run_one_handoff_stops_and_parks_when_activate_ok_but_verify_fails(tmp_path):
+    """wf-276 recovery round 2, finding 1: when ``activate_cmd`` reports rc 0
+    (already active) it has, per its own contract, already removed the
+    external ``.pending`` marker — there is no restart signal left anywhere
+    for a later pass to wait on. Retrying would just re-call activate_cmd
+    and repeat the same rc-0/verify-fail outcome forever, so this must stop
+    and park for a person instead of recording ``activation_pending``."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, activation_mode="handoff")
+    ops = FakeOps(tmp_path, activate_rc=0, verify_ok=False, verify_observed="1.0.0")
+    order = make_order()
+
+    result = integrator.run_one(order, cfg, ops.as_dict())
+
+    assert result["outcome"] == "install_not_verified"
+    assert "close_order" not in ops.calls
+    assert "post_comment" in ops.calls
+    assert "park_seat" in ops.calls
+
+
+def test_run_one_handoff_never_restarts_when_seat_in_flight(tmp_path):
+    """The handoff call is not gated on seat_in_flight — activate_cmd itself
+    is the thing that never restarts from inside a pass."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, activation_mode="handoff")
+    _write_live_lock(cfg["local_root"], "tester")
+    ops = FakeOps(tmp_path, activate_rc=1)
+    order = make_order()
+
+    result = integrator.run_one(order, cfg, ops.as_dict())
+
+    assert result["outcome"] == "activation_handoff"
+    assert "run_activate" in ops.calls
+
+
+def test_load_config_rejects_unknown_activation_mode(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    with pytest.raises(integrator.IntegratorError):
+        base_config(tmp_path, roster_path, activation_mode="restart")
+
+
+def test_load_config_defaults_activation_mode_to_in_pass(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    assert cfg["activation_mode"] == "in_pass"
 
 
 # --------------------------------------------------------------------------
