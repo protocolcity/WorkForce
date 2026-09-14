@@ -389,6 +389,19 @@ def main(argv=None) -> int:
         help="remove existing file for the date and rewrite",
     )
 
+    p_prune = sub.add_parser(
+        "prune",
+        help="remove merged task branches and clean seat checkouts (wf-267)",
+    )
+    p_prune.add_argument(
+        "--config", required=True,
+        help="absolute path to a per-project integration config JSON",
+    )
+    p_prune.add_argument(
+        "--dry-run", action="store_true",
+        help="print what would be removed; write nothing",
+    )
+
     p_integrate = sub.add_parser(
         "integrate",
         help="integrator job — deterministic post-shift pipeline (wf-265): "
@@ -1113,6 +1126,40 @@ def main(argv=None) -> int:
             )
             print("qualify: %s" % json_path)
             print("qualify: %s" % md_path)
+        return 0
+
+    if args.cmd == "prune":
+        from . import prune as prune_mod
+        try:
+            cfg = prune_mod.load_config(args.config)
+            results = prune_mod.prune_pass(cfg, dry_run=args.dry_run)
+        except prune_mod.PruneError as exc:
+            print("prune: %s" % exc, file=sys.stderr)
+            return 1
+        except prune_mod.IntegratorError as exc:
+            print("prune: %s" % exc, file=sys.stderr)
+            return 1
+        if not results:
+            print("prune: nothing to evaluate")
+            return 0
+        for r in results:
+            removed = r.get("removed") or []
+            kept = r.get("kept") or []
+            prefix = "would prune" if args.dry_run else "pruned"
+            if removed:
+                print("%s %s/%s — %d removal(s)" % (
+                    prefix, r["worker"], r["task_id"], len(removed),
+                ))
+                for item in removed:
+                    print("  - %s: %s" % (
+                        item.get("kind"), item.get("branch") or item.get("path"),
+                    ))
+            for keep in kept:
+                print("kept %s/%s — %s (%s)" % (
+                    r["worker"], r["task_id"], keep.get("kind"), keep.get("reason"),
+                ))
+            for note in r.get("notes") or []:
+                print("  note: %s" % note)
         return 0
 
     if args.cmd == "integrate":
