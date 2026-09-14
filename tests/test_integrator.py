@@ -690,7 +690,8 @@ def test_run_one_merge_base_operational_failure_stops_without_suites(tmp_path):
     assert result["outcome"] == "merge_base_failed"
     assert "run_suites" not in ops.calls
     assert "merge_pr" not in ops.calls
-    assert "release_seat" not in ops.calls
+    assert "release_seat" in ops.calls
+    assert "stop_seat" in ops.calls
     assert "dispatch_recovery" not in ops.calls
     state = integrator.read_recovery_state(cfg["local_root"], "wf-1")
     assert state["rounds_used"] == 0
@@ -704,6 +705,8 @@ def test_run_one_merge_base_conflict_stops_once_recovery_rounds_exhausted(tmp_pa
     result = integrator.run_one(make_order(), cfg, ops.as_dict())
     assert result["outcome"] == "stopped"
     assert "run_suites" not in ops.calls
+    assert "release_seat" in ops.calls
+    assert "stop_seat" in ops.calls
     assert "dispatch_recovery" not in ops.calls
 
 

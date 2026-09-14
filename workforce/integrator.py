@@ -2334,11 +2334,13 @@ def run_one(
         # dirty tree, merge already in progress, ...) is an operational
         # failure, not something the seat can fix by redoing work: stop this
         # pass without touching recovery state so the next integrator pass
-        # retries against a clean checkout.
+        # retries against a clean checkout. Drop any implementation-seat claim
+        # so the seat is not left busy on a stopped order (wf-275).
         reason = "merge_base_into_branch failed merging %s into %s (no conflict): %s" % (
             config["pr_base"], branch, (merge_base.get("output") or "").strip() or "(no output)",
         )
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        ops["release_seat"](task_id, reason)
+        _stop_seat_and_record(ops, config, project, task_id, reason)
         result["outcome"] = "merge_base_failed"
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
@@ -2351,7 +2353,7 @@ def run_one(
             config["pr_base"], branch, ", ".join(paths) if paths else "unknown",
         )
         if merge_decision["action"] == "stop":
-            _stop_seat_and_record(ops, config, project, task_id, merge_decision["reason"])
+            _stop_recovery_exhausted(ops, config, project, task_id, merge_decision["reason"])
             result["outcome"] = "stopped"
             result["reason"] = merge_decision["reason"]
             write_receipt(config["local_root"], project, result)
