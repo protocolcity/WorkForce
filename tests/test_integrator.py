@@ -322,6 +322,7 @@ class FakeOps:
         self.review_retry = overrides.get("review_retry", False)
         self.review_empty = overrides.get("review_empty", False)
         self.review_stale = overrides.get("review_stale", False)
+        self.review_dispatch_failed = overrides.get("review_dispatch_failed", False)
         self.ci_status = overrides.get("ci_status", "success")
         self.checkout_clean = overrides.get("checkout_clean_val", True)
         self.merge_rc = overrides.get("merge_rc", 0)
@@ -405,6 +406,8 @@ class FakeOps:
             return {"ok": False, "empty": True, "output": "reviewer output was empty after DONE"}
         if self.review_stale:
             return {"ok": False, "stale": True, "output": "reviewer output was unchanged after DONE (stale)"}
+        if self.review_dispatch_failed:
+            return {"ok": False, "output": "reviewer dispatch failed: rc 1"}
         output = self.review_output
         if output is None:
             output = json.dumps({"findings": self.review_findings})
@@ -701,6 +704,30 @@ def test_run_one_review_stale_stops_with_blocked_comment_and_never_merges(tmp_pa
     assert "post_comment" in ops.calls
     assert "merge_pr" not in ops.calls
     assert "close_order" not in ops.calls
+
+
+def test_run_one_review_dispatch_failure_retries_and_is_never_cached(tmp_path):
+    """A dispatch failure (ledger error, non-zero reviewer rc, etc.) is not a
+    review verdict — it must not be recorded as last_review for this SHA, or
+    an unchanged head would reuse the synthetic failure findings forever
+    instead of retrying the review (wf-271 second-pass finding 1)."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, review_dispatch_failed=True, head_shas=["sha-x"], ci_status="failure")
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "review_retry"
+    assert "release_seat" not in ops.calls
+    assert "dispatch_recovery" not in ops.calls
+    assert "merge_pr" not in ops.calls
+    state = integrator.read_recovery_state(cfg["local_root"], "wf-1")
+    assert state.get("rounds_used", 0) == 0
+    assert "last_review" not in state
+
+    ops.review_dispatch_failed = False
+    ops.review_findings = []
+    second = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert second["outcome"] == "waiting"
+    assert ops.calls.count("dispatch_reviewer") == 2
 
 
 # --------------------------------------------------------------------------
@@ -1067,11 +1094,18 @@ def test_run_one_recorded_findings_with_no_new_commit_reposts_without_reviewing(
     ops = FakeOps(tmp_path, head_shas=["sha-x"])
     result = integrator.run_one(make_order(), cfg, ops.as_dict())
 
-    assert result["outcome"] == "recovering"
+    # Reposting recorded findings for an unchanged SHA must not re-charge the
+    # recovery budget or touch the seat again — that was already done in the
+    # pass that discovered them (wf-271 second-pass finding 2).
+    assert result["outcome"] == "waiting_on_findings"
     assert result["findings"] == ["fix the thing"]
     assert "dispatch_reviewer" not in ops.calls
     assert "run_suites" not in ops.calls
     assert "post_comment" in ops.calls
+    assert "release_seat" not in ops.calls
+    assert "dispatch_recovery" not in ops.calls
+    state = integrator.read_recovery_state(cfg["local_root"], "wf-1")
+    assert state["rounds_used"] == 1
 
 
 def test_clear_recovery_round_state_with_no_prior_state_has_no_later_findings(tmp_path):
