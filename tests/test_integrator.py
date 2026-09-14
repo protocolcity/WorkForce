@@ -2463,3 +2463,15 @@ def test_run_one_stops_with_checkout_missing_when_suites_cannot_start(tmp_path, 
     result = integrator.run_one(order, cfg, ops)
     assert result["outcome"] == "checkout_missing"
     assert posted and posted[0][0] == "wf-9"
+
+
+def test_test_only_correction_delta_falls_back_to_full_review():
+    """wf-268 third pass: a correction delta that only touches tests must not
+    satisfy the previous round's blockers; run_one must treat it like an empty
+    delta and review the full base."""
+    import inspect
+    from workforce import integrator as I
+    src = inspect.getsource(I.run_one)
+    assert "not strip_test_hunks_from_diff(diff).strip()" in src
+    diff = "diff --git a/tests/test_x.py b/tests/test_x.py\n--- a/tests/test_x.py\n+++ b/tests/test_x.py\n@@ -1 +1,2 @@\n+def test_y(): pass\n"
+    assert not I.strip_test_hunks_from_diff(diff).strip()

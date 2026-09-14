@@ -1933,7 +1933,11 @@ def run_one(
         # (wf-268; the pc-1492 rehearsal's nine passes each re-reviewed the
         # entire diff and kept finding new items on the same large surface).
         diff = ops["diff_text"](checkout, last_review["sha"])
-        if not diff.strip():
+        # A correction delta that is empty once test hunks are stripped is the
+        # same silent-clear hole as an empty diff (wf-268 third pass): fall back
+        # to the full base review instead of letting a scoped-empty prompt close
+        # open blockers.
+        if not diff.strip() or not strip_test_hunks_from_diff(diff).strip():
             # A non-zero diff rc and a truly empty correction diff collapse
             # to the same empty string here; either way this must never look
             # like "no non-test changes" to the reviewer. Fall back to a
