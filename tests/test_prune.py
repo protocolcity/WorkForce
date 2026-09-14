@@ -254,6 +254,74 @@ def test_parse_task_branch():
     assert prune.parse_task_branch("feature/foo") is None
 
 
+def test_pr_state_parses_stdout_not_stderr_noise(monkeypatch):
+    """Reviewer finding 1: gh JSON on stdout must not be broken by stderr noise."""
+
+    def fake_run(argv, cwd=None):
+        return {
+            "rc": 0,
+            "stdout": '{"state":"OPEN"}\n',
+            "stderr": "warning: deprecated flag\n",
+            "output": '{"state":"OPEN"}\nwarning: deprecated flag\n',
+        }
+
+    monkeypatch.setattr(prune, "_run", fake_run)
+    ops = prune.default_prune_ops({
+        "main_checkout": "/tmp/main",
+        "pr_base": "main",
+        "project": "workforce",
+        "local_root": "/tmp/local",
+    })
+    assert ops["pr_state"]("workforce/task/tester/wf-1") == "OPEN"
+
+
+def test_evaluate_prune_unknown_status_kept():
+    """Reviewer finding 2: desk fetch failure must not prune open orders."""
+    ops = FakePruneOps(task_status="")
+    cfg = {
+        "pr_base": "main",
+        "checkout_template": "local/task-runs/{worker}/{task_id}/checkout",
+        "workspace_root": "/w",
+        "branch_template": "workforce/task/{worker}/{task_id}",
+    }
+    for status in (None, ""):
+        plan = prune.evaluate_prune(cfg, "tester", "wf-1", ops.as_dict(), task_status=status)
+        assert plan["actions"] == []
+        assert any(k["reason"] == "status_unknown" for k in plan["kept"])
+
+
+def test_apply_prune_skips_task_run_when_worktree_remove_fails(tmp_path):
+    """Reviewer finding 3: failed worktree remove must not rmtree the task-run."""
+    workspace = tmp_path / "ws"
+    task_run = workspace / "local" / "task-runs" / "tester" / "wf-9"
+    checkout = task_run / "checkout"
+    checkout.mkdir(parents=True)
+    (task_run / "preparation.json").write_text("{}\n")
+    (task_run / "prompt.md").write_text("prompt\n")
+    cfg = {
+        "pr_base": "main",
+        "checkout_template": "local/task-runs/{worker}/{task_id}/checkout",
+        "workspace_root": str(workspace),
+        "branch_template": "workforce/task/{worker}/{task_id}",
+        "local_root": str(workspace / "local"),
+        "project": "workforce",
+    }
+    ops = FakePruneOps()
+
+    def fail_remove_worktree(path):
+        ops.removed_worktrees.append(path)
+        return {"rc": 1, "output": "fatal: not a worktree"}
+
+    ops_dict = ops.as_dict()
+    ops_dict["remove_worktree"] = fail_remove_worktree
+    plan = prune.evaluate_prune(cfg, "tester", "wf-9", ops_dict, task_status="done")
+    receipt = prune.apply_prune(cfg, plan, ops_dict)
+    assert (task_run / "prompt.md").exists()
+    assert checkout.exists()
+    assert any(k.get("reason") == "worktree_remove_failed" for k in receipt["kept"])
+    assert not any(item.get("kind") == "task_run" for item in receipt["removed"])
+
+
 def test_prune_ledger_event_allowed(tmp_path):
     roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
     cfg = base_config(tmp_path, roster_path)

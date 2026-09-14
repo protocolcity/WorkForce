@@ -126,7 +126,14 @@ def _run(argv: Sequence[str], cwd: Optional[str] = None) -> Dict[str, Any]:
     proc = subprocess.run(
         list(argv), cwd=cwd, capture_output=True, text=True,
     )
-    return {"rc": proc.returncode, "output": (proc.stdout or "") + (proc.stderr or "")}
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+    return {
+        "rc": proc.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+        "output": stdout + stderr,
+    }
 
 
 def default_prune_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
@@ -168,7 +175,7 @@ def default_prune_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
             return "NONE"
         try:
             import json
-            data = json.loads(view["output"])
+            data = json.loads(view["stdout"].strip())
         except (ValueError, TypeError):
             return "NONE"
         return str(data.get("state") or "NONE").upper()
@@ -254,7 +261,11 @@ def evaluate_prune(
         "notes": [],
     }
 
-    if task_status is not None and not is_terminal_status(task_status):
+    if not (task_status or "").strip():
+        result["kept"].append({"kind": "all", "reason": "status_unknown"})
+        return result
+
+    if not is_terminal_status(task_status):
         result["kept"].append({"kind": "all", "reason": "open_order"})
         return result
 
@@ -367,6 +378,9 @@ def apply_prune(
         else:
             ops["post_note"](task_id, note)
 
+    checkout_planned = any(a.get("kind") == "checkout" for a in plan.get("actions") or [])
+    checkout_cleared = not checkout_planned
+
     for action in plan.get("actions") or []:
         kind = action.get("kind")
         if kind == "branch":
@@ -391,11 +405,17 @@ def apply_prune(
                 continue
             out = ops["remove_worktree"](path)
             if out.get("rc") == 0:
+                checkout_cleared = True
                 receipt["removed"].append({"kind": "checkout", "path": path})
                 _append_prune_ledger(
                     config, "PRUNE", worker, task_id, target="checkout", path=path,
                 )
+            else:
+                receipt["kept"].append({"kind": "checkout", "reason": "worktree_remove_failed"})
+                receipt["kept"].append({"kind": "task_run", "reason": "worktree_remove_failed"})
         elif kind == "task_run":
+            if not checkout_cleared:
+                continue
             path = action["path"]
             removed_paths = _prune_task_run_contents(path, dry_run=dry_run)
             if removed_paths:
