@@ -1374,9 +1374,11 @@ def clear_pending_activation(local_root: str, task_id: str) -> None:
         pass
     version = (marker or {}).get("version")
     if version:
-        pending_file = os.path.join(
-            os.path.dirname(path), "%s.pending" % re.sub(r"[^A-Za-z0-9_.-]", "_", str(version)),
-        )
+        # wf-activate.sh names this file from the raw release basename
+        # (``V=$(basename "$REL")``), not a sanitized form -- WorkForce's
+        # local-suffix versions contain ``+``, so this must match verbatim
+        # (wf-276 recovery round 3, finding 1).
+        pending_file = os.path.join(os.path.dirname(path), "%s.pending" % str(version))
         try:
             os.remove(pending_file)
         except OSError:
