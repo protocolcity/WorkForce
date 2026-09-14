@@ -1594,3 +1594,46 @@ def test_launch_py_grok_plants_config_on_recovery_when_absent(tmp_path, monkeypa
     assert (checkout / ".grok" / "config.toml").read_text() == "# seat config\n"
     exclude = (checkout / ".git" / "info" / "exclude").read_text()
     assert ".grok/" in exclude
+
+
+def test_generate_seat_folder_regenerate_keeps_prior_expected_remote(tmp_path):
+    """wf-264 — --regenerate without --remote must not blank the runner's
+    expected_remote (task_runner refuses every dispatch on a mismatch)."""
+    repo = _seat_base(tmp_path)
+    first = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path),
+        remote="https://github.com/example/demo.git",
+    )
+    assert first["remote_source"] == "argument"
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path), regenerate=True,
+    )
+    assert result["remote_source"] == "prior runner.json"
+    runner = json.loads((tmp_path / "local" / "worker-config" / "demo" / "runner.json").read_text())
+    assert runner["expected_remote"] == "https://github.com/example/demo.git"
+
+
+def test_generate_seat_folder_remote_defaults_to_repository_origin(tmp_path):
+    """wf-264 — an omitted remote for a repository that has an origin resolves
+    to that origin, never to an empty expected_remote."""
+    (tmp_path / "local").mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init(repo, origin="https://github.com/example/origin.git")
+    result = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path),
+    )
+    assert result["remote_source"] == "repository origin"
+    runner = json.loads((tmp_path / "local" / "worker-config" / "demo" / "runner.json").read_text())
+    assert runner["expected_remote"] == "https://github.com/example/origin.git"
+    # regenerate over a row lacking the wf-262 keys still yields a loadable row
+    again = hire_mod.generate_seat_folder(
+        name="demo", provider="cursor", project="recipes",
+        repository=str(repo), base=str(tmp_path), regenerate=True,
+    )
+    er = load(again["roster_path"], base=str(tmp_path))
+    assert "demo" in er.workers and er.skipped == {}
+    assert er.workers["demo"].continuation_attempts == 0

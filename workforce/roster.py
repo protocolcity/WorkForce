@@ -237,11 +237,19 @@ def _validate_owners(workers: Dict[str, Worker]) -> None:
 class Roster:
     workers: Dict[str, Worker]
     path: str
+    # wf-264 — rows the loader refused, name → reason. A refused row must stay
+    # visible (doctor, the desk, the "no worker" refusal) instead of vanishing.
+    skipped: Dict[str, str] = field(default_factory=dict)
 
     def worker(self, name: str) -> Worker:
         try:
             return self.workers[name]
         except KeyError:
+            if name in self.skipped:
+                raise RosterError(
+                    "worker %r is on roster %s but was skipped at load — %s"
+                    % (name, self.path, self.skipped[name])
+                )
             raise RosterError(
                 "no worker %r in roster %s (have: %s)"
                 % (name, self.path, ", ".join(sorted(self.workers)) or "none")
@@ -279,10 +287,19 @@ def load(path: Optional[str] = None, base: Optional[str] = None) -> Roster:
 
     identities = {}
     workers: Dict[str, Worker] = {}
+    skipped: Dict[str, str] = {}
     for name, spec in workers_raw.items():
         try:
             if not isinstance(spec, dict):
                 raise RosterError("worker %r spec must be an object" % name)
+            # wf-264 — a JSON null for one of the wf-262 completion fields means
+            # "unset", the same as an absent key; it must not turn into a
+            # TypeError that drops the whole seat.
+            for _f, _unset in (("continuation_attempts", 0),
+                               ("completion_field", ""),
+                               ("completion_values", [])):
+                if _f in spec and spec[_f] is None:
+                    spec[_f] = _unset
             known = {f for f in Worker.__dataclass_fields__ if f != "name"}
             unknown = set(spec) - known
             if unknown:
@@ -334,5 +351,6 @@ def load(path: Optional[str] = None, base: Optional[str] = None) -> Roster:
             workers[name] = w
         except (RosterError, TypeError) as exc:
             _log.error("roster: skipping worker %r — %s", name, exc)
+            skipped[name] = str(exc)
     _validate_owners(workers)
-    return Roster(workers=workers, path=path)
+    return Roster(workers=workers, path=path, skipped=skipped)
