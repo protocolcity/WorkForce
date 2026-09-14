@@ -1076,9 +1076,14 @@ def clear_recovery_round_state(
 
 def _carry_recovery_state(state: Dict[str, Any], rounds_used: int, **extra: Any) -> Dict[str, Any]:
     """The next round's state: bumped ``rounds_used`` plus any clear history and
-    review context carried over from the current state."""
+    review context carried over from the current state.
+
+    ``later_findings`` accumulates across rounds so a finding capped below
+    the reviewer's per-round limit is never dropped just because a later
+    round's review does not happen to repeat it (wf-268).
+    """
     new_state: Dict[str, Any] = {"rounds_used": rounds_used}
-    for key in ("cleared_by", "cleared_reason", "cleared_at"):
+    for key in ("cleared_by", "cleared_reason", "cleared_at", "last_review", "later_findings"):
         if key in state:
             new_state[key] = state[key]
     new_state.update(extra)
@@ -1130,7 +1135,7 @@ def clear_post_merge_state(local_root: str, task_id: str) -> None:
 # --------------------------------------------------------------------------
 
 _LEDGER_EVENTS = (
-    "DISCOVER", "SUITES", "RECOVER", "STOP", "REVIEW", "FINDINGS",
+    "DISCOVER", "SUITES", "RECOVER", "STOP", "REVIEW", "FINDINGS", "LATER",
     "WAIT_CI", "MERGE", "STAGE", "ACTIVATE", "CLOSE", "DRY_RUN", "SKIP",
 )
 
@@ -1397,6 +1402,10 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
         r = _run(["git", "rev-parse", "HEAD"], cwd=checkout)
         return r["output"].strip() if r["rc"] == 0 else ""
 
+    def sha_exists(checkout: str, sha: str) -> bool:
+        r = _run(["git", "cat-file", "-e", "%s^{commit}" % sha], cwd=checkout)
+        return r["rc"] == 0
+
     def push_branch(checkout: str, branch: str) -> Dict[str, Any]:
         return _run(["git", "push", "-u", "origin", "HEAD:%s" % branch], cwd=checkout)
 
@@ -1648,6 +1657,7 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
         "checkout_clean": checkout_clean,
         "diff_text": diff_text,
         "checkout_head_sha": checkout_head_sha,
+        "sha_exists": sha_exists,
         "push_branch": push_branch,
         "open_or_update_pr": open_or_update_pr,
         "ci_status": ci_status,
@@ -1752,6 +1762,8 @@ def _finish_after_stage(
         "follow_ups": "; ".join(later_findings) if later_findings else "none",
     }
     ops["close_order"](task_id, evidence)
+    if later_findings:
+        append_ledger_row(config["local_root"], project, "LATER", ticket=task_id, count=len(later_findings))
     append_ledger_row(config["local_root"], project, "CLOSE", ticket=task_id)
     clear_recovery_state(config["local_root"], task_id)
     clear_post_merge_state(config["local_root"], task_id)
@@ -1849,8 +1861,6 @@ def run_one(
         ops["release_seat"](task_id, decision["reason"])
         dispatch_seat_recovery(decision["reason"])
         next_state = _carry_recovery_state(state, rounds_used + 1)
-        if last_review is not None:
-            next_state["last_review"] = last_review
         write_recovery_state(config["local_root"], task_id, next_state)
         append_ledger_row(config["local_root"], project, "RECOVER", ticket=task_id, reason=decision["reason"])
         result["outcome"] = "recovering"
@@ -1864,6 +1874,13 @@ def run_one(
 
     current_head_sha = ops["checkout_head_sha"](checkout)
     max_findings = config["max_findings_per_round"]
+    if last_review and last_review.get("sha") and not ops["sha_exists"](checkout, last_review["sha"]):
+        # The commit the prior review saw is gone (rebase/force-push): a
+        # diff against it would fail and come back empty, letting the
+        # reviewer see "(no non-test changes)" and say none without ever
+        # re-auditing the change. Drop the stale review and fall back to a
+        # full pr_base review with no previous findings (wf-268).
+        last_review = None
     if last_review and last_review.get("sha"):
         # Correction round: only the delta since the commit the prior review
         # saw, plus the prior findings — never a re-audit of the whole PR
@@ -1916,10 +1933,16 @@ def run_one(
     raw_findings = parse_reviewer_findings(review.get("output", "")) if review.get("ok") else [
         "reviewer dispatch failed"
     ]
-    findings, later_findings = cap_findings(raw_findings, max_findings)
+    findings, new_later_findings = cap_findings(raw_findings, max_findings)
     result["findings"] = findings
+    # Later findings accumulate across rounds — a finding capped out of an
+    # earlier round's reply must not disappear just because this round's
+    # review does not happen to repeat it (wf-268 finding 2).
+    later_findings = list(state.get("later_findings") or []) + list(new_later_findings)
     if later_findings:
         result["later_findings"] = later_findings
+    if new_later_findings:
+        append_ledger_row(config["local_root"], project, "LATER", ticket=task_id, count=len(new_later_findings))
 
     findings_decision = decide_after_findings(findings, rounds_used, config["max_recovery_rounds"])
     if findings_decision["action"] != "proceed":
@@ -1937,6 +1960,7 @@ def run_one(
             next_state = _carry_recovery_state(
                 state, rounds_used + 1,
                 last_review={"sha": current_head_sha, "findings": findings},
+                later_findings=later_findings,
             )
             write_recovery_state(config["local_root"], task_id, next_state)
             append_ledger_row(config["local_root"], project, "RECOVER", ticket=task_id, reason=findings_decision["reason"])
