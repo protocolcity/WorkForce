@@ -1575,6 +1575,101 @@ def _finalize_shift_workdir(
     }, no_note
 
 
+def _park_seat_order_at_shift_end(
+    worker: Worker,
+    shift_cwd: str,
+    out_path: str,
+    recovery_task_id: Optional[str],
+    ledger: Ledger,
+) -> dict:
+    """wf-273 — a shift that ends DONE without the seat parking its own
+    order leaves it in_progress under the seat identity: the integrator
+    drains only in_review, the supervisor skips claimed orders, and the
+    order is invisible until someone notices.
+
+    Called after every successful shift end. If the order this pass worked
+    is still in_progress under this identity, push any unpushed commits on
+    the shift's own branch (or record why not) and post a ``Parked:`` note
+    — the same lifecycle-heading convention :func:`_release_stranded_ticket`
+    uses for ``Blocked:`` — so the desk moves it to in_review itself. A
+    ledger row is appended per action (push, park) so a receipt is never
+    silent.
+    """
+    from .capacity import hermetic_dry_run
+
+    receipt: Dict[str, object] = {"action": "skipped"}
+    task_id = recovery_task_id
+    if not task_id:
+        ref = _task_ref_from_pass_output(out_path, 0)
+        if ref:
+            task_id = ref[1]
+    if not task_id:
+        receipt["skipped"] = "no_task_ref"
+        return receipt
+    product = product_from_queue_url(worker.queue_url) or ""
+    if not product:
+        receipt["skipped"] = "no_product"
+        return receipt
+    desk = desk_origin_from_queue_url(worker.queue_url or "")
+    if not desk:
+        receipt["skipped"] = "no_desk"
+        return receipt
+    dry_run, hermetic_block = hermetic_dry_run(False)
+    if dry_run:
+        receipt["skipped"] = "hermetic" if hermetic_block else "dry_run"
+        return receipt
+
+    try:
+        task = _fetch_task(desk, product, task_id)
+    except Exception as exc:
+        receipt["error"] = "fetch: %s" % exc
+        return receipt
+    if not task or str(task.get("status") or "").lower() != "in_progress":
+        receipt["skipped"] = "not_in_progress"
+        return receipt
+    owner = latest_owner_id(task.get("comments") or [])
+    identity = (worker.identity or worker.name).strip()
+    if owner not in (identity, worker.name):
+        receipt["skipped"] = "owner_mismatch"
+        return receipt
+
+    push_result = "not_attempted"
+    if shift_cwd and _is_git_workdir(shift_cwd):
+        branch_probe = _git(shift_cwd, "rev-parse", "--abbrev-ref", "HEAD")
+        branch = (branch_probe.stdout or "").strip()
+        if branch_probe.returncode == 0 and branch and branch != "HEAD":
+            push = _git(shift_cwd, "push", "origin", "HEAD:%s" % branch)
+            if push.returncode == 0:
+                push_result = "pushed:%s" % branch
+            else:
+                err = (push.stderr or push.stdout or "push failed").strip()
+                push_result = "push_failed: %.160s" % err
+        else:
+            push_result = "no_branch"
+    ledger.append("WARN", reason="engine-park-at-shift-end push", task=task_id, push=push_result)
+    receipt["push"] = push_result
+
+    body = (
+        "Parked: parked by the engine at shift end (seat did not park)\n"
+        "Push: %s" % push_result
+    )
+    q = urllib.parse.urlencode({"product": product})
+    url = "%s/api/admin/tasks/%s/comments?%s" % (
+        desk.rstrip("/"), urllib.parse.quote(task_id, safe=""), q,
+    )
+    out = _http_json("POST", url, {"body": body, "author": identity})
+    ok = out.get("ok") is not False and not out.get("error")
+    receipt["action"] = "parked" if ok else "park_failed"
+    receipt["task_id"] = task_id
+    receipt["api"] = out
+    ledger.append(
+        "WARN" if not ok else "STOP",
+        reason="engine-park-at-shift-end", task=task_id,
+        action=receipt["action"],
+    )
+    return receipt
+
+
 def _build_env(worker: Worker, predirty: Optional[str], secret: Optional[str],
                chain_paths: Optional[List[str]] = None,
                shift_workdir: Optional[str] = None) -> Dict[str, str]:
@@ -2312,6 +2407,9 @@ def dispatch(
                 _post_shift_finalize_note(
                     worker, finalize_note, out_path, recovery_task_id=recovery_task_id,
                 )
+            _park_seat_order_at_shift_end(
+                worker, shift_cwd, out_path, recovery_task_id, ledger,
+            )
             return 0
 
         # §6 multi-pass drain loop: re-spawn while budget, ceiling,

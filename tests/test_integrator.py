@@ -303,6 +303,60 @@ def test_discover_candidates_bounds_to_headroom(tmp_path):
     assert candidates[0]["task_id"] == "wf-1"
 
 
+def test_discover_candidates_orders_oldest_parked_first_not_by_task_id(tmp_path):
+    """wf-273 — desk list order with --limit 1 let a newer order keep
+    winning while an older parked one (wf-271) starved; oldest updated_at
+    within a priority tier must come first regardless of task id order."""
+    workers = [make_worker(tmp_path, name="a"), make_worker(tmp_path, name="b")]
+    roster_path = write_roster(tmp_path, workers)
+    cfg = make_config(tmp_path, roster_path, active_implementation_cap=5)
+    tasks = [
+        {"id": "wf-9", "labels": ["worker:a"], "title": "newer", "updated_at": "2026-09-14T04:13:00Z"},
+        {"id": "wf-2", "labels": ["worker:b"], "title": "older", "updated_at": "2026-09-14T02:00:00Z"},
+    ]
+
+    def fake_http(method, url, body=None, timeout=15.0):
+        return {"ok": True, "tasks": tasks}
+
+    candidates = integrator.discover_candidates(cfg, http=fake_http)
+    assert [c["task_id"] for c in candidates] == ["wf-2", "wf-9"]
+
+
+def test_discover_candidates_orders_by_priority_before_age(tmp_path):
+    workers = [make_worker(tmp_path, name="a"), make_worker(tmp_path, name="b")]
+    roster_path = write_roster(tmp_path, workers)
+    cfg = make_config(tmp_path, roster_path, active_implementation_cap=5)
+    tasks = [
+        {"id": "wf-1", "labels": ["worker:a"], "title": "old-low-priority",
+         "priority": 4, "updated_at": "2026-09-14T01:00:00Z"},
+        {"id": "wf-2", "labels": ["worker:b"], "title": "newer-urgent",
+         "priority": 1, "updated_at": "2026-09-14T05:00:00Z"},
+    ]
+
+    def fake_http(method, url, body=None, timeout=15.0):
+        return {"ok": True, "tasks": tasks}
+
+    candidates = integrator.discover_candidates(cfg, http=fake_http)
+    assert [c["task_id"] for c in candidates] == ["wf-2", "wf-1"]
+
+
+def test_discover_candidates_unknown_age_sorts_last_within_tier(tmp_path):
+    workers = [make_worker(tmp_path, name="a"), make_worker(tmp_path, name="b")]
+    roster_path = write_roster(tmp_path, workers)
+    cfg = make_config(tmp_path, roster_path, active_implementation_cap=5)
+    tasks = [
+        {"id": "wf-1", "labels": ["worker:a"], "title": "no-timestamp"},
+        {"id": "wf-2", "labels": ["worker:b"], "title": "known-timestamp",
+         "updated_at": "2026-09-14T05:00:00Z"},
+    ]
+
+    def fake_http(method, url, body=None, timeout=15.0):
+        return {"ok": True, "tasks": tasks}
+
+    candidates = integrator.discover_candidates(cfg, http=fake_http)
+    assert [c["task_id"] for c in candidates] == ["wf-2", "wf-1"]
+
+
 # --------------------------------------------------------------------------
 # run_one orchestration — fake ops, disposable checkout
 # --------------------------------------------------------------------------
