@@ -33,7 +33,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from ._utils import _parse_iso_z, _utc_iso_z, _utcnow
 from .capacity import hermetic_dry_run
@@ -52,6 +52,11 @@ _REQUIRED_CONFIG_KEYS = (
 )
 
 _VERSION_BUMP_RULES = ("major", "minor", "patch", "local-suffix")
+
+# "in_pass" (default): activate and verify inline, as every non-daemon
+# project does. "handoff": never restart from inside the pass — write a
+# pending-activation marker instead (wf-276; see the marker helpers below).
+_ACTIVATION_MODES = ("in_pass", "handoff")
 
 # Providers stay replaceable: which reviewer covers which implementation
 # provider is data, not a hard-coded branch per vendor name.
@@ -193,6 +198,12 @@ def load_config(path: str) -> Dict[str, Any]:
         local_root, "COORDINATOR.lock"
     )
 
+    activation_mode = raw.get("activation_mode", "in_pass")
+    if activation_mode not in _ACTIVATION_MODES:
+        raise IntegratorError(
+            "activation_mode must be one of %s" % "/".join(_ACTIVATION_MODES)
+        )
+
     return {
         "config_path": str(raw_path),
         "local_root": local_root,
@@ -228,6 +239,7 @@ def load_config(path: str) -> Dict[str, Any]:
             raw.get("coordinator_lock_ttl_secs"), "coordinator_lock_ttl_secs",
             _DEFAULT_COORDINATOR_LOCK_TTL_SECS,
         ),
+        "activation_mode": activation_mode,
         "checkout_template": raw.get("checkout_template", _DEFAULT_CHECKOUT_TEMPLATE),
         "checkout_templates": dict(raw.get("checkout_templates") or {}),
         "branch_template": raw.get("branch_template", _DEFAULT_BRANCH_TEMPLATE),
@@ -570,6 +582,25 @@ def decide_after_suites(
     return {
         "action": "recover",
         "reason": "suites failed; recovery round %d/%d"
+        % (recovery_rounds_used + 1, max_recovery_rounds),
+    }
+
+
+def decide_after_merge_base(
+    conflict: bool, recovery_rounds_used: int, max_recovery_rounds: int,
+) -> Dict[str, str]:
+    """proceed | recover | stop, from a pr_base merge conflict and history."""
+    if not conflict:
+        return {"action": "proceed", "reason": "merge clean"}
+    if recovery_rounds_used >= max_recovery_rounds:
+        return {
+            "action": "stop",
+            "reason": "recovery rounds exhausted after merge conflict (%d/%d)"
+            % (recovery_rounds_used, max_recovery_rounds),
+        }
+    return {
+        "action": "recover",
+        "reason": "merge conflict merging base into branch; recovery round %d/%d"
         % (recovery_rounds_used + 1, max_recovery_rounds),
     }
 
@@ -1093,6 +1124,14 @@ def suite_failure_comment_body(output: str, round_no: int, max_rounds: int) -> s
     )
 
 
+def merge_base_conflict_comment_body(paths: Sequence[str], round_no: int, max_rounds: int) -> str:
+    return (
+        "Blocked: merge conflict merging base into branch (recovery round %d/%d)\n"
+        "Next step: resolve the conflict in the paths below, then re-run the integrator pass.\n\n%s"
+        % (round_no, max_rounds, "\n".join("- %s" % p for p in paths) if paths else "(no paths reported)")
+    )
+
+
 def later_findings_comment_body(later: Sequence[str]) -> str:
     lines = ["Follow-up: %d lower-priority finding(s) noted, not blocking" % len(later)]
     for f in later:
@@ -1123,6 +1162,18 @@ def build_close_body(evidence: Dict[str, str]) -> str:
             evidence.get("follow_ups", "none"),
         )
     )
+
+
+def close_evidence_links(merge_sha: str, version_sha: str, pr_url: str = "") -> str:
+    """Links line for §5 close-out — cites landing SHAs the desk accepts (wf-277)."""
+    parts = []
+    if merge_sha:
+        parts.append("%s (merge)" % merge_sha)
+    if version_sha:
+        parts.append("%s (version)" % version_sha)
+    if pr_url:
+        parts.append(pr_url)
+    return ", ".join(parts) if parts else ""
 
 
 # --------------------------------------------------------------------------
@@ -1164,6 +1215,11 @@ def clear_recovery_state(local_root: str, task_id: str) -> None:
         os.remove(path)
     except OSError:
         pass
+    # A stuck handoff order reset here must not leave a pending-activation
+    # marker behind: the external activator reads that marker outside any
+    # pass and would restart the daemon for an order that was just reset or
+    # abandoned (wf-276 finding 3).
+    clear_pending_activation(local_root, task_id)
 
 
 def clear_recovery_round_state(
@@ -1200,6 +1256,10 @@ def clear_recovery_round_state(
         if key in previous:
             state[key] = previous[key]
     write_recovery_state(local_root, task_id, state)
+    # Same reasoning as clear_recovery_state (wf-276 finding 3): a stuck
+    # handoff order cleared by a person must not leave a pending-activation
+    # marker for the external activator to act on outside this pass.
+    clear_pending_activation(local_root, task_id)
     if park_seat is not None:
         state["park"] = park_seat(task_id)
     return state
@@ -1262,13 +1322,89 @@ def clear_post_merge_state(local_root: str, task_id: str) -> None:
 
 
 # --------------------------------------------------------------------------
+# Pending-activation handoff (per task id, durable across passes) — wf-276
+# --------------------------------------------------------------------------
+#
+# A daemon project's own release restarts the process the integrator pass
+# is running under, so activating from inside the pass kills the pass
+# before the ACTIVATE row, the installed-version verify, and the close are
+# written. In ``activation_mode: "handoff"`` the pass never restarts
+# anything itself: it writes this marker (the release the pass wants
+# active) and ends the pass with outcome ``activation_handoff``. A
+# scheduled activator outside any pass — the daemon's own job scheduling,
+# not this module — reads the marker and performs the restart once no
+# implementation lane is in flight. The next pass that finds a marker
+# checks the installed version: not yet the marker's version is
+# ``activation_pending`` (retry next pass, no stop/park — this is the
+# expected wait, not a failure); already the marker's version clears the
+# marker and closes the order from here, without ever having called
+# ``run_activate`` itself.
+
+
+def _pending_activation_path(local_root: str, task_id: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(task_id))
+    return os.path.join(local_root, "state", "integrator-activate", "%s.json" % safe)
+
+
+def read_pending_activation(local_root: str, task_id: str) -> Optional[Dict[str, Any]]:
+    path = _pending_activation_path(local_root, task_id)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_pending_activation(local_root: str, task_id: str, state: Dict[str, Any]) -> None:
+    path = _pending_activation_path(local_root, task_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2)
+    os.replace(tmp, path)
+
+
+def clear_pending_activation(local_root: str, task_id: str) -> None:
+    """Clear this module's own bookkeeping marker *and* the external
+    activator's restart signal for the same version.
+
+    ``activate_cmd`` (``wf-activate.sh``) writes ``<version>.pending`` in the
+    same ``integrator-activate`` directory for ``wf-activator.sh`` to consume
+    outside any pass — clearing only ``<task-id>.json`` here left that file
+    behind for a stuck order a person just reset or abandoned, and the
+    external activator would still restart a release for it (wf-276 recovery
+    round 2, finding 2).
+    """
+    marker = read_pending_activation(local_root, task_id)
+    path = _pending_activation_path(local_root, task_id)
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    version = (marker or {}).get("version")
+    if version:
+        # wf-activate.sh names this file from the raw release basename
+        # (``V=$(basename "$REL")``), not a sanitized form -- WorkForce's
+        # local-suffix versions contain ``+``, so this must match verbatim
+        # (wf-276 recovery round 3, finding 1).
+        pending_file = os.path.join(os.path.dirname(path), "%s.pending" % str(version))
+        try:
+            os.remove(pending_file)
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------
 # Ledger + receipts
 # --------------------------------------------------------------------------
 
 _LEDGER_EVENTS = (
     "DISCOVER", "SUITES", "RECOVER", "STOP", "REVIEW", "FINDINGS", "LATER",
-    "WAIT_CI", "MERGE", "STAGE", "ACTIVATE", "CLOSE", "PRUNE", "DRY_RUN", "SKIP",
-    "PARK_FAILED",
+    "WAIT_CI", "MERGE", "MERGE_BASE", "STAGE", "ACTIVATE", "CLOSE", "PRUNE",
+    "DRY_RUN", "SKIP", "PARK_FAILED",
 )
 
 
@@ -1319,27 +1455,69 @@ def write_receipt(local_root: str, project: str, result: Dict[str, Any]) -> str:
 # --------------------------------------------------------------------------
 
 
-def _any_open_ledger_shift(local_root: str, seats: Optional[Sequence[str]] = None) -> bool:
-    """True when a seat's ledger has a START with no terminal event yet.
+def _implementation_seats(workers: Dict[str, Any]) -> Set[str]:
+    return {
+        name for name, worker in workers.items()
+        if getattr(worker, "kind", "lane") == "lane"
+    }
 
-    With *seats* given (the roster's implementation lanes) only those ledgers
+
+def _any_open_ledger_shift(
+    local_root: str,
+    workers: Dict[str, Any],
+    implementation_seats: Optional[Set[str]] = None,
+) -> bool:
+    """True when a roster lane seat's ledger has a non-stale open shift.
+
+    With *implementation_seats* given (the roster's lanes) only those ledgers
     are read: a job's own ledger (the integrator's ``integrator.log`` is
     open for the whole pass that asks this question, and so are the
     supervisor's and loop-health's while they run) and retired identities'
     files must never read as a seat mid-shift, or activation is skipped
-    forever. Without *seats* every ledger except the integrator's per-project
-    receipts is read (legacy behaviour, kept for callers with no roster).
+    forever. Skips ``integrator-<project>.log`` receipts. START rows older
+    than the seat's budget are ignored.
     """
+    from . import ledger as ledger_mod
+
+    seats = implementation_seats if implementation_seats is not None else _implementation_seats(workers)
+    if not seats:
+        return False
+    ledger_dir = os.path.join(local_root, "ledger")
+    if not os.path.isdir(ledger_dir):
+        return False
+    now = _utcnow()
+    for name in os.listdir(ledger_dir):
+        if not name.endswith(".log") or name.startswith("integrator-"):
+            continue
+        worker_name = name[:-4]
+        if worker_name not in seats:
+            continue
+        worker = workers.get(worker_name)
+        budget = int(getattr(worker, "budget_secs", 0) or 0) or 1500
+        try:
+            with open(os.path.join(ledger_dir, name), "r", encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        shifts = ledger_mod.parse_shifts(text, limit=1)
+        if not shifts or shifts[0].get("outcome") != "running":
+            continue
+        started = _parse_iso_z(shifts[0]["ts"])
+        if started is not None and (now - started).total_seconds() > budget:
+            continue
+        return True
+    return False
+
+
+def _legacy_any_open_ledger_shift(local_root: str) -> bool:
+    """Legacy one-arg path: any worker ledger with a running shift counts."""
     from . import ledger as ledger_mod
 
     ledger_dir = os.path.join(local_root, "ledger")
     if not os.path.isdir(ledger_dir):
         return False
-    wanted = None if seats is None else {"%s.log" % s for s in seats}
     for name in os.listdir(ledger_dir):
         if not name.endswith(".log") or name.startswith("integrator-"):
-            continue
-        if wanted is not None and name not in wanted:
             continue
         try:
             with open(os.path.join(ledger_dir, name), "r", encoding="utf-8") as fh:
@@ -1352,34 +1530,106 @@ def _any_open_ledger_shift(local_root: str, seats: Optional[Sequence[str]] = Non
     return False
 
 
-def seat_in_flight(local_root: str, roster_path: Optional[str] = None) -> bool:
-    """True when any implementation seat holds a live lock or an open shift.
+def _seat_open_ledger_shift(local_root: str, seat: str, worker: Any) -> bool:
+    """True when this seat's ledger has a non-stale open shift."""
+    from . import ledger as ledger_mod
+
+    ledger_path = os.path.join(local_root, "ledger", "%s.log" % seat)
+    if not os.path.isfile(ledger_path):
+        return False
+    budget = int(getattr(worker, "budget_secs", 0) or 0) or 1500
+    try:
+        with open(ledger_path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return False
+    shifts = ledger_mod.parse_shifts(text, limit=1)
+    if not shifts or shifts[0].get("outcome") != "running":
+        return False
+    started = _parse_iso_z(shifts[0]["ts"])
+    if started is not None and (_utcnow() - started).total_seconds() > budget:
+        return False
+    return True
+
+
+def seat_in_flight(
+    local_root: str,
+    workers: Optional[Dict[str, Any]] = None,
+    *,
+    roster_path: Optional[str] = None,
+) -> bool:
+    """True when any implementation seat holds a live lock or a non-stale open shift.
 
     Activation restarts the WorkForce install a live seat is running under;
     this must never fire while a seat is mid-shift, live-locked or not.
-    With *roster_path* the open-shift scan is limited to the roster's lanes
+    With *workers* or *roster_path* the scan is limited to roster lanes
     (implementation seats); jobs and retired identities are not seats.
+    With neither, any live lock or open ledger shift is in-flight (legacy
+    fail-safe for callers that still use the one-arg form).
     """
     from . import provider_qualification as pq_mod
     from . import roster as roster_mod
 
-    seats: Optional[List[str]] = None
+    resolved_workers: Optional[Dict[str, Any]] = workers
     if roster_path:
         try:
             rost = roster_mod.load(path=roster_path)
-            seats = [n for n, w in rost.workers.items() if getattr(w, "kind", "lane") == "lane"]
+            resolved_workers = rost.workers
         except Exception:  # noqa: BLE001 — an unreadable roster must not unblock a restart
-            seats = None
-    locks = pq_mod.scan_active_locks(local_root)
-    if seats is None:
-        if locks:
+            resolved_workers = None
+
+    if not resolved_workers:
+        if pq_mod.scan_active_locks(local_root):
             return True
-    else:
-        # The integrator holds its own integrator.lock for the whole pass
-        # that asks this question; a job's lock is not a seat mid-shift.
-        if any(str(row.get("worker") or "") in seats for row in locks):
+        return _legacy_any_open_ledger_shift(local_root)
+
+    implementation_seats = _implementation_seats(resolved_workers)
+    if not implementation_seats:
+        return False
+    for row in pq_mod.scan_active_locks(local_root):
+        if row["worker"] in implementation_seats:
             return True
-    return _any_open_ledger_shift(local_root, seats)
+    return _any_open_ledger_shift(local_root, resolved_workers, implementation_seats)
+
+
+def _seat_has_active_lock(local_root: str, seat: str) -> bool:
+    from . import provider_qualification as pq_mod
+
+    return any(
+        row["worker"] == seat
+        for row in pq_mod.scan_active_locks(local_root)
+    )
+
+
+def _seat_in_flight(local_root: str, seat: str, workers: Dict[str, Any]) -> bool:
+    """True when *seat* holds a live lock or a non-stale open shift."""
+    if seat not in _implementation_seats(workers):
+        return False
+    if _seat_has_active_lock(local_root, seat):
+        return True
+    worker = workers.get(seat)
+    if worker is None:
+        return False
+    return _seat_open_ledger_shift(local_root, seat, worker)
+
+
+def _defer_recovery_if_seat_busy(
+    local_root: str,
+    project: str,
+    task_id: str,
+    seat: str,
+    workers: Dict[str, Any],
+    result: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Park recovery when the seat is mid-shift; do not consume a round."""
+    if not _seat_in_flight(local_root, seat, workers):
+        return None
+    append_ledger_row(local_root, project, "SKIP", ticket=task_id, reason="seat_busy", worker=seat)
+    result["outcome"] = "seat_busy"
+    result["seat"] = seat
+    result["reason"] = "seat %s is in flight; retry recovery next pass" % seat
+    write_receipt(local_root, project, result)
+    return result
 
 
 def _worker_seat_from_labels(labels: Optional[Sequence[Any]]) -> Optional[str]:
@@ -1397,10 +1647,10 @@ def discover_candidates(
 ) -> List[Dict[str, Any]]:
     """In_review orders on ``config["project"]`` owned by a registered seat.
 
-    Excludes any seat currently holding a live (non-orphan) dispatch lock —
-    the integrator never runs while that seat is in flight — and bounds the
-    result to remaining active-implementation headroom. Stable order (task
-    id ascending) so repeated passes are deterministic.
+    A busy seat does not exclude its parked orders — only recovery needs the
+    seat free, and ``run_one`` defers that. Bounds the result to remaining
+    active-implementation headroom. Stable order (task id ascending) so
+    repeated passes are deterministic.
     """
     from . import roster as roster_mod
     from . import provider_qualification as pq_mod
@@ -1412,7 +1662,6 @@ def discover_candidates(
     tasks = _list_tasks(
         desk, config["project"], status="in_review", limit=200, http=http,
     )
-    active = {row["worker"] for row in pq_mod.scan_active_locks(config["local_root"])}
     snap = pq_mod.implementation_capacity_snapshot(
         config["local_root"], rost.workers, config=config,
     )
@@ -1424,8 +1673,6 @@ def discover_candidates(
             continue
         seat = _worker_seat_from_labels(t.get("labels"))
         if not seat or seat not in rost.workers:
-            continue
-        if seat in active:
             continue
         worker = rost.workers[seat]
         provider = pq_mod._infer_provider_from_worker(worker)
@@ -1602,6 +1849,42 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
 
     def push_branch(checkout: str, branch: str) -> Dict[str, Any]:
         return _run(["git", "push", "-u", "origin", "HEAD:%s" % branch], cwd=checkout)
+
+    def merge_base_into_branch(checkout: str, branch: str, base: str) -> Dict[str, Any]:
+        """Merge ``origin/<base>`` into *branch* before suites (wf-274).
+
+        No rebase, no force: a clean merge commits as "Merge <base> into
+        <branch> (integrator)" and is pushed with the branch; a conflicting
+        merge aborts cleanly and reports the conflicting paths, leaving the
+        seat's own commits untouched. A merge failure that leaves no
+        conflicted paths (missing origin/<base>, dirty tree, merge already
+        in progress, ...) is reported as an operational failure
+        (``ok=False, conflict=False``) rather than a conflict, so callers
+        don't misroute it as something the seat can fix by redoing work.
+        """
+        fetch = _run(["git", "fetch", "origin"], cwd=checkout)
+        if fetch["rc"] != 0:
+            return {"ok": False, "conflict": False, "paths": [], "sha": "", "output": fetch["output"]}
+        pre_sha = _run(["git", "rev-parse", "HEAD"], cwd=checkout)
+        merge = _run(
+            ["git", "merge", "--no-ff", "origin/%s" % base,
+             "-m", "Merge %s into %s (integrator)" % (base, branch)],
+            cwd=checkout,
+        )
+        if merge["rc"] != 0:
+            unmerged = _run(["git", "diff", "--name-only", "--diff-filter=U"], cwd=checkout)
+            paths = [p for p in unmerged["output"].splitlines() if p.strip()]
+            _run(["git", "merge", "--abort"], cwd=checkout)
+            if paths:
+                return {"ok": False, "conflict": True, "paths": paths, "output": merge["output"]}
+            return {"ok": False, "conflict": False, "paths": [], "output": merge["output"]}
+        post_sha = _run(["git", "rev-parse", "HEAD"], cwd=checkout)
+        new_sha = post_sha["output"].strip() if post_sha["rc"] == 0 else ""
+        if new_sha and new_sha != pre_sha["output"].strip():
+            push = _run(["git", "push", "origin", "HEAD:%s" % branch], cwd=checkout)
+            if push["rc"] != 0:
+                return {"ok": False, "conflict": False, "paths": [], "sha": new_sha, "output": push["output"]}
+        return {"ok": True, "conflict": False, "paths": [], "sha": new_sha, "output": merge["output"]}
 
     def open_or_update_pr(checkout: str, branch: str, base: str, title: str, body: str) -> Dict[str, Any]:
         view = _run(["gh", "pr", "view", branch, "--json", "number,url"], cwd=checkout)
@@ -1944,6 +2227,7 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
 
     return {
         "run_suites": run_suites,
+        "merge_base_into_branch": merge_base_into_branch,
         "checkout_clean": checkout_clean,
         "diff_text": diff_text,
         "checkout_head_sha": checkout_head_sha,
@@ -1989,6 +2273,177 @@ def _dry_plan(order: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _close_merged_order(
+    task_id: str,
+    project: str,
+    config: Dict[str, Any],
+    ops: Dict[str, Callable],
+    post_merge: Dict[str, Any],
+    result: Dict[str, Any],
+    verified: Dict[str, Any],
+    screenshots: List[str],
+    pr: Dict[str, Any],
+    reviewer: str,
+    new_version: str,
+) -> Dict[str, Any]:
+    """Evidence, close, prune, and local-state cleanup once install is verified.
+
+    Shared by the in-pass path (verified right after ``run_activate``) and
+    the handoff path (verified on a later pass against a pending-activation
+    marker, wf-276) — everything after "the install is confirmed" is the
+    same either way.
+    """
+    result["installed_verified"] = verified.get("ok")
+    result["screenshots"] = screenshots
+    later_findings = post_merge.get("later_findings") or []
+    evidence = {
+        "completed": "Merged PR %s and released version %s." % (pr.get("url") or pr.get("number"), new_version),
+        "verification": "Suites green; reviewer (%s) reported no findings; CI green; installed version verified=%s."
+        % (reviewer, verified.get("ok")),
+        "links": close_evidence_links(
+            post_merge.get("merge_sha") or "",
+            post_merge.get("version_sha") or "",
+            pr.get("url") or "",
+        ),
+        "follow_ups": "; ".join(later_findings) if later_findings else "none",
+    }
+    close = ops["close_order"](task_id, evidence)
+    result["close"] = close
+    confirmed_status = close.get("status") or ""
+    if close.get("ok") is not True or confirmed_status != "done":
+        ops["park_seat"](task_id)
+        append_ledger_row(
+            config["local_root"], project, "CLOSE", ticket=task_id,
+            status=confirmed_status or "failed",
+            error=close.get("error") or "close not confirmed",
+        )
+        result["outcome"] = "close_failed"
+        result["reason"] = close.get("error") or "desk did not confirm done"
+        write_receipt(config["local_root"], project, result)
+        return result
+
+    if later_findings:
+        append_ledger_row(config["local_root"], project, "LATER", ticket=task_id, count=len(later_findings))
+    append_ledger_row(config["local_root"], project, "CLOSE", ticket=task_id, status="done")
+    worker = result.get("worker")
+    if worker:
+        from .prune import prune_after_close
+
+        result["prune"] = prune_after_close(config, worker, task_id)
+    clear_recovery_state(config["local_root"], task_id)
+    clear_post_merge_state(config["local_root"], task_id)
+    result["outcome"] = "closed"
+    write_receipt(config["local_root"], project, result)
+    return result
+
+
+def _finish_after_stage_handoff(
+    task_id: str,
+    project: str,
+    config: Dict[str, Any],
+    ops: Dict[str, Callable],
+    post_merge: Dict[str, Any],
+    result: Dict[str, Any],
+    ctx: Dict[str, str],
+    new_version: str,
+    pr: Dict[str, Any],
+    reviewer: str,
+) -> Dict[str, Any]:
+    """``activation_mode: "handoff"`` — never restart from inside the pass.
+
+    ``activate_cmd`` (``wf-activate.sh`` in production) is still called every
+    pass, same as ``in_pass`` mode: it is what actually leaves the pending
+    marker the external activator (``wf-activator.sh``, scheduled outside any
+    pass) consumes, and it is the tool that knows whether the release is
+    already active without this module hard-coding that protocol. The
+    difference from ``in_pass`` is only in how a nonzero rc is read: never a
+    stop, always the ordinary "handed off, retry next pass" outcome, because
+    the wrapper's own contract is "never restart, exit 1 to mean pending"
+    (wf-276 host comment). This module's own marker under
+    ``integrator-activate/<task-id>.json`` is bookkeeping only — it decides
+    whether this is the first handoff (outcome ``activation_handoff``) or a
+    later poll (``activation_pending``) — not the protocol the activator
+    reads.
+    """
+    local_root = config["local_root"]
+    release_dir = os.path.join(config["release_root"], new_version)
+    pending = read_pending_activation(local_root, task_id)
+    first = pending is None or pending.get("version") != new_version
+
+    activate = ops["run_activate"](ctx)
+    if activate["rc"] != 0:
+        write_pending_activation(local_root, task_id, {
+            "task_id": task_id,
+            "project": project,
+            "version": new_version,
+            "release_root": release_dir,
+            "requested_at": pending.get("requested_at") if pending and not first else _utc_iso_z(),
+        })
+        outcome = "activation_handoff" if first else "activation_pending"
+        if first:
+            append_ledger_row(local_root, project, "ACTIVATE", ticket=task_id, outcome=outcome)
+        else:
+            append_ledger_row(local_root, project, "SKIP", ticket=task_id, reason=outcome)
+        result["outcome"] = outcome
+        result["reason"] = (
+            "activation handed off to the scheduled activator; release %s is pending at %s"
+            % (new_version, release_dir)
+        )
+        write_receipt(local_root, project, result)
+        return result
+
+    verified = ops["verify_installed_version"](new_version, ctx)
+    if not verified.get("ok"):
+        # activate_cmd (rc 0) already reported the release active and, per
+        # its own contract, removed the .pending marker the external
+        # activator reads — there is no restart signal left anywhere for a
+        # later pass to wait on. Retrying would just re-run activate_cmd and
+        # hit the same rc-0/verify-fail outcome forever, unlike the ordinary
+        # rc!=0 branch above where the activator genuinely has work queued.
+        # Stop and park for a person, mirroring in_pass's own verify gate,
+        # instead of spinning on activation_pending (wf-276 finding 1).
+        result["installed_verified"] = verified.get("ok")
+        body = (
+            "Blocked: activate_cmd reported %s active but installed build does not "
+            "report the bumped version\n"
+            "Expected: %s\n"
+            "Observed: %s\n"
+            "Next step: workforce integrate --config %s "
+            "--clear-recovery %s --cleared-by <who> --reason \"<why>\""
+            % (
+                new_version, new_version, verified.get("observed") or "(unknown)",
+                config.get("config_path", ""), task_id,
+            )
+        )
+        ops["post_comment"](task_id, body)
+        park_result = ops["park_seat"](task_id)
+        if park_result.get("ok") is False:
+            ops["post_comment"](
+                task_id,
+                "Blocked: automatic re-park to in_review failed (%s) after "
+                "the stop above; this order is exposed in backlog and a "
+                "person must re-park it to in_review by hand."
+                % (park_result.get("error") or "unknown error"),
+            )
+            append_ledger_row(
+                local_root, project, "PARK_FAILED",
+                ticket=task_id, error=park_result.get("error") or "unknown error",
+            )
+        else:
+            append_ledger_row(local_root, project, "STOP", ticket=task_id, reason="install not verified")
+        result["outcome"] = "install_not_verified"
+        result["reason"] = "installed build does not report version %s" % new_version
+        write_receipt(local_root, project, result)
+        return result
+
+    clear_pending_activation(local_root, task_id)
+    screenshots = ops["capture_screenshots"](ctx)
+    return _close_merged_order(
+        task_id, project, config, ops, post_merge, result,
+        verified, screenshots, pr, reviewer, new_version,
+    )
+
+
 def _finish_after_stage(
     task_id: str,
     project: str,
@@ -2011,6 +2466,11 @@ def _finish_after_stage(
     result["version"] = {"from": current_version, "to": new_version}
     ctx = {"version": new_version, "checkout": config["main_checkout"]}
 
+    if config.get("activation_mode") == "handoff":
+        return _finish_after_stage_handoff(
+            task_id, project, config, ops, post_merge, result, ctx, new_version, pr, reviewer,
+        )
+
     if seat_in_flight(config["local_root"], roster_path=config.get("roster_path")):
         append_ledger_row(config["local_root"], project, "SKIP", ticket=task_id, reason="seat_in_flight")
         result["outcome"] = "activate_skipped"
@@ -2028,10 +2488,10 @@ def _finish_after_stage(
 
     verified = ops["verify_installed_version"](new_version, ctx)
     screenshots = ops["capture_screenshots"](ctx)
-    result["installed_verified"] = verified.get("ok")
-    result["screenshots"] = screenshots
 
     if not verified.get("ok"):
+        result["installed_verified"] = verified.get("ok")
+        result["screenshots"] = screenshots
         body = (
             "Blocked: installed build does not report the bumped version\n"
             "Expected: %s\n"
@@ -2067,42 +2527,10 @@ def _finish_after_stage(
         write_receipt(config["local_root"], project, result)
         return result
 
-    later_findings = post_merge.get("later_findings") or []
-    evidence = {
-        "completed": "Merged PR %s and released version %s." % (pr.get("url") or pr.get("number"), new_version),
-        "verification": "Suites green; reviewer (%s) reported no findings; CI green; installed version verified=%s."
-        % (reviewer, verified.get("ok")),
-        "links": pr.get("url") or "",
-        "follow_ups": "; ".join(later_findings) if later_findings else "none",
-    }
-    close = ops["close_order"](task_id, evidence)
-    result["close"] = close
-    confirmed_status = close.get("status") or ""
-    if close.get("ok") is not True or confirmed_status != "done":
-        ops["park_seat"](task_id)
-        append_ledger_row(
-            config["local_root"], project, "CLOSE", ticket=task_id,
-            status=confirmed_status or "failed",
-            error=close.get("error") or "close not confirmed",
-        )
-        result["outcome"] = "close_failed"
-        result["reason"] = close.get("error") or "desk did not confirm done"
-        write_receipt(config["local_root"], project, result)
-        return result
-
-    if later_findings:
-        append_ledger_row(config["local_root"], project, "LATER", ticket=task_id, count=len(later_findings))
-    append_ledger_row(config["local_root"], project, "CLOSE", ticket=task_id, status="done")
-    worker = result.get("worker")
-    if worker:
-        from .prune import prune_after_close
-
-        result["prune"] = prune_after_close(config, worker, task_id)
-    clear_recovery_state(config["local_root"], task_id)
-    clear_post_merge_state(config["local_root"], task_id)
-    result["outcome"] = "closed"
-    write_receipt(config["local_root"], project, result)
-    return result
+    return _close_merged_order(
+        task_id, project, config, ops, post_merge, result,
+        verified, screenshots, pr, reviewer, new_version,
+    )
 
 
 def _stop_seat_and_record(
@@ -2121,6 +2549,19 @@ def _stop_seat_and_record(
         return stop_result
     append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
     return stop_result
+
+
+def _stop_recovery_exhausted(
+    ops: Dict[str, Callable], config: Dict[str, Any], project: str, task_id: str, reason: str,
+) -> Dict[str, Any]:
+    """Suite/findings stop after recovery rounds are exhausted.
+
+    ``release_seat`` drops the implementation-seat claim so the seat is not
+    left busy on a stopped order; ``stop_seat`` posts the durable stop note
+    and re-parks to ``in_review`` (wf-270).
+    """
+    ops["release_seat"](task_id, reason)
+    return _stop_seat_and_record(ops, config, project, task_id, reason)
 
 
 def run_one(
@@ -2163,6 +2604,10 @@ def run_one(
     if post_merge is not None:
         return _finish_after_stage(task_id, project, config, ops, post_merge, result)
 
+    from . import roster as roster_mod
+
+    roster_workers = roster_mod.load(path=config["roster_path"]).workers
+
     checkout = _checkout_path(config, order)
     branch = _branch_name(config, order)
     reviewer = reviewer_for_provider(order["provider"], config["reviewer_by_provider"])
@@ -2183,6 +2628,7 @@ def run_one(
     append_ledger_row(config["local_root"], project, "DISCOVER", ticket=task_id, worker=order["worker"])
 
     try:
+        merge_base = ops["merge_base_into_branch"](checkout, branch, config["pr_base"])
         current_head_sha = ops["checkout_head_sha"](checkout)
     except FileNotFoundError:
         # The seat's checkout is not where the template or its Workdir line
@@ -2191,6 +2637,53 @@ def run_one(
         reason = "checkout missing: %s (seat Workdir: line or checkout_templates needed)" % checkout
         _stop_seat_and_record(ops, config, project, task_id, reason)
         result["outcome"] = "checkout_missing"
+        result["reason"] = reason
+        write_receipt(config["local_root"], project, result)
+        return result
+
+    append_ledger_row(
+        config["local_root"], project, "MERGE_BASE", ticket=task_id,
+        conflict=bool(merge_base.get("conflict")),
+    )
+    if not merge_base.get("ok") and not merge_base.get("conflict"):
+        # A merge failure that leaves no conflicted paths (fetch/push error,
+        # dirty tree, merge already in progress, ...) is an operational
+        # failure, not something the seat can fix by redoing work: stop this
+        # pass without touching recovery state so the next integrator pass
+        # retries against a clean checkout. Drop any implementation-seat claim
+        # so the seat is not left busy on a stopped order (wf-275).
+        reason = "merge_base_into_branch failed merging %s into %s (no conflict): %s" % (
+            config["pr_base"], branch, (merge_base.get("output") or "").strip() or "(no output)",
+        )
+        ops["release_seat"](task_id, reason)
+        _stop_seat_and_record(ops, config, project, task_id, reason)
+        result["outcome"] = "merge_base_failed"
+        result["reason"] = reason
+        write_receipt(config["local_root"], project, result)
+        return result
+    if merge_base.get("conflict"):
+        paths = merge_base.get("paths") or []
+        result["conflict_paths"] = paths
+        merge_decision = decide_after_merge_base(True, rounds_used, config["max_recovery_rounds"])
+        reason = "merge conflict merging %s into %s (paths: %s)" % (
+            config["pr_base"], branch, ", ".join(paths) if paths else "unknown",
+        )
+        if merge_decision["action"] == "stop":
+            _stop_recovery_exhausted(ops, config, project, task_id, merge_decision["reason"])
+            result["outcome"] = "stopped"
+            result["reason"] = merge_decision["reason"]
+            write_receipt(config["local_root"], project, result)
+            return result
+        ops["post_comment"](
+            task_id,
+            merge_base_conflict_comment_body(paths, rounds_used + 1, config["max_recovery_rounds"]),
+        )
+        ops["release_seat"](task_id, reason)
+        dispatch_seat_recovery(reason)
+        next_state = _carry_recovery_state(state, rounds_used + 1)
+        write_recovery_state(config["local_root"], task_id, next_state)
+        append_ledger_row(config["local_root"], project, "RECOVER", ticket=task_id, reason=reason)
+        result["outcome"] = "merge_base_conflict"
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
         return result
@@ -2209,13 +2702,18 @@ def run_one(
     result["suites"] = {"rc": suite["rc"]}
 
     if decision["action"] == "stop":
-        _stop_seat_and_record(ops, config, project, task_id, decision["reason"])
+        _stop_recovery_exhausted(ops, config, project, task_id, decision["reason"])
         result["outcome"] = "stopped"
         result["reason"] = decision["reason"]
         write_receipt(config["local_root"], project, result)
         return result
 
     if decision["action"] == "recover":
+        deferred = _defer_recovery_if_seat_busy(
+            config["local_root"], project, task_id, order["worker"], roster_workers, result,
+        )
+        if deferred is not None:
+            return deferred
         ops["post_comment"](task_id, suite_failure_comment_body(suite["output"], rounds_used + 1, config["max_recovery_rounds"]))
         ops["release_seat"](task_id, decision["reason"])
         dispatch_seat_recovery(decision["reason"])
@@ -2385,9 +2883,14 @@ def run_one(
         if later_findings:
             ops["post_comment"](task_id, later_findings_comment_body(later_findings))
         if findings_decision["action"] == "stop":
-            _stop_seat_and_record(ops, config, project, task_id, findings_decision["reason"])
+            _stop_recovery_exhausted(ops, config, project, task_id, findings_decision["reason"])
             result["outcome"] = "stopped"
         else:
+            deferred = _defer_recovery_if_seat_busy(
+                config["local_root"], project, task_id, order["worker"], roster_workers, result,
+            )
+            if deferred is not None:
+                return deferred
             ops["release_seat"](task_id, findings_decision["reason"])
             dispatch_seat_recovery(findings_decision["reason"])
             next_state = _carry_recovery_state(
@@ -2448,6 +2951,7 @@ def run_one(
         write_receipt(config["local_root"], project, result)
         return result
     append_ledger_row(config["local_root"], project, "MERGE", ticket=task_id, pr=pr.get("number"))
+    merge_landing_sha = ops["remote_head_sha"](checkout, config["pr_base"])
 
     # A concurrent order merging onto the same base between our pre-merge
     # read and this merge landing would make a version bump built on this
@@ -2522,6 +3026,8 @@ def run_one(
         "reviewer": reviewer,
         "version": {"from": current_version, "to": new_version},
         "later_findings": later_findings,
+        "merge_sha": merge_landing_sha,
+        "version_sha": pushed_sha,
     }
     write_post_merge_state(config["local_root"], task_id, post_merge_state)
     return _finish_after_stage(task_id, project, config, ops, post_merge_state, result)
