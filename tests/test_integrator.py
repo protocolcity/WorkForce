@@ -2608,3 +2608,22 @@ def test_ci_state_from_check_rows_buckets():
     assert f([]) == "pending"
     assert f([{"state": "SUCCESS"}]) == "success"
     assert f([{"state": "IN_PROGRESS"}]) == "pending"
+
+
+def test_seat_in_flight_ignores_job_and_retired_ledgers_with_roster(tmp_path):
+    """The integrator's own ledger is open for the whole pass that asks; jobs
+    and retired identities are not implementation seats."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path, name="tester")])
+    local_root = str(tmp_path / "local")
+    ledger_dir = os.path.join(local_root, "ledger")
+    os.makedirs(ledger_dir, exist_ok=True)
+    now = integrator._utc_iso_z()
+    for name in ("integrator.log", "bp-supervisor.log", "retired-citizen.log"):
+        with open(os.path.join(ledger_dir, name), "w") as fh:
+            fh.write("%s START queue=ready budget_secs=600\n" % now)
+    assert integrator.seat_in_flight(local_root, roster_path=roster_path) is False
+    with open(os.path.join(ledger_dir, "tester.log"), "w") as fh:
+        fh.write("%s START queue=ready budget_secs=600\n" % now)
+    assert integrator.seat_in_flight(local_root, roster_path=roster_path) is True
+    # legacy call without a roster still reads every ledger
+    assert integrator.seat_in_flight(local_root) is True
