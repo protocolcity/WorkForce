@@ -1164,7 +1164,7 @@ def clear_post_merge_state(local_root: str, task_id: str) -> None:
 
 _LEDGER_EVENTS = (
     "DISCOVER", "SUITES", "RECOVER", "STOP", "REVIEW", "FINDINGS", "LATER",
-    "WAIT_CI", "MERGE", "STAGE", "ACTIVATE", "CLOSE", "DRY_RUN", "SKIP",
+    "WAIT_CI", "MERGE", "STAGE", "ACTIVATE", "CLOSE", "PRUNE", "DRY_RUN", "SKIP",
 )
 
 
@@ -1803,6 +1803,11 @@ def _finish_after_stage(
     if later_findings:
         append_ledger_row(config["local_root"], project, "LATER", ticket=task_id, count=len(later_findings))
     append_ledger_row(config["local_root"], project, "CLOSE", ticket=task_id)
+    worker = result.get("worker")
+    if worker:
+        from .prune import prune_after_close
+
+        result["prune"] = prune_after_close(config, worker, task_id)
     clear_recovery_state(config["local_root"], task_id)
     clear_post_merge_state(config["local_root"], task_id)
     result["outcome"] = "closed"
