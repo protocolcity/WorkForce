@@ -705,20 +705,44 @@ def strip_test_hunks_from_diff(diff_text: str) -> str:
     return "".join(kept)
 
 
+def suite_result_summary(rc: Optional[int], output: str) -> str:
+    """One-line-plus-tail summary of a suite run for the reviewer prompt.
+
+    A correction-round reviewer that only sees the delta diff has no way to
+    know the suites passed in the same pass, so it can raise a "cannot pass
+    the suites" finding that flatly contradicts a green run (wf-269). Stating
+    the result here removes that guesswork.
+    """
+    if rc is None:
+        return "Suites in this pass: not run."
+    if rc == 0:
+        return "Suites in this pass: green (rc 0)."
+    excerpt = (output or "").strip()
+    if len(excerpt) > 2000:
+        excerpt = excerpt[-2000:]
+    return "Suites in this pass: red (rc %d) — tail:\n%s" % (rc, excerpt or "(no output)")
+
+
 def build_reviewer_prompt(
     order: Dict[str, Any],
     diff: str,
     *,
     max_findings: int = _DEFAULT_MAX_FINDINGS_PER_ROUND,
     previous_findings: Optional[Sequence[str]] = None,
+    branch_diff: Optional[str] = None,
+    suite_rc: Optional[int] = None,
+    suite_output: str = "",
 ) -> str:
     """Deterministic reviewer prompt: scope from the order, diff minus tests.
 
     Round one (``previous_findings`` empty) reviews the whole PR diff.
     A correction round (``previous_findings`` non-empty) reviews only the
     delta *diff* since the prior review's commit, plus the prior findings
-    list, and asks whether each is closed and whether the correction
-    introduced a new defect — never a re-audit of the whole change.
+    list, plus the *full* branch diff against the PR base as read-only
+    context and the suite result of the same pass — a previous finding
+    fixed by an earlier commit on the same branch (outside the correction
+    delta) must close instead of being reported open again (wf-269;
+    wf-272).
     """
     scoped_diff = strip_test_hunks_from_diff(diff)
     cap_line = (
@@ -739,9 +763,12 @@ def build_reviewer_prompt(
         )
         lines.extend([
             "",
-            "Only the correction diff since the prior review is included below — not the "
-            "whole PR. For each finding above, judge whether it is now closed, and whether "
-            "the correction introduced a new defect. Do not re-audit code outside this diff.",
+            "The correction diff since the prior review is included below, followed by "
+            "the full branch diff against the PR base as read-only context. Mark a "
+            "finding above closed if the branch as a whole addresses it, even if the fix "
+            "landed in an earlier commit outside the correction diff. Report only defects "
+            "introduced by the correction diff; do not re-audit the branch context.",
+            suite_result_summary(suite_rc, suite_output),
             cap_line,
             "",
             "Respond with a single JSON object: "
@@ -751,6 +778,9 @@ def build_reviewer_prompt(
             "",
             "--- correction diff (tests excluded) ---",
             scoped_diff or "(no non-test changes)",
+            "",
+            "--- full branch diff vs PR base, read-only context (tests excluded) ---",
+            strip_test_hunks_from_diff(branch_diff or "") or "(no non-test changes)",
         ])
         return "\n".join(lines)
 
@@ -2163,9 +2193,13 @@ def run_one(
                 diff = ops["diff_text"](checkout, config["pr_base"])
                 prompt = build_reviewer_prompt(order, diff, max_findings=max_findings)
             else:
+                branch_diff = ops["diff_text"](checkout, config["pr_base"])
                 prompt = build_reviewer_prompt(
                     order, diff, max_findings=max_findings,
                     previous_findings=last_review.get("findings"),
+                    branch_diff=branch_diff,
+                    suite_rc=suite["rc"],
+                    suite_output=suite["output"],
                 )
         else:
             diff = ops["diff_text"](checkout, config["pr_base"])
