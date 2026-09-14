@@ -83,9 +83,50 @@ def test_hire_workdir_help_says_project_folder(capsys):
     assert "cabinet" not in help_text
 
 
-# --- doctor subcommand ---
+# --- integrate subcommand (wf-270: --clear-recovery must reach the module
+# entry point exactly like `python -m workforce.integrator`) ---
 
 import json  # noqa: E402
+from workforce import integrator as integrator_mod  # noqa: E402
+
+
+def test_integrate_clear_recovery_requires_cleared_by_and_reason(capsys):
+    rc = cli.main(["integrate", "--config", "/nonexistent.json", "--clear-recovery", "wf-1"])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "--clear-recovery requires --cleared-by and --reason" in captured.err
+
+
+def test_integrate_clear_recovery_forwards_to_integrator(tmp_path, capsys):
+    roster_path = tmp_path / "roster.json"
+    roster_path.write_text(json.dumps({"workers": []}))
+    cfg_raw = dict(
+        local_root=str(tmp_path / "local"),
+        roster_path=str(roster_path),
+        project="workforce",
+        test_cmd=["/bin/sh", "-c", "exit 0"],
+        pr_base="main",
+        version_bump="patch",
+        version_file="VERSION.json",
+        stage_cmd=["/bin/sh", "-c", "exit 0"],
+        activate_cmd=["/bin/sh", "-c", "exit 0"],
+        main_checkout=str(tmp_path / "main_checkout"),
+    )
+    (tmp_path / "main_checkout").mkdir(exist_ok=True)
+    cfg_path = tmp_path / "integration_config.json"
+    cfg_path.write_text(json.dumps(cfg_raw))
+    integrator_mod.write_recovery_state(cfg_raw["local_root"], "wf-1", {"rounds_used": 2})
+
+    rc = cli.main([
+        "integrate", "--config", str(cfg_path), "--clear-recovery", "wf-1",
+        "--cleared-by", "you", "--reason", "seat fixed by hand",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "cleared recovery state for wf-1" in captured.out
+    state = integrator_mod.read_recovery_state(cfg_raw["local_root"], "wf-1")
+    assert state["rounds_used"] == 0
+    assert state["cleared_by"] == "you"
 
 
 def test_papers_rel_for_section_52():

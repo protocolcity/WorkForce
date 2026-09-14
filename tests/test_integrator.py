@@ -476,6 +476,16 @@ class FakeOps:
         self._record("release_seat")
         return {"ok": True}
 
+    def park_seat(self, task_id):
+        self._record("park_seat")
+        return {"ok": True}
+
+    def stop_seat(self, task_id, reason):
+        self._record("stop_seat")
+        self._record("post_comment")
+        self._record("park_seat")
+        return {"ok": True}
+
     def close_order(self, task_id, evidence):
         self._record("close_order")
         self.close_evidence = evidence
@@ -507,6 +517,8 @@ class FakeOps:
             "capture_screenshots": self.capture_screenshots,
             "post_comment": self.post_comment,
             "release_seat": self.release_seat,
+            "park_seat": self.park_seat,
+            "stop_seat": self.stop_seat,
             "close_order": self.close_order,
         }
 
@@ -2456,13 +2468,21 @@ def test_run_one_stops_with_checkout_missing_when_suites_cannot_start(tmp_path, 
     roster_path = write_roster(tmp_path, [w])
     cfg = make_config(tmp_path, roster_path)
     posted = []
+    parked = []
     def run_suites(checkout):
         raise FileNotFoundError(checkout)
-    ops = {"run_suites": run_suites, "post_comment": lambda tid, body: posted.append((tid, body))}
+    def stop_seat(tid, reason):
+        posted.append((tid, integrator.stopped_comment_body(
+            reason, config_path=cfg["config_path"], task_id=tid,
+        )))
+        parked.append(tid)
+        return {"ok": True}
+    ops = {"run_suites": run_suites, "post_comment": lambda tid, body: posted.append((tid, body)), "stop_seat": stop_seat}
     order = {"task_id": "wf-9", "worker": "tester", "provider": "claude", "title": "t", "checkout_override": None}
     result = integrator.run_one(order, cfg, ops)
     assert result["outcome"] == "checkout_missing"
     assert posted and posted[0][0] == "wf-9"
+    assert parked == ["wf-9"]
 
 
 def test_test_only_correction_delta_falls_back_to_full_review():

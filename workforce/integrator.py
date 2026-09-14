@@ -194,6 +194,7 @@ def load_config(path: str) -> Dict[str, Any]:
     )
 
     return {
+        "config_path": str(raw_path),
         "local_root": local_root,
         "roster_path": roster_path,
         "project": project,
@@ -590,6 +591,27 @@ def decide_after_findings(
         "reason": "%d unresolved finding(s); recovery round %d/%d"
         % (len(findings), recovery_rounds_used + 1, max_recovery_rounds),
     }
+
+
+# Provider-planted identity scratch (seat_templates.py plants these into a
+# dispatched checkout for cursor-agent/grok CLI to read their own MCP/config
+# from <cwd>). exclude_from_git() (task_runner.py) is meant to keep git from
+# seeing them, but engine-mediated recovery can run a provider's own dispatch
+# path before that plant happens; treating them as always-untracked here is
+# the belt to that exclude's suspenders so a leftover scratch dir never reads
+# as "checkout is not clean" (wf-270).
+_PROVIDER_SCRATCH_DIRS = (".cursor/", ".grok/")
+
+
+def _strip_provider_scratch(porcelain_output: str) -> str:
+    """*porcelain_output* (``git status --porcelain``) minus provider scratch lines."""
+    kept = []
+    for line in porcelain_output.splitlines():
+        path = line[3:] if len(line) > 3 else ""
+        if any(path.startswith(d) for d in _PROVIDER_SCRATCH_DIRS):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
 
 
 def decide_merge_ready(
@@ -1014,11 +1036,13 @@ def later_findings_comment_body(later: Sequence[str]) -> str:
     return "\n".join(lines)
 
 
-def stopped_comment_body(reason: str) -> str:
+def stopped_comment_body(reason: str, *, config_path: str, task_id: str) -> str:
+    """The Blocked: comment a stop posts — names the exact clear command (wf-270)."""
     return (
         "Blocked: integrator stopped this order — %s\n"
-        "Next step: a person clears this before further automated attempts."
-        % reason
+        "Next step: workforce integrate --config %s "
+        "--clear-recovery %s --cleared-by <who> --reason \"<why>\""
+        % (reason, config_path, task_id)
     )
 
 
@@ -1425,7 +1449,7 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
 
     def checkout_clean(checkout: str) -> bool:
         r = _run(["git", "status", "--porcelain"], cwd=checkout)
-        return r["rc"] == 0 and not r["output"].strip()
+        return r["rc"] == 0 and not _strip_provider_scratch(r["output"]).strip()
 
     def diff_text(checkout: str, base: str) -> str:
         r = _run(["git", "diff", "%s...HEAD" % base], cwd=checkout)
@@ -1691,6 +1715,36 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
         # Blocked:-headed comments already move the ticket to backlog.
         return post_comment(task_id, "Blocked: %s" % reason)
 
+    def park_seat(task_id: str) -> Dict[str, Any]:
+        """Set the order's status back to ``in_review`` directly.
+
+        A Blocked:-headed comment auto-transitions a ticket to backlog
+        (PROTOCOL.md §5 comment lifecycle); a stopped order must stay parked
+        so the next scheduled pass discovers it without a hand, and a fresh
+        seat shift is never dispatched over the stopped order's branch
+        (wf-270).
+        """
+        import urllib.parse
+        dry, hermetic = hermetic_dry_run(False)
+        if dry:
+            return {"ok": True, "dry_run": True, "hermetic": hermetic}
+        q = urllib.parse.urlencode({"product": config["project"]})
+        url = "%s/api/admin/tasks/%s?%s" % (
+            desk, urllib.parse.quote(task_id, safe=""), q,
+        )
+        return _req("PATCH", url, {"status": "in_review", "author": "integrator"})
+
+    def stop_seat(task_id: str, reason: str) -> Dict[str, Any]:
+        """Post the Blocked stop comment, then re-park the order in_review."""
+        comment = post_comment(
+            task_id,
+            stopped_comment_body(
+                reason, config_path=config.get("config_path", ""), task_id=task_id,
+            ),
+        )
+        park_seat(task_id)
+        return comment
+
     def close_order(task_id: str, evidence: Dict[str, str]) -> Dict[str, Any]:
         return post_comment(task_id, build_close_body(evidence))
 
@@ -1719,6 +1773,8 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
         "capture_screenshots": capture_screenshots,
         "post_comment": post_comment,
         "release_seat": release_seat,
+        "park_seat": park_seat,
+        "stop_seat": stop_seat,
         "close_order": close_order,
     }
 
@@ -1786,10 +1842,15 @@ def _finish_after_stage(
             "Blocked: installed build does not report the bumped version\n"
             "Expected: %s\n"
             "Observed: %s\n"
-            "Next step: a person clears this before further automated attempts."
-            % (new_version, verified.get("observed") or "(unknown)")
+            "Next step: workforce integrate --config %s "
+            "--clear-recovery %s --cleared-by <who> --reason \"<why>\""
+            % (
+                new_version, verified.get("observed") or "(unknown)",
+                config.get("config_path", ""), task_id,
+            )
         )
         ops["post_comment"](task_id, body)
+        ops["park_seat"](task_id)
         append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason="install not verified")
         result["outcome"] = "install_not_verified"
         result["reason"] = "installed build does not report version %s" % new_version
@@ -1881,7 +1942,7 @@ def run_one(
         # says (pc-1487 rehearsal): stop this order with a durable comment
         # instead of letting the whole pass die.
         reason = "checkout missing: %s (seat Workdir: line or checkout_templates needed)" % checkout
-        ops["post_comment"](task_id, stopped_comment_body(reason))
+        ops["stop_seat"](task_id, reason)
         append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
         result["outcome"] = "checkout_missing"
         result["reason"] = reason
@@ -1892,7 +1953,7 @@ def run_one(
     result["suites"] = {"rc": suite["rc"]}
 
     if decision["action"] == "stop":
-        ops["release_seat"](task_id, stopped_comment_body(decision["reason"]))
+        ops["stop_seat"](task_id, decision["reason"])
         append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=decision["reason"])
         result["outcome"] = "stopped"
         result["reason"] = decision["reason"]
@@ -1976,7 +2037,7 @@ def run_one(
 
     if review.get("empty"):
         reason = review.get("output") or "reviewer output was empty after DONE"
-        ops["post_comment"](task_id, stopped_comment_body(reason))
+        ops["stop_seat"](task_id, reason)
         append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
         result["outcome"] = "review_empty"
         result["reason"] = reason
@@ -1988,7 +2049,7 @@ def run_one(
         # contains is leftover from an earlier, unrelated dispatch and must
         # never be parsed as this dispatch's findings or merged on.
         reason = review.get("output") or "reviewer output was unchanged after DONE (stale)"
-        ops["post_comment"](task_id, stopped_comment_body(reason))
+        ops["stop_seat"](task_id, reason)
         append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
         result["outcome"] = "review_stale"
         result["reason"] = reason
@@ -2021,7 +2082,7 @@ def run_one(
         if later_findings:
             ops["post_comment"](task_id, later_findings_comment_body(later_findings))
         if findings_decision["action"] == "stop":
-            ops["release_seat"](task_id, stopped_comment_body(findings_decision["reason"]))
+            ops["stop_seat"](task_id, findings_decision["reason"])
             append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=findings_decision["reason"])
             result["outcome"] = "stopped"
         else:
@@ -2060,7 +2121,7 @@ def run_one(
     pre_merge_sha = ops["remote_head_sha"](checkout, config["pr_base"])
     if not pre_merge_sha:
         reason = "could not read origin/%s before merge; not bumping" % config["pr_base"]
-        ops["post_comment"](task_id, stopped_comment_body(reason))
+        ops["stop_seat"](task_id, reason)
         append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
         result["outcome"] = "main_unverified"
         result["reason"] = reason
@@ -2070,7 +2131,7 @@ def run_one(
     merge = ops["merge_pr"](checkout, pr.get("number"))
     if merge.get("rc") != 0:
         reason = "merge_pr failed (rc=%s)" % merge.get("rc")
-        ops["post_comment"](task_id, stopped_comment_body(reason))
+        ops["stop_seat"](task_id, reason)
         append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
         result["outcome"] = "merge_failed"
         result["reason"] = reason
@@ -2085,7 +2146,7 @@ def run_one(
     merge_parent_sha = ops["merge_commit_parent_sha"](checkout, config["pr_base"])
     if not merge_parent_sha:
         reason = "could not read merge commit parent for origin/%s after merge; not bumping" % config["pr_base"]
-        ops["post_comment"](task_id, stopped_comment_body(reason))
+        ops["stop_seat"](task_id, reason)
         append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
         result["outcome"] = "main_unverified"
         result["reason"] = reason
@@ -2093,7 +2154,7 @@ def run_one(
         return result
     if pre_merge_sha != merge_parent_sha:
         reason = "origin/%s moved during merge; not bumping" % config["pr_base"]
-        ops["post_comment"](task_id, stopped_comment_body(reason))
+        ops["stop_seat"](task_id, reason)
         append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
         result["outcome"] = "main_moved"
         result["reason"] = reason
@@ -2106,7 +2167,7 @@ def run_one(
     sync = ops["sync_main_checkout"](main_checkout, config["pr_base"])
     if not sync.get("sha"):
         reason = "could not sync main_checkout to origin/%s; not bumping" % config["pr_base"]
-        ops["post_comment"](task_id, stopped_comment_body(reason))
+        ops["stop_seat"](task_id, reason)
         append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
         result["outcome"] = "main_unverified"
         result["reason"] = reason
@@ -2120,7 +2181,7 @@ def run_one(
     push = ops["commit_and_push_version"](main_checkout, config["pr_base"], new_version)
     if push.get("rc") != 0:
         reason = "version bump commit/push to origin/%s failed (rc=%s)" % (config["pr_base"], push.get("rc"))
-        ops["post_comment"](task_id, stopped_comment_body(reason))
+        ops["stop_seat"](task_id, reason)
         append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
         result["outcome"] = "main_unverified"
         result["reason"] = reason
@@ -2135,7 +2196,7 @@ def run_one(
     post_push_sha = ops["remote_head_sha"](main_checkout, config["pr_base"])
     if not pushed_sha or not post_push_sha or pushed_sha != post_push_sha:
         reason = "origin/%s moved during the version bump push; not staging" % config["pr_base"]
-        ops["post_comment"](task_id, stopped_comment_body(reason))
+        ops["stop_seat"](task_id, reason)
         append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
         result["outcome"] = "main_moved"
         result["reason"] = reason
