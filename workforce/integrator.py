@@ -1195,7 +1195,8 @@ def clear_post_merge_state(local_root: str, task_id: str) -> None:
 
 _LEDGER_EVENTS = (
     "DISCOVER", "SUITES", "RECOVER", "STOP", "REVIEW", "FINDINGS", "LATER",
-    "WAIT_CI", "MERGE", "STAGE", "ACTIVATE", "CLOSE", "PRUNE", "DRY_RUN", "SKIP",
+    "WAIT_CI", "MERGE", "MERGE_BASE", "STAGE", "ACTIVATE", "CLOSE", "PRUNE",
+    "DRY_RUN", "SKIP",
 )
 
 
@@ -1477,6 +1478,36 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
     def push_branch(checkout: str, branch: str) -> Dict[str, Any]:
         return _run(["git", "push", "-u", "origin", "HEAD:%s" % branch], cwd=checkout)
 
+    def merge_base_into_branch(checkout: str, branch: str, base: str) -> Dict[str, Any]:
+        """Merge ``origin/<base>`` into *branch* before suites (wf-274).
+
+        No rebase, no force: a clean merge commits as "Merge <base> into
+        <branch> (integrator)" and is pushed with the branch; a conflicting
+        merge aborts cleanly and reports the conflicting paths, leaving the
+        seat's own commits untouched.
+        """
+        fetch = _run(["git", "fetch", "origin"], cwd=checkout)
+        if fetch["rc"] != 0:
+            return {"ok": False, "conflict": False, "sha": "", "output": fetch["output"]}
+        pre_sha = _run(["git", "rev-parse", "HEAD"], cwd=checkout)
+        merge = _run(
+            ["git", "merge", "--no-ff", "origin/%s" % base,
+             "-m", "Merge %s into %s (integrator)" % (base, branch)],
+            cwd=checkout,
+        )
+        if merge["rc"] != 0:
+            unmerged = _run(["git", "diff", "--name-only", "--diff-filter=U"], cwd=checkout)
+            paths = [p for p in unmerged["output"].splitlines() if p.strip()]
+            _run(["git", "merge", "--abort"], cwd=checkout)
+            return {"ok": False, "conflict": True, "paths": paths, "output": merge["output"]}
+        post_sha = _run(["git", "rev-parse", "HEAD"], cwd=checkout)
+        new_sha = post_sha["output"].strip() if post_sha["rc"] == 0 else ""
+        if new_sha and new_sha != pre_sha["output"].strip():
+            push = _run(["git", "push", "origin", "HEAD:%s" % branch], cwd=checkout)
+            if push["rc"] != 0:
+                return {"ok": False, "conflict": False, "sha": new_sha, "output": push["output"]}
+        return {"ok": True, "conflict": False, "sha": new_sha, "output": merge["output"]}
+
     def open_or_update_pr(checkout: str, branch: str, base: str, title: str, body: str) -> Dict[str, Any]:
         view = _run(["gh", "pr", "view", branch, "--json", "number,url"], cwd=checkout)
         if view["rc"] == 0:
@@ -1720,6 +1751,7 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
 
     return {
         "run_suites": run_suites,
+        "merge_base_into_branch": merge_base_into_branch,
         "checkout_clean": checkout_clean,
         "diff_text": diff_text,
         "checkout_head_sha": checkout_head_sha,
@@ -1904,7 +1936,8 @@ def run_one(
     append_ledger_row(config["local_root"], project, "DISCOVER", ticket=task_id, worker=order["worker"])
 
     try:
-        suite = ops["run_suites"](checkout)
+        merge_base = ops["merge_base_into_branch"](checkout, branch, config["pr_base"])
+        suite = ops["run_suites"](checkout) if not merge_base.get("conflict") else None
     except FileNotFoundError:
         # The seat's checkout is not where the template or its Workdir line
         # says (pc-1487 rehearsal): stop this order with a durable comment
@@ -1916,6 +1949,27 @@ def run_one(
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
         return result
+
+    append_ledger_row(
+        config["local_root"], project, "MERGE_BASE", ticket=task_id,
+        conflict=bool(merge_base.get("conflict")),
+    )
+    if merge_base.get("conflict"):
+        paths = merge_base.get("paths") or []
+        result["conflict_paths"] = paths
+        reason = "merge conflict merging %s into %s (paths: %s)" % (
+            config["pr_base"], branch, ", ".join(paths) if paths else "unknown",
+        )
+        ops["release_seat"](task_id, reason)
+        dispatch_seat_recovery(reason)
+        next_state = _carry_recovery_state(state, rounds_used + 1)
+        write_recovery_state(config["local_root"], task_id, next_state)
+        append_ledger_row(config["local_root"], project, "RECOVER", ticket=task_id, reason=reason)
+        result["outcome"] = "merge_base_conflict"
+        result["reason"] = reason
+        write_receipt(config["local_root"], project, result)
+        return result
+
     append_ledger_row(config["local_root"], project, "SUITES", ticket=task_id, rc=suite["rc"])
     decision = decide_after_suites(suite["rc"], rounds_used, config["max_recovery_rounds"])
     result["suites"] = {"rc": suite["rc"]}
