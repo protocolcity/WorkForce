@@ -664,6 +664,14 @@ def main(argv=None) -> int:
             engine_workers = set(er.workers)
             er_path = er.path or ""
             print("Engine roster: %s (%d workers)" % (er_path, len(engine_workers)))
+            # wf-264 — a row the loader refused is invisible to dispatch, the
+            # daemon and the desk; say so instead of letting it vanish.
+            for s_name, s_reason in sorted(getattr(er, "skipped", {}).items()):
+                faults.append(
+                    "ROSTER: worker %r skipped at load — %s (invisible to "
+                    "dispatch and the desk until the row is fixed)"
+                    % (s_name, s_reason)
+                )
             for w_name, w in er.workers.items():
                 if w.kind == "lane" and not w.queue_url:
                     faults.append(

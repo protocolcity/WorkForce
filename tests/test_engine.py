@@ -993,6 +993,20 @@ def test_preflight_resolves_relative_and_absolute_script_paths(tmp_path):
         )
 
 
+def test_missing_workdir_fails_closed_with_ledger_error(tmp_path):
+    """wf-269: a stale/misconfigured roster workdir must not raise a bare
+    OSError past dispatch()'s own error handling. os.statvfs on a missing
+    workdir (the observed bp-supervisor agent-exit shape) has to surface as
+    an ERROR row in the worker's own ledger, not an opaque exception that
+    only the caller's generic except-clause ever sees."""
+    w = make_worker(tmp_path, workdir=str(tmp_path / "does-not-exist"))
+    assert engine.dispatch(w, local(tmp_path)) == 1
+    text = ledger_text(tmp_path)
+    assert "ERROR" in text
+    assert "workdir unreadable" in text
+    assert "START" not in text
+
+
 def test_roster_isolates_duplicate_identity(tmp_path, caplog):
     """Second worker with duplicate identity is skipped; first survives."""
     import logging
@@ -2677,3 +2691,41 @@ def test_pre_park_terminal_wait_is_capped_by_linger_grace(monkeypatch, tmp_path)
     src = inspect.getsource(eng._run_pass)
     assert "terminal_seen_at" in src
     assert "pending >= worker.linger_grace_secs" in src
+
+
+def test_roster_null_completion_fields_load_as_unset(tmp_path, caplog):
+    """wf-264 — hire --regenerate once wrote continuation_attempts: null; a
+    null for any wf-262 completion field means unset, not a dropped seat."""
+    import logging
+    row = {"workdir": ".", "contract": "c", "prompt": "p", "identity": "seat-id",
+           "command": ["x"], "continuation_attempts": None,
+           "completion_field": None, "completion_values": None}
+    p = tmp_path / "roster.json"
+    p.write_text(json.dumps({"workers": {"seat": row}}))
+    with caplog.at_level(logging.ERROR, logger="workforce.roster"):
+        r = load(str(p))
+    assert "seat" in r.workers
+    assert r.workers["seat"].continuation_attempts == 0
+    assert r.workers["seat"].completion_field == ""
+    assert r.workers["seat"].completion_values == []
+    assert r.skipped == {}
+
+
+def test_roster_skipped_row_stays_visible(tmp_path, caplog):
+    """wf-264 — a refused row is recorded on the Roster and named by the
+    'no worker' refusal instead of silently vanishing."""
+    import logging
+    good = {"workdir": ".", "contract": "c", "prompt": "p", "identity": "good-id",
+            "command": ["x"]}
+    bad = {"workdir": ".", "contract": "c", "prompt": "p", "identity": "bad-id",
+           "command": ["x"], "continuation_attempts": -1}
+    p = tmp_path / "roster.json"
+    p.write_text(json.dumps({"workers": {"good": good, "bad": bad}}))
+    with caplog.at_level(logging.ERROR, logger="workforce.roster"):
+        r = load(str(p))
+    assert "bad" not in r.workers
+    assert "bad" in r.skipped and ">= 0" in r.skipped["bad"]
+    with pytest.raises(RosterError, match="skipped at load"):
+        r.worker("bad")
+    with pytest.raises(RosterError, match="no worker 'nope'"):
+        r.worker("nope")

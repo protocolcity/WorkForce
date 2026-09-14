@@ -966,8 +966,13 @@ def _json_findings_array(body: str) -> Optional[List[str]]:
     start = body.find("{")
     if start < 0:
         return None
+    # raw_decode: the object is usually inside a ```json fence and followed
+    # by the closing fence or a closing remark. json.loads would refuse the
+    # trailing text and the whole reply would count as one finding, which
+    # turned every cursor-reviewer verdict, clean ones included, into a
+    # recovery round (pc-1496 / wf-269, 2026-09-14).
     try:
-        data = json.loads(body[start:])
+        data, _end = json.JSONDecoder().raw_decode(body[start:])
     except (ValueError, TypeError):
         return None
     if not isinstance(data, dict):

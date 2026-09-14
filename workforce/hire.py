@@ -1057,6 +1057,32 @@ def generate_seat_folder(
     runner_path = os.path.join(seat_dir, "runner.json")
     launch_path = os.path.join(seat_dir, "launch.py")
     repository = os.path.abspath(repository)
+    # wf-264 — expected_remote is the authorized push destination task_runner
+    # checks the checkout's origin against. A --regenerate without --remote
+    # must keep the prior runner's value, and an omitted remote for a
+    # repository that has an origin resolves to that origin rather than an
+    # empty string that refuses every dispatch.
+    remote_source = "argument" if remote else ""
+    if not remote and regenerate and os.path.isfile(runner_path):
+        try:
+            with open(runner_path, "r", encoding="utf-8") as fh:
+                prior_runner = json.load(fh)
+        except (OSError, ValueError):
+            prior_runner = {}
+        if isinstance(prior_runner, dict) and (prior_runner.get("expected_remote") or ""):
+            remote = str(prior_runner["expected_remote"])
+            remote_source = "prior runner.json"
+    if not remote:
+        try:
+            origin = subprocess.run(
+                ["git", "-C", repository, "remote", "get-url", "origin"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, ValueError):
+            origin = None
+        if origin is not None and origin.returncode == 0 and origin.stdout.strip():
+            remote = origin.stdout.strip()
+            remote_source = "repository origin"
     authority_chain = list(authority_chain or _default_authority_chain(
         workspace=workspace, repository=repository, contract_path=contract_path,
     ))
@@ -1128,6 +1154,8 @@ def generate_seat_folder(
         "armed": not dry_run,
         "dry_run": dry_run,
         "regenerated": exists and regenerate,
+        "expected_remote": remote,
+        "remote_source": remote_source,
         "seat_dir": seat_dir,
         "files": {name: os.path.join(seat_dir, name) for name in files},
         "file_bodies": files,

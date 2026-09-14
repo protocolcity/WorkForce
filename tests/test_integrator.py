@@ -2475,3 +2475,23 @@ def test_test_only_correction_delta_falls_back_to_full_review():
     assert "not strip_test_hunks_from_diff(diff).strip()" in src
     diff = "diff --git a/tests/test_x.py b/tests/test_x.py\n--- a/tests/test_x.py\n+++ b/tests/test_x.py\n@@ -1 +1,2 @@\n+def test_y(): pass\n"
     assert not I.strip_test_hunks_from_diff(diff).strip()
+
+
+def test_parse_reviewer_findings_fenced_json_after_prose_empty_is_clean():
+    """A reviewer that writes a line of prose, then a ```json fence holding
+    {"findings": []}, then a closing remark, is a clean verdict."""
+    text = (
+        "Reviewing the correction diff against each prior finding.\n"
+        "```json\n{\"findings\": []}\n```\n"
+        "**No new defect** from the correction itself.\n"
+    )
+    assert integrator.parse_reviewer_findings(text) == []
+
+
+def test_parse_reviewer_findings_fenced_json_after_prose_counts_entries():
+    text = (
+        "Checking how SUITE_URL is used.\n"
+        "```json\n{\"findings\": [\"first defect\", \"second defect\"]}\n```\n"
+        "Finding 4 is closed.\n"
+    )
+    assert integrator.parse_reviewer_findings(text) == ["first defect", "second defect"]
