@@ -1155,7 +1155,9 @@ def test_run_one_new_commit_after_waiting_triggers_a_fresh_delta_review(tmp_path
     assert second["outcome"] == "waiting"
     assert ops.calls.count("run_suites") == 2
     assert ops.calls.count("dispatch_reviewer") == 2
-    assert ops.diff_text_bases[-1] == "sha-x"
+    # the delta review diffs against the last reviewed sha; wf-272 also reads
+    # the whole branch diff (pr_base) for context, so both bases are asked for
+    assert "sha-x" in ops.diff_text_bases[-2:]
     state = integrator.read_recovery_state(cfg["local_root"], "wf-1")
     assert state["suites_ok_sha"] == "sha-y"
     assert state["last_review"] == {"sha": "sha-y", "findings": []}
