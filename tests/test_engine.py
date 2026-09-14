@@ -2774,6 +2774,7 @@ def test_park_seat_order_at_shift_end_parks_and_pushes_unpushed_commits(tmp_path
     _write_pass_receipt(tmp_path, out_path, "workforce", "wf-9")
 
     posts = []
+    patches = []
 
     def fake_http(method, url, body=None, timeout=8.0):
         if method == "GET" and "/wf-9" in url:
@@ -2784,6 +2785,9 @@ def test_park_seat_order_at_shift_end_parks_and_pushes_unpushed_commits(tmp_path
                     "comments": [{"body": "Owner: tester-id", "author": "tester-id"}],
                 },
             }
+        if method == "PATCH" and "/wf-9" in url and "comments" not in url:
+            patches.append(body)
+            return {"ok": True, "task": {"id": "wf-9", "status": "in_review"}}
         if method == "POST" and "comments" in url:
             posts.append(body)
             return {"ok": True, "comment": {"id": 1}}
@@ -2802,6 +2806,8 @@ def test_park_seat_order_at_shift_end_parks_and_pushes_unpushed_commits(tmp_path
 
     assert receipt["action"] == "parked"
     assert receipt["push"].startswith("pushed:")
+    assert len(patches) == 1
+    assert patches[0]["status"] == "in_review"
     assert len(posts) == 1
     assert "Parked: parked by the engine at shift end (seat did not park)" in posts[0]["body"]
     assert posts[0]["author"] == "tester-id"
@@ -2895,6 +2901,99 @@ def test_park_seat_order_at_shift_end_noop_without_task_ref(tmp_path, monkeypatc
     )
     receipt = eng._park_seat_order_at_shift_end(w, str(tmp_path), str(out_path), None, ledger)
     assert receipt["skipped"] == "no_task_ref"
+
+
+def test_park_seat_order_at_shift_end_patches_status_before_comment(tmp_path, monkeypatch):
+    """A ``Parked:`` heading alone does not move the desk's status — only
+    ``Completed:``/``Blocked:`` auto-transition via the comment lifecycle —
+    so the engine must PATCH status=in_review itself, or the order stays
+    in_progress and invisible to the integrator (wf-273 second review)."""
+    from workforce import engine as eng
+
+    out_path = tmp_path / "tester.out"
+    _write_pass_receipt(tmp_path, out_path, "workforce", "wf-9")
+
+    calls = []
+
+    def fake_http(method, url, body=None, timeout=8.0):
+        calls.append(method)
+        if method == "GET" and "/wf-9" in url:
+            return {
+                "ok": True,
+                "task": {
+                    "id": "wf-9", "status": "in_progress",
+                    "comments": [{"body": "Owner: tester-id", "author": "tester-id"}],
+                },
+            }
+        if method == "PATCH" and "comments" not in url:
+            return {"ok": False, "error": "desk unreachable"}
+        raise AssertionError("must not comment when the status PATCH fails: %s %s" % (method, url))
+
+    monkeypatch.setattr(eng, "_http_json", fake_http)
+    monkeypatch.setenv("WORKFORCE_ALLOW_DESK", "1")
+
+    ledger = eng.Ledger(str(tmp_path / "local" / "ledger"), "tester")
+    w = make_worker(
+        tmp_path,
+        queue_url="http://desk.test/api/admin/tasks/ready?product=workforce&label=worker:tester",
+        identity="tester-id", name="tester",
+    )
+    receipt = eng._park_seat_order_at_shift_end(w, str(tmp_path), str(out_path), None, ledger)
+    assert receipt["action"] == "patch_failed"
+    assert calls == ["GET", "PATCH"]
+    ledger_lines = (tmp_path / "local" / "ledger" / "tester.log").read_text()
+    assert "engine-park-at-shift-end patch" in ledger_lines
+
+
+def test_park_seat_order_at_shift_end_covers_every_order_this_shift_prepared(tmp_path, monkeypatch):
+    """A multi-pass shift can claim more than one order; an earlier pass that
+    itself failed to park must not be left uncovered just because a later
+    pass's receipt is the last one in the shift's output (wf-273 second
+    review)."""
+    from workforce import engine as eng
+
+    out_path = tmp_path / "tester.out"
+    receipt_a = tmp_path / "receipt-a.json"
+    receipt_a.write_text(json.dumps({"project": "workforce", "task_id": "wf-1"}))
+    receipt_b = tmp_path / "receipt-b.json"
+    receipt_b.write_text(json.dumps({"project": "workforce", "task_id": "wf-2"}))
+    out_path.write_text(
+        "Prepared wf-1; not yet claimed. Receipt: %s\n"
+        "Prepared wf-2; not yet claimed. Receipt: %s\n" % (receipt_a, receipt_b),
+    )
+
+    seen_tasks = []
+
+    def fake_http(method, url, body=None, timeout=8.0):
+        if method == "GET":
+            task_id = "wf-1" if "/wf-1" in url else "wf-2"
+            return {
+                "ok": True,
+                "task": {
+                    "id": task_id, "status": "in_progress",
+                    "comments": [{"body": "Owner: tester-id", "author": "tester-id"}],
+                },
+            }
+        if method == "PATCH" and "comments" not in url:
+            return {"ok": True, "task": {"status": "in_review"}}
+        if method == "POST" and "comments" in url:
+            seen_tasks.append("/wf-1" in url and "wf-1" or "wf-2")
+            return {"ok": True, "comment": {"id": 1}}
+        raise AssertionError("unexpected %s %s" % (method, url))
+
+    monkeypatch.setattr(eng, "_http_json", fake_http)
+    monkeypatch.setenv("WORKFORCE_ALLOW_DESK", "1")
+
+    ledger = eng.Ledger(str(tmp_path / "local" / "ledger"), "tester")
+    w = make_worker(
+        tmp_path,
+        queue_url="http://desk.test/api/admin/tasks/ready?product=workforce&label=worker:tester",
+        identity="tester-id", name="tester",
+    )
+    receipt = eng._park_seat_order_at_shift_end(w, str(tmp_path), str(out_path), None, ledger)
+    assert receipt["action"] == "parked"
+    assert {r["task_id"] for r in receipt["results"]} == {"wf-1", "wf-2"}
+    assert sorted(seen_tasks) == ["wf-1", "wf-2"]
 
 
 def test_dispatch_calls_park_seat_order_at_shift_end_on_successful_stop(tmp_path, monkeypatch):
