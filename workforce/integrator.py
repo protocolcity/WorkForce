@@ -1164,6 +1164,29 @@ def build_close_body(evidence: Dict[str, str]) -> str:
     )
 
 
+def close_evidence_links(merge_sha: str, version_sha: str, pr_url: str = "") -> str:
+    """Links line for §5 close-out — cites landing SHAs the desk accepts (wf-277)."""
+    parts = []
+    if merge_sha:
+        parts.append("%s (merge)" % merge_sha)
+    if version_sha:
+        parts.append("%s (version)" % version_sha)
+    if pr_url:
+        parts.append(pr_url)
+    return ", ".join(parts) if parts else ""
+
+
+def build_integrator_claim_body() -> str:
+    """Signed Owner marker before integrator §5 close (wl_claim parity, wf-277)."""
+    return (
+        "Owner: integrator\n"
+        "Start: %s\n"
+        "Plan:\n"
+        "- close merged order"
+        % _utc_iso_z()
+    )
+
+
 # --------------------------------------------------------------------------
 # Recovery-round state (per task id, durable across passes)
 # --------------------------------------------------------------------------
@@ -2162,7 +2185,137 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
         return comment
 
     def close_order(task_id: str, evidence: Dict[str, str]) -> Dict[str, Any]:
-        return post_comment(task_id, build_close_body(evidence))
+        """Claim as integrator, post §5 close-out, confirm desk status is done.
+
+        Mirrors ``wl_claim`` + ``wl_close`` + explicit ``status=done``:
+        Owner marker (not PATCH alone), §5 body signed as integrator (not
+        routed through ``post_comment``), then PATCH done before confirm.
+        Callers must treat ``ok`` and ``status`` before pruning or clearing
+        local post-merge state (wf-277).
+        """
+        import urllib.parse
+        from .engine import _fetch_task
+
+        integrator_author = "integrator"
+        dry, hermetic = hermetic_dry_run(False)
+        if dry:
+            return {
+                "ok": True, "dry_run": True, "hermetic": hermetic,
+                "status": "done",
+            }
+
+        q = urllib.parse.urlencode({"product": config["project"]})
+        task_url = "%s/api/admin/tasks/%s?%s" % (
+            desk, urllib.parse.quote(task_id, safe=""), q,
+        )
+        comments_url = "%s/api/admin/tasks/%s/comments?%s" % (
+            desk, urllib.parse.quote(task_id, safe=""), q,
+        )
+
+        def desk_comment(body: str) -> Dict[str, Any]:
+            return _req(
+                "POST", comments_url,
+                {"body": body, "author": integrator_author},
+            )
+
+        def desk_patch_status(status: str) -> Dict[str, Any]:
+            return _req(
+                "PATCH", task_url,
+                {"status": status, "author": integrator_author},
+            )
+
+        task = _fetch_task(desk, config["project"], task_id)
+        if not task:
+            return {
+                "ok": False,
+                "step": "fetch",
+                "error": "task not found",
+            }
+
+        status = str(task.get("status") or "")
+        if status == "done":
+            # Idempotent: a recovery retry after a successful desk close must
+            # still prune and clear local post-merge state (wf-277).
+            return {
+                "ok": True,
+                "status": "done",
+                "already_done": True,
+            }
+        if status == "canceled":
+            return {
+                "ok": False,
+                "step": "claim",
+                "status": status,
+                "error": "task already %s" % status,
+            }
+
+        # wl_claim parity: promote in_review/backlog → in_progress; already
+        # in_progress is an idempotent re-claim (Owner marker only).
+        if status in ("in_review", "backlog"):
+            promote = desk_patch_status("in_progress")
+            if promote.get("ok") is False:
+                task = _fetch_task(desk, config["project"], task_id) or task
+                status = str(task.get("status") or "")
+                if status != "in_progress":
+                    return {
+                        "ok": False,
+                        "step": "claim",
+                        "error": promote.get("error") or "claim failed",
+                        "desk": promote,
+                    }
+        elif status != "in_progress":
+            return {
+                "ok": False,
+                "step": "claim",
+                "status": status,
+                "error": "cannot close from status %r" % (status or "(unknown)",),
+            }
+
+        claim_comment = desk_comment(build_integrator_claim_body())
+        if claim_comment.get("ok") is False or claim_comment.get("error"):
+            return {
+                "ok": False,
+                "step": "claim",
+                "error": claim_comment.get("error") or "integrator claim marker rejected",
+                "desk": claim_comment,
+            }
+
+        body = build_close_body(evidence)
+        close_comment = desk_comment(body)
+        if close_comment.get("ok") is False or close_comment.get("error"):
+            return {
+                "ok": False,
+                "step": "close_comment",
+                "error": close_comment.get("error") or "close comment rejected",
+                "desk": close_comment,
+            }
+
+        done_patch = desk_patch_status("done")
+        if done_patch.get("ok") is False or done_patch.get("error"):
+            return {
+                "ok": False,
+                "step": "set_done",
+                "error": done_patch.get("error") or "status=done patch rejected",
+                "desk": done_patch,
+            }
+
+        task = _fetch_task(desk, config["project"], task_id)
+        status = str((task or {}).get("status") or "")
+        if status != "done":
+            return {
+                "ok": False,
+                "step": "confirm_done",
+                "status": status,
+                "error": "desk status is %r after close (want done)" % (status or "(unknown)",),
+                "desk": done_patch,
+            }
+        return {
+            "ok": True,
+            "status": "done",
+            "claim": claim_comment,
+            "comment": close_comment,
+            "done": done_patch,
+        }
 
     return {
         "run_suites": run_suites,
@@ -2239,13 +2392,31 @@ def _close_merged_order(
         "completed": "Merged PR %s and released version %s." % (pr.get("url") or pr.get("number"), new_version),
         "verification": "Suites green; reviewer (%s) reported no findings; CI green; installed version verified=%s."
         % (reviewer, verified.get("ok")),
-        "links": pr.get("url") or "",
+        "links": close_evidence_links(
+            post_merge.get("merge_sha") or "",
+            post_merge.get("version_sha") or "",
+            pr.get("url") or "",
+        ),
         "follow_ups": "; ".join(later_findings) if later_findings else "none",
     }
-    ops["close_order"](task_id, evidence)
+    close = ops["close_order"](task_id, evidence)
+    result["close"] = close
+    confirmed_status = close.get("status") or ""
+    if close.get("ok") is not True or confirmed_status != "done":
+        ops["park_seat"](task_id)
+        append_ledger_row(
+            config["local_root"], project, "CLOSE", ticket=task_id,
+            status=confirmed_status or "failed",
+            error=close.get("error") or "close not confirmed",
+        )
+        result["outcome"] = "close_failed"
+        result["reason"] = close.get("error") or "desk did not confirm done"
+        write_receipt(config["local_root"], project, result)
+        return result
+
     if later_findings:
         append_ledger_row(config["local_root"], project, "LATER", ticket=task_id, count=len(later_findings))
-    append_ledger_row(config["local_root"], project, "CLOSE", ticket=task_id)
+    append_ledger_row(config["local_root"], project, "CLOSE", ticket=task_id, status="done")
     worker = result.get("worker")
     if worker:
         from .prune import prune_after_close
@@ -2872,6 +3043,7 @@ def run_one(
         write_receipt(config["local_root"], project, result)
         return result
     append_ledger_row(config["local_root"], project, "MERGE", ticket=task_id, pr=pr.get("number"))
+    merge_landing_sha = ops["remote_head_sha"](checkout, config["pr_base"])
 
     # A concurrent order merging onto the same base between our pre-merge
     # read and this merge landing would make a version bump built on this
@@ -2904,6 +3076,9 @@ def run_one(
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
         return result
+    # Landed merge commit on origin/main (from synced host checkout, not the
+    # seat checkout tip which may lag or include unrelated local state).
+    merge_landing_sha = sync.get("sha") or merge_landing_sha
 
     current_version = ops["read_version"](main_checkout)
     new_version = bump_version(current_version, config["version_bump"])
@@ -2946,6 +3121,8 @@ def run_one(
         "reviewer": reviewer,
         "version": {"from": current_version, "to": new_version},
         "later_findings": later_findings,
+        "merge_sha": merge_landing_sha,
+        "version_sha": pushed_sha,
     }
     write_post_merge_state(config["local_root"], task_id, post_merge_state)
     return _finish_after_stage(task_id, project, config, ops, post_merge_state, result)
