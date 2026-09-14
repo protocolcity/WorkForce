@@ -2233,7 +2233,15 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
             }
 
         status = str(task.get("status") or "")
-        if status in ("done", "canceled"):
+        if status == "done":
+            # Idempotent: a recovery retry after a successful desk close must
+            # still prune and clear local post-merge state (wf-277).
+            return {
+                "ok": True,
+                "status": "done",
+                "already_done": True,
+            }
+        if status == "canceled":
             return {
                 "ok": False,
                 "step": "claim",
