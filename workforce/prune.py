@@ -410,6 +410,8 @@ def apply_prune(
                 receipt["removed"].append({"kind": "checkout", "path": path, "dry_run": True})
                 continue
             if not os.path.isdir(path):
+                # Worktree already gone (manual remove or a prior partial run).
+                checkout_cleared = True
                 continue
             out = ops["remove_worktree"](path)
             if out.get("rc") == 0:
