@@ -2515,3 +2515,92 @@ def test_parse_reviewer_findings_fenced_json_after_prose_counts_entries():
         "Finding 4 is closed.\n"
     )
     assert integrator.parse_reviewer_findings(text) == ["first defect", "second defect"]
+
+
+# --------------------------------------------------------------------------
+# wf-270 recovery round 4 — reviewer findings
+# --------------------------------------------------------------------------
+
+
+def test_strip_provider_scratch_handles_quoted_and_bare_directory_entries():
+    """git quotes porcelain paths with special characters in double quotes,
+    and reports some untracked directories as a bare entry with no trailing
+    slash; both forms must still be recognised as provider scratch, not read
+    as "checkout is not clean" (finding 3)."""
+    porcelain = "\n".join([
+        "?? .cursor",
+        '?? ".cursor/config.json"',
+        "?? .grok/",
+        "?? real_file.py",
+    ])
+    assert integrator._strip_provider_scratch(porcelain) == "?? real_file.py"
+
+
+def test_default_ops_stop_seat_escalates_when_repark_patch_fails(tmp_path, monkeypatch):
+    """A failed re-park PATCH after the stop comment must not silently read as
+    a clean STOP — stop_seat posts an escalation comment and logs a distinct
+    PARK_FAILED ledger row instead of leaving the order invisible in backlog
+    (finding 1)."""
+    from workforce import capacity as capacity_mod
+
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    local_root = str(tmp_path / "local")
+    cfg = base_config(tmp_path, roster_path, local_root=local_root)
+
+    calls = []
+
+    def fake_req(method, url, body=None, timeout=20.0):
+        calls.append((method, body))
+        if method == "PATCH":
+            return {"ok": False, "error": "desk unreachable"}
+        return {"ok": True}
+
+    monkeypatch.setenv("WORKFORCE_ALLOW_DESK", "1")
+    monkeypatch.setattr(capacity_mod, "_req", fake_req)
+    ops = integrator.default_ops(cfg)
+
+    result = ops["stop_seat"]("wf-1", "suites failed")
+    assert result["park"]["ok"] is False
+
+    patches = [c for c in calls if c[0] == "PATCH"]
+    posts = [c for c in calls if c[0] == "POST"]
+    assert len(patches) == 1
+    assert len(posts) == 2
+    assert "re-park to in_review failed" in posts[-1][1]["body"]
+
+    ledger_path = os.path.join(local_root, "ledger", "integrator-workforce.log")
+    with open(ledger_path, encoding="utf-8") as fh:
+        ledger_text = fh.read()
+    assert "PARK_FAILED" in ledger_text
+    assert "wf-1" in ledger_text
+
+
+def test_clear_recovery_round_state_reparks_when_park_seat_given(tmp_path):
+    """--clear-recovery must not only reset local recovery JSON — it must
+    also re-park the order to in_review, or a ticket already fallen to
+    backlog (pre-fix stop or a failed park_seat) stays invisible to
+    discover_candidates even after a human runs the posted clear command
+    (finding 2)."""
+    local_root = str(tmp_path / "local")
+    integrator.write_recovery_state(local_root, "wf-1", {"rounds_used": 2})
+
+    parked = []
+
+    def fake_park_seat(task_id):
+        parked.append(task_id)
+        return {"ok": True, "task": {"id": task_id, "status": "in_review"}}
+
+    state = integrator.clear_recovery_round_state(
+        local_root, "wf-1", "you", "seat fixed by hand", park_seat=fake_park_seat,
+    )
+    assert parked == ["wf-1"]
+    assert state["park"]["ok"] is True
+    assert state["rounds_used"] == 0
+
+
+def test_clear_recovery_round_state_without_park_seat_has_no_park_key(tmp_path):
+    """Backward compatible: omitting park_seat (existing direct callers)
+    leaves the returned state exactly as before."""
+    local_root = str(tmp_path / "local")
+    state = integrator.clear_recovery_round_state(local_root, "wf-1", "you", "first clear")
+    assert "park" not in state

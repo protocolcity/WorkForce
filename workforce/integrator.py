@@ -608,7 +608,15 @@ def _strip_provider_scratch(porcelain_output: str) -> str:
     kept = []
     for line in porcelain_output.splitlines():
         path = line[3:] if len(line) > 3 else ""
-        if any(path.startswith(d) for d in _PROVIDER_SCRATCH_DIRS):
+        # git quotes paths containing spaces/special chars in double quotes
+        # (C-style); strip them so a quoted ".cursor/..." still matches.
+        if len(path) >= 2 and path[0] == '"' and path[-1] == '"':
+            path = path[1:-1]
+        bare = path.rstrip("/")
+        if any(
+            path.startswith(d) or bare == d.rstrip("/")
+            for d in _PROVIDER_SCRATCH_DIRS
+        ):
             continue
         kept.append(line)
     return "\n".join(kept)
@@ -1104,6 +1112,7 @@ def clear_recovery_state(local_root: str, task_id: str) -> None:
 
 def clear_recovery_round_state(
     local_root: str, task_id: str, cleared_by: str, reason: str,
+    *, park_seat: Optional[Callable[[str], Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """A person clearing an order stuck at ``max_recovery_rounds``.
 
@@ -1116,6 +1125,13 @@ def clear_recovery_round_state(
     the stuck round count, not about forgetting capped follow-ups or the
     review scope, and a close right after a clear must still show the real
     follow_ups (wf-268 second-pass finding 2).
+
+    *park_seat*, when given, re-parks the order to ``in_review`` after the
+    local state is cleared, under key ``"park"`` on the returned state —
+    clearing local JSON alone leaves an order that fell to ``backlog``
+    (a pre-fix stop or a failed re-park) invisible to
+    :func:`discover_candidates` even after this clear (wf-270 recovery
+    round 4, finding 2).
     """
     previous = read_recovery_state(local_root, task_id) or {}
     state: Dict[str, Any] = {
@@ -1128,6 +1144,8 @@ def clear_recovery_round_state(
         if key in previous:
             state[key] = previous[key]
     write_recovery_state(local_root, task_id, state)
+    if park_seat is not None:
+        state["park"] = park_seat(task_id)
     return state
 
 
@@ -1194,6 +1212,7 @@ def clear_post_merge_state(local_root: str, task_id: str) -> None:
 _LEDGER_EVENTS = (
     "DISCOVER", "SUITES", "RECOVER", "STOP", "REVIEW", "FINDINGS", "LATER",
     "WAIT_CI", "MERGE", "STAGE", "ACTIVATE", "CLOSE", "PRUNE", "DRY_RUN", "SKIP",
+    "PARK_FAILED",
 )
 
 
@@ -1742,7 +1761,26 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
                 reason, config_path=config.get("config_path", ""), task_id=task_id,
             ),
         )
-        park_seat(task_id)
+        park_result = park_seat(task_id)
+        if park_result.get("ok") is False:
+            # A stop comment already moved the ticket to backlog (PROTOCOL.md
+            # §5 comment lifecycle); a failed re-park PATCH leaves it there
+            # with nothing surfacing the failure, silently recreating the
+            # exact hole wf-270 exists to close. Escalate with a second
+            # comment and a distinct ledger event instead of letting the
+            # caller record a plain STOP as if the order stayed parked.
+            post_comment(
+                task_id,
+                "Blocked: automatic re-park to in_review failed (%s) after "
+                "the stop above; this order is exposed in backlog and a "
+                "person must re-park it to in_review by hand."
+                % (park_result.get("error") or "unknown error"),
+            )
+            append_ledger_row(
+                config["local_root"], config["project"], "PARK_FAILED",
+                ticket=task_id, error=park_result.get("error") or "unknown error",
+            )
+        comment["park"] = park_result
         return comment
 
     def close_order(task_id: str, evidence: Dict[str, str]) -> Dict[str, Any]:
@@ -1850,7 +1888,22 @@ def _finish_after_stage(
             )
         )
         ops["post_comment"](task_id, body)
-        ops["park_seat"](task_id)
+        park_result = ops["park_seat"](task_id)
+        if park_result.get("ok") is False:
+            # Same failure class as stop_seat's re-park (wf-270 recovery
+            # round 4, finding 1): a failed PATCH must not read as a
+            # successful STOP, or the order sits invisible in backlog.
+            ops["post_comment"](
+                task_id,
+                "Blocked: automatic re-park to in_review failed (%s) after "
+                "the stop above; this order is exposed in backlog and a "
+                "person must re-park it to in_review by hand."
+                % (park_result.get("error") or "unknown error"),
+            )
+            append_ledger_row(
+                config["local_root"], project, "PARK_FAILED",
+                ticket=task_id, error=park_result.get("error") or "unknown error",
+            )
         append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason="install not verified")
         result["outcome"] = "install_not_verified"
         result["reason"] = "installed build does not report version %s" % new_version
@@ -2270,11 +2323,24 @@ def main(argv=None) -> int:
             return 1
         try:
             config = load_config(args.config)
-            clear_recovery_round_state(config["local_root"], args.clear_recovery, args.cleared_by, args.reason)
+            ops = default_ops(config)
+            state = clear_recovery_round_state(
+                config["local_root"], args.clear_recovery, args.cleared_by, args.reason,
+                park_seat=ops["park_seat"],
+            )
         except IntegratorError as exc:
             print("Integrator clear-recovery failed: %s" % exc, file=sys.stderr)
             return 1
-        print("Cleared recovery state for %s (by %s)." % (args.clear_recovery, args.cleared_by))
+        park_result = state.get("park") or {}
+        if park_result.get("ok") is False:
+            print(
+                "Integrator clear-recovery: cleared recovery state for %s but "
+                "failed to re-park in_review: %s"
+                % (args.clear_recovery, park_result.get("error") or "unknown error"),
+                file=sys.stderr,
+            )
+            return 1
+        print("Cleared recovery state for %s (by %s) and re-parked in_review." % (args.clear_recovery, args.cleared_by))
         return 0
 
     try:

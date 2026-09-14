@@ -1188,13 +1188,24 @@ def main(argv=None) -> int:
                 return 1
             try:
                 cfg = integrator_mod.load_config(args.config)
-                integrator_mod.clear_recovery_round_state(
+                ops = integrator_mod.default_ops(cfg)
+                state = integrator_mod.clear_recovery_round_state(
                     cfg["local_root"], args.clear_recovery, args.cleared_by, args.reason,
+                    park_seat=ops["park_seat"],
                 )
             except integrator_mod.IntegratorError as exc:
                 print("integrate: clear-recovery failed: %s" % exc, file=sys.stderr)
                 return 1
-            print("integrate: cleared recovery state for %s (by %s)." % (args.clear_recovery, args.cleared_by))
+            park_result = state.get("park") or {}
+            if park_result.get("ok") is False:
+                print(
+                    "integrate: cleared recovery state for %s but failed to "
+                    "re-park in_review: %s"
+                    % (args.clear_recovery, park_result.get("error") or "unknown error"),
+                    file=sys.stderr,
+                )
+                return 1
+            print("integrate: cleared recovery state for %s (by %s) and re-parked in_review." % (args.clear_recovery, args.cleared_by))
             return 0
         try:
             cfg = integrator_mod.load_config(args.config)
