@@ -12,7 +12,7 @@ SUITE_URL = (os.environ.get("SUITE_URL") or "http://127.0.0.1:8801").rstrip("/")
 
 
 def _map_roster_url() -> str:
-    return SUITE_URL + "/roster"
+    return (os.environ.get("SUITE_URL") or SUITE_URL).rstrip("/") + "/roster"
 
 
 def _html_escape_requested() -> bool:
