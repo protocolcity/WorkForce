@@ -1787,9 +1787,17 @@ def _is_terminal_result(worker: Worker, obj: Optional[dict]) -> bool:
     ``type == "end"`` or ``type == "result"`` wrapper (covers both a normal
     end_turn NDJSON tail and grok's ``--output-format json`` shape), or —
     for a worker that opted into wf-262 stop-reason verification — its own
-    ``completion_field`` resolving to one of ``completion_values``. A worker
-    that never opts in and whose output carries no recognizable ``type`` is
-    never treated as terminal by this check alone.
+    ``completion_field`` resolving to *any* string value, not only one of
+    ``completion_values`` (wf-266 second review — grok's real cancelled turn
+    is a bare ``{"stopReason": "cancelled", ...}`` with no ``type`` field at
+    all; requiring membership in ``completion_values`` here would leave that
+    genuinely terminal denial unrecognized and never armed for linger, so a
+    hang after it would still ride to a bare budget kill instead of the
+    ``denied: cancelled`` classification dispatch runs once the linger
+    exits). Whether the resolved value actually counts as *complete* is
+    ``_classify_completion``'s job, run on exit, not this arming check's. A
+    worker that never opts in and whose output carries no recognizable
+    ``type`` is never treated as terminal by this check alone.
     """
     if not isinstance(obj, dict):
         return False
@@ -1800,7 +1808,7 @@ def _is_terminal_result(worker: Worker, obj: Optional[dict]) -> bool:
             value = _dig(obj, worker.completion_field)
         except KeyError:
             return False
-        return isinstance(value, str) and value in worker.completion_values
+        return isinstance(value, str) and bool(value)
     return False
 
 
@@ -1823,6 +1831,11 @@ def _run_pass(
     desk = desk_origin_from_queue_url(worker.queue_url or "")
     task_ref: Optional[Tuple[str, str]] = None
     linger_since: Optional[float] = None
+    # wf-266 second review — a terminal result already on disk, before the
+    # desk has confirmed the order left in_progress (a slow park/release),
+    # still means the provider's own work is done; budget expiry in that
+    # window must not fall through to the bare "killed at budget" ERROR.
+    terminal_result_seen = False
     while True:
         remain = deadline - time.monotonic()
         if linger_since is not None:
@@ -1838,6 +1851,8 @@ def _run_pass(
         else:
             if remain <= 0:
                 _terminate_process_group(proc)
+                if terminal_result_seen:
+                    return None, "provider lingered after result"
                 return None, None
             wait_for = min(_LINGER_POLL_SECS, remain)
         try:
@@ -1851,6 +1866,7 @@ def _run_pass(
             if task_ref is not None and _is_terminal_result(
                 worker, _pass_result_json(out_path, pass_offset),
             ):
+                terminal_result_seen = True
                 project, task_id = task_ref
                 if not _task_still_in_progress(desk, project, task_id):
                     linger_since = time.monotonic()
@@ -2256,12 +2272,21 @@ def dispatch(
                     # classification the normal rc==0 path uses, so a Grok
                     # pass that printed stopReason cancelled before parking
                     # still records the real denial instead of a false DONE.
-                    configured, _complete, stop_value = _classify_completion(
+                    configured, complete, stop_value = _classify_completion(
                         worker, out_path, pass_offset,
                     )
-                    if configured and stop_value == "cancelled":
-                        ledger.append("ERROR", reason="denied: cancelled",
-                                      on_pass=passes + 1, **recovery_kv)
+                    if configured and not complete:
+                        # wf-266 second review — any configured-and-incomplete
+                        # outcome is terminal, exactly as the rc==0 path
+                        # treats it, not only the "cancelled" denial: a
+                        # linger is never allowed to paper over an
+                        # unrecognized/incomplete stop value as DONE.
+                        if stop_value == "cancelled":
+                            ledger.append("ERROR", reason="denied: cancelled",
+                                          on_pass=passes + 1, **recovery_kv)
+                        else:
+                            ledger.append("ERROR", reason="incomplete: " + stop_value,
+                                          on_pass=passes + 1, **recovery_kv)
                         return 1
                     ledger.append("DONE", reason=linger_reason, rc=0, on_pass=passes + 1,
                                   secs=int(time.monotonic() - pass_t0), **recovery_kv)
