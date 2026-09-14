@@ -351,9 +351,18 @@ class FakeOps:
             "diff_text_val", "diff --git a/src/x.py b/src/x.py\n+1\n",
         )
         self.diff_text_bases = []
+        self.merge_base_conflict = overrides.get("merge_base_conflict", False)
+        self.merge_base_conflict_paths = overrides.get("merge_base_conflict_paths", ["src/x.py"])
+        self.merge_base_sha = overrides.get("merge_base_sha", "")
 
     def _record(self, name, *a, **kw):
         self.calls.append(name)
+
+    def merge_base_into_branch(self, checkout, branch, base):
+        self._record("merge_base_into_branch")
+        if self.merge_base_conflict:
+            return {"ok": False, "conflict": True, "paths": self.merge_base_conflict_paths, "output": ""}
+        return {"ok": True, "conflict": False, "sha": self.merge_base_sha, "output": ""}
 
     def run_suites(self, checkout):
         self._record("run_suites")
@@ -484,6 +493,7 @@ class FakeOps:
     def as_dict(self):
         return {
             "run_suites": self.run_suites,
+            "merge_base_into_branch": self.merge_base_into_branch,
             "checkout_clean": self.checkout_clean_fn,
             "diff_text": self.diff_text,
             "checkout_head_sha": self.checkout_head_sha,
@@ -568,6 +578,30 @@ def test_run_one_suite_failure_stops_after_recovery_rounds_exhausted(tmp_path):
     result = integrator.run_one(make_order(), cfg, ops.as_dict())
     assert result["outcome"] == "stopped"
     assert "merge_pr" not in ops.calls
+
+
+def test_run_one_merges_base_before_suites(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, merge_base_sha="sha-merged")
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "closed"
+    assert ops.calls.index("merge_base_into_branch") < ops.calls.index("run_suites")
+
+
+def test_run_one_merge_base_conflict_dispatches_recovery_without_running_suites(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, merge_base_conflict=True, merge_base_conflict_paths=["src/x.py", "src/y.py"])
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "merge_base_conflict"
+    assert result["conflict_paths"] == ["src/x.py", "src/y.py"]
+    assert "run_suites" not in ops.calls
+    assert "merge_pr" not in ops.calls
+    assert len(ops.recovery_calls) == 1
+    assert "src/x.py" in ops.recovery_calls[0][2]
+    state = integrator.read_recovery_state(cfg["local_root"], "wf-1")
+    assert state["rounds_used"] == 1
 
 
 def test_run_one_findings_recover_without_merging(tmp_path):
@@ -2458,7 +2492,11 @@ def test_run_one_stops_with_checkout_missing_when_suites_cannot_start(tmp_path, 
     posted = []
     def run_suites(checkout):
         raise FileNotFoundError(checkout)
-    ops = {"run_suites": run_suites, "post_comment": lambda tid, body: posted.append((tid, body))}
+    ops = {
+        "run_suites": run_suites,
+        "merge_base_into_branch": lambda checkout, branch, base: {"ok": True, "conflict": False, "sha": ""},
+        "post_comment": lambda tid, body: posted.append((tid, body)),
+    }
     order = {"task_id": "wf-9", "worker": "tester", "provider": "claude", "title": "t", "checkout_override": None}
     result = integrator.run_one(order, cfg, ops)
     assert result["outcome"] == "checkout_missing"
