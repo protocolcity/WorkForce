@@ -711,13 +711,12 @@ def _one_shot_board(local_root):
     return httpd, port, t
 
 
-def test_non_api_get_points_at_map_not_api_only_escape(tmp_path):
+def test_non_api_get_points_at_map_not_api_only_escape(tmp_path, monkeypatch):
     """GET / is gone — one line at Map; no WORKFORCE_API_ONLY=0 hint."""
     import urllib.error
     import urllib.request
 
-    from workforce.board.paths import SUITE_URL
-
+    monkeypatch.setenv("SUITE_URL", "http://127.0.0.1:8801")
     local = _html_retired_setup(tmp_path)
     httpd, port, t = _one_shot_board(local)
     try:
@@ -737,7 +736,7 @@ def test_non_api_get_points_at_map_not_api_only_escape(tmp_path):
         t.join(timeout=3)
 
     assert code == 410
-    assert "%s/roster" % SUITE_URL in body
+    assert "8801/roster" in body
     assert "WORKFORCE_API_ONLY=0" not in body
     assert "legacy board" not in body.lower()
 
@@ -775,9 +774,8 @@ def test_api_only_zero_does_not_serve_html(tmp_path, monkeypatch, capsys):
     import urllib.error
     import urllib.request
 
-    from workforce.board.paths import SUITE_URL
-
     monkeypatch.setenv("WORKFORCE_API_ONLY", "0")
+    monkeypatch.setenv("SUITE_URL", "http://127.0.0.1:8801")
     local = _html_retired_setup(tmp_path)
     httpd, port, t = _one_shot_board(local)
     err = capsys.readouterr().err
@@ -800,7 +798,7 @@ def test_api_only_zero_does_not_serve_html(tmp_path, monkeypatch, capsys):
     assert "WORKFORCE_API_ONLY=0 is not supported" in err
     assert "/roster" in err
     assert code == 410
-    assert "%s/roster" % SUITE_URL in body
+    assert "8801/roster" in body
     assert "legacy board" not in body.lower()
 
 
