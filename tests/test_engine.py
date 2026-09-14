@@ -628,6 +628,271 @@ def test_budget_kill_is_infra_error(tmp_path):
     assert "killed at budget" in ledger_text(tmp_path)
 
 
+def _fake_provider_argv(receipt_path):
+    """A task_runner-shaped provider: prints the receipt line + a terminal
+    JSON result, then hangs (wf-266 — cursor-agent observed doing exactly
+    this after its own turn actually finished)."""
+    script = (
+        "import sys, time\n"
+        "print('Prepared wf-1; not yet claimed. Receipt: %s'); sys.stdout.flush()\n"
+        "print('{\"type\": \"result\", \"done\": true}'); sys.stdout.flush()\n"
+        "time.sleep(30)\n"
+    ) % receipt_path
+    return [sys.executable, "-c", script]
+
+
+def test_provider_lingering_after_parked_result_ends_as_done(tmp_path, monkeypatch):
+    """wf-266: a provider that prints its terminal result then keeps running,
+    once WorkLane shows its order left in_progress, ends the shift as DONE
+    with the linger reason (not a budget-kill ERROR), well inside the grace
+    period, and releases the lock."""
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text(json.dumps({"project": "workforce", "task_id": "wf-1"}))
+    w = make_worker(
+        tmp_path,
+        command=_fake_provider_argv(receipt),
+        queue_url="http://desk.test/api/admin/tasks/ready?product=workforce&label=worker:tester",
+        budget_secs=20,
+        linger_grace_secs=1,
+    )
+    monkeypatch.setattr(engine, "_LINGER_POLL_SECS", 0.2)
+    monkeypatch.setattr(engine, "_http_get_json", lambda *a, **k: {"count": 1})
+
+    def fake_http(method, url, body=None, timeout=8.0):
+        assert method == "GET" and "/wf-1" in url
+        return {"ok": True, "task": {"id": "wf-1", "status": "in_review"}}
+
+    monkeypatch.setattr(engine, "_http_json", fake_http)
+
+    t0 = time.monotonic()
+    assert engine.dispatch(w, local(tmp_path)) == 0
+    elapsed = time.monotonic() - t0
+    assert elapsed < 10  # well within budget_secs=20; grace is 1s
+    text = ledger_text(tmp_path)
+    assert "DONE" in text and "provider lingered after result" in text
+    assert "killed at budget" not in text
+    assert not (tmp_path / "local" / "locks" / "tester.lock").exists()
+
+
+def test_provider_that_never_prints_a_result_keeps_budget_kill(tmp_path, monkeypatch):
+    """wf-266: without a receipt/result to confirm ownership left this
+    identity, the existing budget-kill ERROR is unchanged — the desk is
+    never even contacted."""
+    w = make_worker(
+        tmp_path,
+        command=["/bin/sh", "-c", "sleep 30"],
+        queue_url="http://desk.test/api/admin/tasks/ready?product=workforce&label=worker:tester",
+        budget_secs=1,
+        linger_grace_secs=1,
+    )
+    monkeypatch.setattr(engine, "_LINGER_POLL_SECS", 0.2)
+    monkeypatch.setattr(engine, "_http_get_json", lambda *a, **k: {"count": 1})
+
+    def boom(*a, **k):
+        raise AssertionError("desk must not be contacted without a task reference")
+
+    monkeypatch.setattr(engine, "_http_json", boom)
+    assert engine.dispatch(w, local(tmp_path)) == 1
+    assert "killed at budget" in ledger_text(tmp_path)
+
+
+def test_linger_armed_before_budget_still_ends_as_done(tmp_path, monkeypatch):
+    """wf-266 review finding 1: once the linger is armed, a budget that
+    expires before the (longer) linger grace elapses must still end the
+    pass with the linger reason, not fall through to "killed at budget"."""
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text(json.dumps({"project": "workforce", "task_id": "wf-1"}))
+    w = make_worker(
+        tmp_path,
+        command=_fake_provider_argv(receipt),
+        queue_url="http://desk.test/api/admin/tasks/ready?product=workforce&label=worker:tester",
+        budget_secs=1,
+        linger_grace_secs=30,
+    )
+    monkeypatch.setattr(engine, "_LINGER_POLL_SECS", 0.2)
+    monkeypatch.setattr(engine, "_http_get_json", lambda *a, **k: {"count": 1})
+
+    def fake_http(method, url, body=None, timeout=8.0):
+        return {"ok": True, "task": {"id": "wf-1", "status": "in_review"}}
+
+    monkeypatch.setattr(engine, "_http_json", fake_http)
+    assert engine.dispatch(w, local(tmp_path)) == 0
+    text = ledger_text(tmp_path)
+    assert "DONE" in text and "provider lingered after result" in text
+    assert "killed at budget" not in text
+
+
+def _fake_intermediate_argv(receipt_path):
+    """Prints the receipt then a non-terminal NDJSON diagnostic object
+    (no ``type: end/result``), then hangs — never emits a real terminal
+    result."""
+    script = (
+        "import sys, time\n"
+        "print('Prepared wf-1; not yet claimed. Receipt: %s'); sys.stdout.flush()\n"
+        "print('{\"type\": \"tool_use\", \"name\": \"bash\"}'); sys.stdout.flush()\n"
+        "time.sleep(30)\n"
+    ) % receipt_path
+    return [sys.executable, "-c", script]
+
+
+def test_linger_not_armed_on_intermediate_ndjson_object(tmp_path, monkeypatch):
+    """wf-266 review finding 2: the last parsed top-level JSON object alone
+    must not arm the linger — only a verified terminal result (type end/
+    result, or the worker's own completion_field/completion_values) does.
+    An intermediate diagnostic object plus a parked order must not force-end
+    the pass early; the existing budget-kill applies unchanged."""
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text(json.dumps({"project": "workforce", "task_id": "wf-1"}))
+    w = make_worker(
+        tmp_path,
+        command=_fake_intermediate_argv(receipt),
+        queue_url="http://desk.test/api/admin/tasks/ready?product=workforce&label=worker:tester",
+        budget_secs=1,
+        linger_grace_secs=30,
+    )
+    monkeypatch.setattr(engine, "_LINGER_POLL_SECS", 0.2)
+    monkeypatch.setattr(engine, "_http_get_json", lambda *a, **k: {"count": 1})
+    monkeypatch.setattr(
+        engine, "_http_json",
+        lambda *a, **k: {"ok": True, "task": {"id": "wf-1", "status": "in_review"}},
+    )
+    assert engine.dispatch(w, local(tmp_path)) == 1
+    text = ledger_text(tmp_path)
+    assert "killed at budget" in text
+    assert "provider lingered after result" not in text
+
+
+def _fake_cancelled_linger_argv(receipt_path):
+    """Prints the receipt then grok's real pretty-printed cancelled-turn
+    shape — a bare top-level ``{"stopReason": "cancelled", ...}`` with no
+    ``type`` field at all (matches
+    ``test_pass_result_json_pretty_printed_cancelled_still_found``) — then
+    hangs, the shape a Grok pass produces on an internal vendor stop
+    (wf-262)."""
+    script = (
+        "import sys, time\n"
+        "print('Prepared wf-1; not yet claimed. Receipt: %s'); sys.stdout.flush()\n"
+        "print('{\\n  \"stopReason\": \"cancelled\",\\n  \"sessionId\": \"sid-1\"\\n}');"
+        " sys.stdout.flush()\n"
+        "time.sleep(30)\n"
+    ) % receipt_path
+    return [sys.executable, "-c", script]
+
+
+def test_linger_exit_classifies_cancelled_as_denied_not_done(tmp_path, monkeypatch):
+    """wf-266 second review finding 2: _is_terminal_result must arm the
+    linger for grok's real cancelled shape (no "type" field, just a
+    completion_field value) — not only a synthetic {"type": "end", ...}
+    wrapper — and the linger exit in dispatch must still run
+    _classify_completion, so a lingering Grok pass whose own result carries
+    stopReason=cancelled records the wf-262 ERROR "denied: cancelled", never
+    a false DONE just because the process was confirmed parked."""
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text(json.dumps({"project": "workforce", "task_id": "wf-1"}))
+    w = make_worker(
+        tmp_path,
+        command=_fake_cancelled_linger_argv(receipt),
+        queue_url="http://desk.test/api/admin/tasks/ready?product=workforce&label=worker:tester",
+        budget_secs=20,
+        linger_grace_secs=1,
+        completion_field="stopReason",
+        completion_values=["end_turn"],
+    )
+    monkeypatch.setattr(engine, "_LINGER_POLL_SECS", 0.2)
+    monkeypatch.setattr(engine, "_http_get_json", lambda *a, **k: {"count": 1})
+    monkeypatch.setattr(
+        engine, "_http_json",
+        lambda *a, **k: {"ok": True, "task": {"id": "wf-1", "status": "in_review"}},
+    )
+    assert engine.dispatch(w, local(tmp_path)) == 1
+    text = ledger_text(tmp_path)
+    assert "ERROR" in text and "denied: cancelled" in text
+    assert "DONE" not in text or "provider lingered after result" not in text
+
+
+def _fake_still_running_linger_argv(receipt_path):
+    """Prints the receipt then a wrapper-terminal result whose configured
+    stop value is neither in completion_values nor "cancelled" — e.g. a
+    future/unmapped vendor stop reason — then hangs."""
+    script = (
+        "import sys, time\n"
+        "print('Prepared wf-1; not yet claimed. Receipt: %s'); sys.stdout.flush()\n"
+        "print('{\"type\": \"end\", \"stopReason\": \"still_running\"}'); sys.stdout.flush()\n"
+        "time.sleep(30)\n"
+    ) % receipt_path
+    return [sys.executable, "-c", script]
+
+
+def test_linger_exit_classifies_other_incomplete_as_error_not_done(tmp_path, monkeypatch):
+    """wf-266 second review finding 1: the linger exit must mirror the
+    rc==0 path for *any* configured-and-not-complete outcome, not only
+    "cancelled" — a wrapper-terminal result whose stop value is some other
+    unmapped/incomplete reason must record ERROR "incomplete: <value>",
+    never a DONE just because the process was confirmed parked."""
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text(json.dumps({"project": "workforce", "task_id": "wf-1"}))
+    w = make_worker(
+        tmp_path,
+        command=_fake_still_running_linger_argv(receipt),
+        queue_url="http://desk.test/api/admin/tasks/ready?product=workforce&label=worker:tester",
+        budget_secs=20,
+        linger_grace_secs=1,
+        completion_field="stopReason",
+        completion_values=["end_turn"],
+    )
+    monkeypatch.setattr(engine, "_LINGER_POLL_SECS", 0.2)
+    monkeypatch.setattr(engine, "_http_get_json", lambda *a, **k: {"count": 1})
+    monkeypatch.setattr(
+        engine, "_http_json",
+        lambda *a, **k: {"ok": True, "task": {"id": "wf-1", "status": "in_review"}},
+    )
+    assert engine.dispatch(w, local(tmp_path)) == 1
+    text = ledger_text(tmp_path)
+    assert "ERROR" in text and "incomplete: still_running" in text
+    assert "provider lingered after result" not in text
+
+
+def _fake_slow_park_argv(receipt_path):
+    """Prints the receipt then a terminal result, then hangs; the desk
+    keeps reporting in_progress (a slow park that never confirms before
+    budget expiry)."""
+    script = (
+        "import sys, time\n"
+        "print('Prepared wf-1; not yet claimed. Receipt: %s'); sys.stdout.flush()\n"
+        "print('{\"type\": \"result\", \"done\": true}'); sys.stdout.flush()\n"
+        "time.sleep(30)\n"
+    ) % receipt_path
+    return [sys.executable, "-c", script]
+
+
+def test_budget_expiry_with_terminal_result_pending_park_is_linger_not_kill(
+    tmp_path, monkeypatch,
+):
+    """wf-266 second review finding 3: once a verified terminal result is on
+    disk, budget expiry before the desk confirms the order left in_progress
+    (a slow park) must still end with the linger reason, never the bare
+    "killed at budget" ERROR."""
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text(json.dumps({"project": "workforce", "task_id": "wf-1"}))
+    w = make_worker(
+        tmp_path,
+        command=_fake_slow_park_argv(receipt),
+        queue_url="http://desk.test/api/admin/tasks/ready?product=workforce&label=worker:tester",
+        budget_secs=1,
+        linger_grace_secs=30,
+    )
+    monkeypatch.setattr(engine, "_LINGER_POLL_SECS", 0.2)
+    monkeypatch.setattr(engine, "_http_get_json", lambda *a, **k: {"count": 1})
+    monkeypatch.setattr(
+        engine, "_http_json",
+        lambda *a, **k: {"ok": True, "task": {"id": "wf-1", "status": "in_progress"}},
+    )
+    assert engine.dispatch(w, local(tmp_path)) == 0
+    text = ledger_text(tmp_path)
+    assert "DONE" in text and "provider lingered after result" in text
+    assert "killed at budget" not in text
+
+
 def test_lock_released_after_shift(tmp_path):
     w = make_worker(tmp_path)
     engine.dispatch(w, local(tmp_path))
@@ -2399,3 +2664,14 @@ def test_continuation_attempts_negative_rejected(tmp_path):
         make_worker(
             tmp_path, completion_field="stopReason", continuation_attempts=-1,
         ).validate()
+
+
+def test_pre_park_terminal_wait_is_capped_by_linger_grace(monkeypatch, tmp_path):
+    """wf-266 third pass: a verified terminal result with the desk still in_progress
+    must not hold the shift for the whole remaining budget; the pre-park wait is
+    bounded by linger_grace_secs like the post-park linger."""
+    import inspect
+    from workforce import engine as eng
+    src = inspect.getsource(eng._run_pass)
+    assert "terminal_seen_at" in src
+    assert "pending >= worker.linger_grace_secs" in src
