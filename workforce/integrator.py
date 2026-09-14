@@ -1246,19 +1246,27 @@ def write_receipt(local_root: str, project: str, result: Dict[str, Any]) -> str:
 # --------------------------------------------------------------------------
 
 
-def _any_open_ledger_shift(local_root: str) -> bool:
-    """True when any worker's ledger has a START with no terminal event yet.
+def _any_open_ledger_shift(local_root: str, seats: Optional[Sequence[str]] = None) -> bool:
+    """True when a seat's ledger has a START with no terminal event yet.
 
-    Skips the integrator's own ``integrator-<project>.log`` files — those
-    are this job's receipts, not an implementation seat's shift record.
+    With *seats* given (the roster's implementation lanes) only those ledgers
+    are read: a job's own ledger (the integrator's ``integrator.log`` is
+    open for the whole pass that asks this question, and so are the
+    supervisor's and loop-health's while they run) and retired identities'
+    files must never read as a seat mid-shift, or activation is skipped
+    forever. Without *seats* every ledger except the integrator's per-project
+    receipts is read (legacy behaviour, kept for callers with no roster).
     """
     from . import ledger as ledger_mod
 
     ledger_dir = os.path.join(local_root, "ledger")
     if not os.path.isdir(ledger_dir):
         return False
+    wanted = None if seats is None else {"%s.log" % s for s in seats}
     for name in os.listdir(ledger_dir):
         if not name.endswith(".log") or name.startswith("integrator-"):
+            continue
+        if wanted is not None and name not in wanted:
             continue
         try:
             with open(os.path.join(ledger_dir, name), "r", encoding="utf-8") as fh:
@@ -1271,17 +1279,27 @@ def _any_open_ledger_shift(local_root: str) -> bool:
     return False
 
 
-def seat_in_flight(local_root: str) -> bool:
+def seat_in_flight(local_root: str, roster_path: Optional[str] = None) -> bool:
     """True when any implementation seat holds a live lock or an open shift.
 
     Activation restarts the WorkForce install a live seat is running under;
     this must never fire while a seat is mid-shift, live-locked or not.
+    With *roster_path* the open-shift scan is limited to the roster's lanes
+    (implementation seats); jobs and retired identities are not seats.
     """
     from . import provider_qualification as pq_mod
+    from . import roster as roster_mod
 
     if pq_mod.scan_active_locks(local_root):
         return True
-    return _any_open_ledger_shift(local_root)
+    seats: Optional[List[str]] = None
+    if roster_path:
+        try:
+            rost = roster_mod.load(path=roster_path)
+            seats = [n for n, w in rost.workers.items() if getattr(w, "kind", "lane") == "lane"]
+        except Exception:  # noqa: BLE001 — an unreadable roster must not unblock a restart
+            seats = None
+    return _any_open_ledger_shift(local_root, seats)
 
 
 def _worker_seat_from_labels(labels: Optional[Sequence[Any]]) -> Optional[str]:
@@ -1785,7 +1803,7 @@ def _finish_after_stage(
     result["version"] = {"from": current_version, "to": new_version}
     ctx = {"version": new_version, "checkout": config["main_checkout"]}
 
-    if seat_in_flight(config["local_root"]):
+    if seat_in_flight(config["local_root"], roster_path=config.get("roster_path")):
         append_ledger_row(config["local_root"], project, "SKIP", ticket=task_id, reason="seat_in_flight")
         result["outcome"] = "activate_skipped"
         result["reason"] = "an implementation seat is in flight; retry activation next pass"
