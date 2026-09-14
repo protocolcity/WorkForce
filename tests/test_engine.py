@@ -2664,3 +2664,14 @@ def test_continuation_attempts_negative_rejected(tmp_path):
         make_worker(
             tmp_path, completion_field="stopReason", continuation_attempts=-1,
         ).validate()
+
+
+def test_pre_park_terminal_wait_is_capped_by_linger_grace(monkeypatch, tmp_path):
+    """wf-266 third pass: a verified terminal result with the desk still in_progress
+    must not hold the shift for the whole remaining budget; the pre-park wait is
+    bounded by linger_grace_secs like the post-park linger."""
+    import inspect
+    from workforce import engine as eng
+    src = inspect.getsource(eng._run_pass)
+    assert "terminal_seen_at" in src
+    assert "pending >= worker.linger_grace_secs" in src

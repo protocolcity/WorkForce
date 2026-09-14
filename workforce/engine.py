@@ -1836,6 +1836,7 @@ def _run_pass(
     # still means the provider's own work is done; budget expiry in that
     # window must not fall through to the bare "killed at budget" ERROR.
     terminal_result_seen = False
+    terminal_seen_at = None
     while True:
         remain = deadline - time.monotonic()
         if linger_since is not None:
@@ -1849,6 +1850,14 @@ def _run_pass(
                 return None, "provider lingered after result"
             wait_for = min(_LINGER_POLL_SECS, remain, grace_remain)
         else:
+            # A verified terminal result without a desk park yet: bound the
+            # pre-park wait by the same grace as the post-park linger, not by
+            # the remaining shift budget (wf-266 third-pass finding).
+            if terminal_result_seen and terminal_seen_at is not None:
+                pending = time.monotonic() - terminal_seen_at
+                if pending >= worker.linger_grace_secs:
+                    _terminate_process_group(proc)
+                    return None, "provider lingered after result"
             if remain <= 0:
                 _terminate_process_group(proc)
                 if terminal_result_seen:
@@ -1867,6 +1876,8 @@ def _run_pass(
                 worker, _pass_result_json(out_path, pass_offset),
             ):
                 terminal_result_seen = True
+                if terminal_seen_at is None:
+                    terminal_seen_at = time.monotonic()
                 project, task_id = task_ref
                 if not _task_still_in_progress(desk, project, task_id):
                     linger_since = time.monotonic()
