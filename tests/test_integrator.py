@@ -2604,3 +2604,12 @@ def test_clear_recovery_round_state_without_park_seat_has_no_park_key(tmp_path):
     local_root = str(tmp_path / "local")
     state = integrator.clear_recovery_round_state(local_root, "wf-1", "you", "first clear")
     assert "park" not in state
+def test_ci_state_from_check_rows_buckets():
+    f = integrator.ci_state_from_check_rows
+    assert f([{"bucket": "pass", "state": "SUCCESS"}, {"bucket": "skipping", "state": "SKIPPED"}]) == "success"
+    assert f([{"bucket": "pass", "state": "SUCCESS"}, {"bucket": "pending", "state": "PENDING"}]) == "pending"
+    assert f([{"bucket": "pass", "state": "SUCCESS"}, {"bucket": "fail", "state": "FAILURE"}]) == "failure"
+    assert f([{"bucket": "cancel", "state": "CANCELLED"}]) == "failure"
+    assert f([]) == "pending"
+    assert f([{"state": "SUCCESS"}]) == "success"
+    assert f([{"state": "IN_PROGRESS"}]) == "pending"
