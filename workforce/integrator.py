@@ -53,6 +53,11 @@ _REQUIRED_CONFIG_KEYS = (
 
 _VERSION_BUMP_RULES = ("major", "minor", "patch", "local-suffix")
 
+# "in_pass" (default): activate and verify inline, as every non-daemon
+# project does. "handoff": never restart from inside the pass — write a
+# pending-activation marker instead (wf-276; see the marker helpers below).
+_ACTIVATION_MODES = ("in_pass", "handoff")
+
 # Providers stay replaceable: which reviewer covers which implementation
 # provider is data, not a hard-coded branch per vendor name.
 DEFAULT_REVIEWER_BY_PROVIDER = {
@@ -193,6 +198,12 @@ def load_config(path: str) -> Dict[str, Any]:
         local_root, "COORDINATOR.lock"
     )
 
+    activation_mode = raw.get("activation_mode", "in_pass")
+    if activation_mode not in _ACTIVATION_MODES:
+        raise IntegratorError(
+            "activation_mode must be one of %s" % "/".join(_ACTIVATION_MODES)
+        )
+
     return {
         "config_path": str(raw_path),
         "local_root": local_root,
@@ -228,6 +239,7 @@ def load_config(path: str) -> Dict[str, Any]:
             raw.get("coordinator_lock_ttl_secs"), "coordinator_lock_ttl_secs",
             _DEFAULT_COORDINATOR_LOCK_TTL_SECS,
         ),
+        "activation_mode": activation_mode,
         "checkout_template": raw.get("checkout_template", _DEFAULT_CHECKOUT_TEMPLATE),
         "checkout_templates": dict(raw.get("checkout_templates") or {}),
         "branch_template": raw.get("branch_template", _DEFAULT_BRANCH_TEMPLATE),
@@ -1191,6 +1203,11 @@ def clear_recovery_state(local_root: str, task_id: str) -> None:
         os.remove(path)
     except OSError:
         pass
+    # A stuck handoff order reset here must not leave a pending-activation
+    # marker behind: the external activator reads that marker outside any
+    # pass and would restart the daemon for an order that was just reset or
+    # abandoned (wf-276 finding 3).
+    clear_pending_activation(local_root, task_id)
 
 
 def clear_recovery_round_state(
@@ -1227,6 +1244,10 @@ def clear_recovery_round_state(
         if key in previous:
             state[key] = previous[key]
     write_recovery_state(local_root, task_id, state)
+    # Same reasoning as clear_recovery_state (wf-276 finding 3): a stuck
+    # handoff order cleared by a person must not leave a pending-activation
+    # marker for the external activator to act on outside this pass.
+    clear_pending_activation(local_root, task_id)
     if park_seat is not None:
         state["park"] = park_seat(task_id)
     return state
@@ -1286,6 +1307,82 @@ def clear_post_merge_state(local_root: str, task_id: str) -> None:
         os.remove(path)
     except OSError:
         pass
+
+
+# --------------------------------------------------------------------------
+# Pending-activation handoff (per task id, durable across passes) — wf-276
+# --------------------------------------------------------------------------
+#
+# A daemon project's own release restarts the process the integrator pass
+# is running under, so activating from inside the pass kills the pass
+# before the ACTIVATE row, the installed-version verify, and the close are
+# written. In ``activation_mode: "handoff"`` the pass never restarts
+# anything itself: it writes this marker (the release the pass wants
+# active) and ends the pass with outcome ``activation_handoff``. A
+# scheduled activator outside any pass — the daemon's own job scheduling,
+# not this module — reads the marker and performs the restart once no
+# implementation lane is in flight. The next pass that finds a marker
+# checks the installed version: not yet the marker's version is
+# ``activation_pending`` (retry next pass, no stop/park — this is the
+# expected wait, not a failure); already the marker's version clears the
+# marker and closes the order from here, without ever having called
+# ``run_activate`` itself.
+
+
+def _pending_activation_path(local_root: str, task_id: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(task_id))
+    return os.path.join(local_root, "state", "integrator-activate", "%s.json" % safe)
+
+
+def read_pending_activation(local_root: str, task_id: str) -> Optional[Dict[str, Any]]:
+    path = _pending_activation_path(local_root, task_id)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_pending_activation(local_root: str, task_id: str, state: Dict[str, Any]) -> None:
+    path = _pending_activation_path(local_root, task_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2)
+    os.replace(tmp, path)
+
+
+def clear_pending_activation(local_root: str, task_id: str) -> None:
+    """Clear this module's own bookkeeping marker *and* the external
+    activator's restart signal for the same version.
+
+    ``activate_cmd`` (``wf-activate.sh``) writes ``<version>.pending`` in the
+    same ``integrator-activate`` directory for ``wf-activator.sh`` to consume
+    outside any pass — clearing only ``<task-id>.json`` here left that file
+    behind for a stuck order a person just reset or abandoned, and the
+    external activator would still restart a release for it (wf-276 recovery
+    round 2, finding 2).
+    """
+    marker = read_pending_activation(local_root, task_id)
+    path = _pending_activation_path(local_root, task_id)
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    version = (marker or {}).get("version")
+    if version:
+        # wf-activate.sh names this file from the raw release basename
+        # (``V=$(basename "$REL")``), not a sanitized form -- WorkForce's
+        # local-suffix versions contain ``+``, so this must match verbatim
+        # (wf-276 recovery round 3, finding 1).
+        pending_file = os.path.join(os.path.dirname(path), "%s.pending" % str(version))
+        try:
+            os.remove(pending_file)
+        except OSError:
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -2115,6 +2212,159 @@ def _dry_plan(order: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _close_merged_order(
+    task_id: str,
+    project: str,
+    config: Dict[str, Any],
+    ops: Dict[str, Callable],
+    post_merge: Dict[str, Any],
+    result: Dict[str, Any],
+    verified: Dict[str, Any],
+    screenshots: List[str],
+    pr: Dict[str, Any],
+    reviewer: str,
+    new_version: str,
+) -> Dict[str, Any]:
+    """Evidence, close, prune, and local-state cleanup once install is verified.
+
+    Shared by the in-pass path (verified right after ``run_activate``) and
+    the handoff path (verified on a later pass against a pending-activation
+    marker, wf-276) — everything after "the install is confirmed" is the
+    same either way.
+    """
+    result["installed_verified"] = verified.get("ok")
+    result["screenshots"] = screenshots
+    later_findings = post_merge.get("later_findings") or []
+    evidence = {
+        "completed": "Merged PR %s and released version %s." % (pr.get("url") or pr.get("number"), new_version),
+        "verification": "Suites green; reviewer (%s) reported no findings; CI green; installed version verified=%s."
+        % (reviewer, verified.get("ok")),
+        "links": pr.get("url") or "",
+        "follow_ups": "; ".join(later_findings) if later_findings else "none",
+    }
+    ops["close_order"](task_id, evidence)
+    if later_findings:
+        append_ledger_row(config["local_root"], project, "LATER", ticket=task_id, count=len(later_findings))
+    append_ledger_row(config["local_root"], project, "CLOSE", ticket=task_id)
+    worker = result.get("worker")
+    if worker:
+        from .prune import prune_after_close
+
+        result["prune"] = prune_after_close(config, worker, task_id)
+    clear_recovery_state(config["local_root"], task_id)
+    clear_post_merge_state(config["local_root"], task_id)
+    result["outcome"] = "closed"
+    write_receipt(config["local_root"], project, result)
+    return result
+
+
+def _finish_after_stage_handoff(
+    task_id: str,
+    project: str,
+    config: Dict[str, Any],
+    ops: Dict[str, Callable],
+    post_merge: Dict[str, Any],
+    result: Dict[str, Any],
+    ctx: Dict[str, str],
+    new_version: str,
+    pr: Dict[str, Any],
+    reviewer: str,
+) -> Dict[str, Any]:
+    """``activation_mode: "handoff"`` — never restart from inside the pass.
+
+    ``activate_cmd`` (``wf-activate.sh`` in production) is still called every
+    pass, same as ``in_pass`` mode: it is what actually leaves the pending
+    marker the external activator (``wf-activator.sh``, scheduled outside any
+    pass) consumes, and it is the tool that knows whether the release is
+    already active without this module hard-coding that protocol. The
+    difference from ``in_pass`` is only in how a nonzero rc is read: never a
+    stop, always the ordinary "handed off, retry next pass" outcome, because
+    the wrapper's own contract is "never restart, exit 1 to mean pending"
+    (wf-276 host comment). This module's own marker under
+    ``integrator-activate/<task-id>.json`` is bookkeeping only — it decides
+    whether this is the first handoff (outcome ``activation_handoff``) or a
+    later poll (``activation_pending``) — not the protocol the activator
+    reads.
+    """
+    local_root = config["local_root"]
+    release_dir = os.path.join(config["release_root"], new_version)
+    pending = read_pending_activation(local_root, task_id)
+    first = pending is None or pending.get("version") != new_version
+
+    activate = ops["run_activate"](ctx)
+    if activate["rc"] != 0:
+        write_pending_activation(local_root, task_id, {
+            "task_id": task_id,
+            "project": project,
+            "version": new_version,
+            "release_root": release_dir,
+            "requested_at": pending.get("requested_at") if pending and not first else _utc_iso_z(),
+        })
+        outcome = "activation_handoff" if first else "activation_pending"
+        if first:
+            append_ledger_row(local_root, project, "ACTIVATE", ticket=task_id, outcome=outcome)
+        else:
+            append_ledger_row(local_root, project, "SKIP", ticket=task_id, reason=outcome)
+        result["outcome"] = outcome
+        result["reason"] = (
+            "activation handed off to the scheduled activator; release %s is pending at %s"
+            % (new_version, release_dir)
+        )
+        write_receipt(local_root, project, result)
+        return result
+
+    verified = ops["verify_installed_version"](new_version, ctx)
+    if not verified.get("ok"):
+        # activate_cmd (rc 0) already reported the release active and, per
+        # its own contract, removed the .pending marker the external
+        # activator reads — there is no restart signal left anywhere for a
+        # later pass to wait on. Retrying would just re-run activate_cmd and
+        # hit the same rc-0/verify-fail outcome forever, unlike the ordinary
+        # rc!=0 branch above where the activator genuinely has work queued.
+        # Stop and park for a person, mirroring in_pass's own verify gate,
+        # instead of spinning on activation_pending (wf-276 finding 1).
+        result["installed_verified"] = verified.get("ok")
+        body = (
+            "Blocked: activate_cmd reported %s active but installed build does not "
+            "report the bumped version\n"
+            "Expected: %s\n"
+            "Observed: %s\n"
+            "Next step: workforce integrate --config %s "
+            "--clear-recovery %s --cleared-by <who> --reason \"<why>\""
+            % (
+                new_version, new_version, verified.get("observed") or "(unknown)",
+                config.get("config_path", ""), task_id,
+            )
+        )
+        ops["post_comment"](task_id, body)
+        park_result = ops["park_seat"](task_id)
+        if park_result.get("ok") is False:
+            ops["post_comment"](
+                task_id,
+                "Blocked: automatic re-park to in_review failed (%s) after "
+                "the stop above; this order is exposed in backlog and a "
+                "person must re-park it to in_review by hand."
+                % (park_result.get("error") or "unknown error"),
+            )
+            append_ledger_row(
+                local_root, project, "PARK_FAILED",
+                ticket=task_id, error=park_result.get("error") or "unknown error",
+            )
+        else:
+            append_ledger_row(local_root, project, "STOP", ticket=task_id, reason="install not verified")
+        result["outcome"] = "install_not_verified"
+        result["reason"] = "installed build does not report version %s" % new_version
+        write_receipt(local_root, project, result)
+        return result
+
+    clear_pending_activation(local_root, task_id)
+    screenshots = ops["capture_screenshots"](ctx)
+    return _close_merged_order(
+        task_id, project, config, ops, post_merge, result,
+        verified, screenshots, pr, reviewer, new_version,
+    )
+
+
 def _finish_after_stage(
     task_id: str,
     project: str,
@@ -2137,6 +2387,11 @@ def _finish_after_stage(
     result["version"] = {"from": current_version, "to": new_version}
     ctx = {"version": new_version, "checkout": config["main_checkout"]}
 
+    if config.get("activation_mode") == "handoff":
+        return _finish_after_stage_handoff(
+            task_id, project, config, ops, post_merge, result, ctx, new_version, pr, reviewer,
+        )
+
     if seat_in_flight(config["local_root"], roster_path=config.get("roster_path")):
         append_ledger_row(config["local_root"], project, "SKIP", ticket=task_id, reason="seat_in_flight")
         result["outcome"] = "activate_skipped"
@@ -2154,10 +2409,10 @@ def _finish_after_stage(
 
     verified = ops["verify_installed_version"](new_version, ctx)
     screenshots = ops["capture_screenshots"](ctx)
-    result["installed_verified"] = verified.get("ok")
-    result["screenshots"] = screenshots
 
     if not verified.get("ok"):
+        result["installed_verified"] = verified.get("ok")
+        result["screenshots"] = screenshots
         body = (
             "Blocked: installed build does not report the bumped version\n"
             "Expected: %s\n"
@@ -2193,28 +2448,10 @@ def _finish_after_stage(
         write_receipt(config["local_root"], project, result)
         return result
 
-    later_findings = post_merge.get("later_findings") or []
-    evidence = {
-        "completed": "Merged PR %s and released version %s." % (pr.get("url") or pr.get("number"), new_version),
-        "verification": "Suites green; reviewer (%s) reported no findings; CI green; installed version verified=%s."
-        % (reviewer, verified.get("ok")),
-        "links": pr.get("url") or "",
-        "follow_ups": "; ".join(later_findings) if later_findings else "none",
-    }
-    ops["close_order"](task_id, evidence)
-    if later_findings:
-        append_ledger_row(config["local_root"], project, "LATER", ticket=task_id, count=len(later_findings))
-    append_ledger_row(config["local_root"], project, "CLOSE", ticket=task_id)
-    worker = result.get("worker")
-    if worker:
-        from .prune import prune_after_close
-
-        result["prune"] = prune_after_close(config, worker, task_id)
-    clear_recovery_state(config["local_root"], task_id)
-    clear_post_merge_state(config["local_root"], task_id)
-    result["outcome"] = "closed"
-    write_receipt(config["local_root"], project, result)
-    return result
+    return _close_merged_order(
+        task_id, project, config, ops, post_merge, result,
+        verified, screenshots, pr, reviewer, new_version,
+    )
 
 
 def _stop_seat_and_record(
