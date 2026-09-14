@@ -333,6 +333,41 @@ def test_prune_ledger_event_allowed(tmp_path):
     assert " PRUNE " in line
 
 
+def test_apply_prune_cleans_task_run_when_checkout_already_missing(tmp_path):
+    """Round-4 finding: a planned checkout that is already gone must still
+    allow task-run cleanup on retry."""
+    workspace = tmp_path / "ws"
+    task_run = workspace / "local" / "task-runs" / "tester" / "wf-9"
+    checkout = task_run / "checkout"
+    task_run.mkdir(parents=True)
+    (task_run / "preparation.json").write_text("{}\n")
+    (task_run / "prompt.md").write_text("prompt\n")
+    assert not checkout.exists()
+    cfg = {
+        "pr_base": "main",
+        "checkout_template": "local/task-runs/{worker}/{task_id}/checkout",
+        "workspace_root": str(workspace),
+        "branch_template": "workforce/task/{worker}/{task_id}",
+        "local_root": str(workspace / "local"),
+        "project": "workforce",
+    }
+    ops = FakePruneOps()
+    plan = {
+        "worker": "tester",
+        "task_id": "wf-9",
+        "actions": [
+            {"kind": "checkout", "path": str(checkout)},
+            {"kind": "task_run", "path": str(task_run)},
+        ],
+        "kept": [],
+        "notes": [],
+    }
+    receipt = prune.apply_prune(cfg, plan, ops.as_dict())
+    assert not (task_run / "prompt.md").exists()
+    assert (task_run / "preparation.json").exists()
+    assert any(item.get("kind") == "task_run" for item in receipt["removed"])
+
+
 def test_apply_prune_cleans_task_run_when_listed_before_checkout(tmp_path):
     """Round-3 finding: a plan that lists task_run before checkout must still
     clean the task-run once the worktree removal succeeds."""
