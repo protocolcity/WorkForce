@@ -129,6 +129,49 @@ def test_integrate_clear_recovery_forwards_to_integrator(tmp_path, capsys):
     assert state["cleared_by"] == "you"
 
 
+def test_integrate_clear_recovery_surfaces_failed_repark(tmp_path, monkeypatch, capsys):
+    """--clear-recovery must not print success when the local state clears
+    but the re-park PATCH to in_review fails — the order would stay
+    invisible in backlog despite the printed "cleared" message
+    (wf-270 recovery round 4, finding 2)."""
+    from workforce import capacity as capacity_mod
+
+    roster_path = tmp_path / "roster.json"
+    roster_path.write_text(json.dumps({"workers": []}))
+    cfg_raw = dict(
+        local_root=str(tmp_path / "local"),
+        roster_path=str(roster_path),
+        project="workforce",
+        test_cmd=["/bin/sh", "-c", "exit 0"],
+        pr_base="main",
+        version_bump="patch",
+        version_file="VERSION.json",
+        stage_cmd=["/bin/sh", "-c", "exit 0"],
+        activate_cmd=["/bin/sh", "-c", "exit 0"],
+        main_checkout=str(tmp_path / "main_checkout"),
+    )
+    (tmp_path / "main_checkout").mkdir(exist_ok=True)
+    cfg_path = tmp_path / "integration_config.json"
+    cfg_path.write_text(json.dumps(cfg_raw))
+    integrator_mod.write_recovery_state(cfg_raw["local_root"], "wf-1", {"rounds_used": 2})
+
+    def fake_req(method, url, body=None, timeout=20.0):
+        return {"ok": False, "error": "desk unreachable"}
+
+    monkeypatch.setenv("WORKFORCE_ALLOW_DESK", "1")
+    monkeypatch.setattr(capacity_mod, "_req", fake_req)
+
+    rc = cli.main([
+        "integrate", "--config", str(cfg_path), "--clear-recovery", "wf-1",
+        "--cleared-by", "you", "--reason", "seat fixed by hand",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "failed to re-park" in captured.err
+    state = integrator_mod.read_recovery_state(cfg_raw["local_root"], "wf-1")
+    assert state["rounds_used"] == 0
+
+
 def test_papers_rel_for_section_52():
     assert cli._papers_rel_for_section_52(
         "/city/recipes/workers/demo-worker/CONTRACT.md"
