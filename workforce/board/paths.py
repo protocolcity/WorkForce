@@ -8,11 +8,24 @@ from typing import Optional
 
 
 API_ONLY = True
-SUITE_URL = (os.environ.get("SUITE_URL") or "http://127.0.0.1:8801").rstrip("/")
+
+
+def _suite_url() -> str:
+    return (os.environ.get("SUITE_URL") or "http://127.0.0.1:8801").rstrip("/")
+
+
+def __getattr__(name: str):
+    # PEP 562: keeps ``paths.SUITE_URL`` live instead of an import-time
+    # snapshot, so a host that sets SUITE_URL after import (or a caller
+    # that reads the constant directly instead of _map_roster_url()) still
+    # sees the current port.
+    if name == "SUITE_URL":
+        return _suite_url()
+    raise AttributeError("module %r has no attribute %r" % (__name__, name))
 
 
 def _map_roster_url() -> str:
-    return (os.environ.get("SUITE_URL") or SUITE_URL).rstrip("/") + "/roster"
+    return _suite_url() + "/roster"
 
 
 def _html_escape_requested() -> bool:
