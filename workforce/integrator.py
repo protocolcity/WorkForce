@@ -1176,6 +1176,17 @@ def close_evidence_links(merge_sha: str, version_sha: str, pr_url: str = "") -> 
     return ", ".join(parts) if parts else ""
 
 
+def build_integrator_claim_body() -> str:
+    """Signed Owner marker before integrator §5 close (wl_claim parity, wf-277)."""
+    return (
+        "Owner: integrator\n"
+        "Start: %s\n"
+        "Plan:\n"
+        "- close merged order"
+        % _utc_iso_z()
+    )
+
+
 # --------------------------------------------------------------------------
 # Recovery-round state (per task id, durable across passes)
 # --------------------------------------------------------------------------
@@ -2176,13 +2187,16 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
     def close_order(task_id: str, evidence: Dict[str, str]) -> Dict[str, Any]:
         """Claim as integrator, post §5 close-out, confirm desk status is done.
 
-        The desk refuses a close from an identity that has not claimed the
-        order; callers must treat ``ok`` and ``status`` before pruning or
-        clearing local post-merge state (wf-277).
+        Mirrors ``wl_claim`` + ``wl_close`` + explicit ``status=done``:
+        Owner marker (not PATCH alone), §5 body signed as integrator (not
+        routed through ``post_comment``), then PATCH done before confirm.
+        Callers must treat ``ok`` and ``status`` before pruning or clearing
+        local post-merge state (wf-277).
         """
         import urllib.parse
         from .engine import _fetch_task
 
+        integrator_author = "integrator"
         dry, hermetic = hermetic_dry_run(False)
         if dry:
             return {
@@ -2194,23 +2208,87 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
         task_url = "%s/api/admin/tasks/%s?%s" % (
             desk, urllib.parse.quote(task_id, safe=""), q,
         )
-        claim = _req("PATCH", task_url, {"status": "in_progress", "author": "integrator"})
-        if claim.get("ok") is False or claim.get("error"):
+        comments_url = "%s/api/admin/tasks/%s/comments?%s" % (
+            desk, urllib.parse.quote(task_id, safe=""), q,
+        )
+
+        def desk_comment(body: str) -> Dict[str, Any]:
+            return _req(
+                "POST", comments_url,
+                {"body": body, "author": integrator_author},
+            )
+
+        def desk_patch_status(status: str) -> Dict[str, Any]:
+            return _req(
+                "PATCH", task_url,
+                {"status": status, "author": integrator_author},
+            )
+
+        task = _fetch_task(desk, config["project"], task_id)
+        if not task:
+            return {
+                "ok": False,
+                "step": "fetch",
+                "error": "task not found",
+            }
+
+        status = str(task.get("status") or "")
+        if status in ("done", "canceled"):
             return {
                 "ok": False,
                 "step": "claim",
-                "error": claim.get("error") or "claim failed",
-                "desk": claim,
+                "status": status,
+                "error": "task already %s" % status,
+            }
+
+        # wl_claim parity: promote in_review/backlog → in_progress; already
+        # in_progress is an idempotent re-claim (Owner marker only).
+        if status in ("in_review", "backlog"):
+            promote = desk_patch_status("in_progress")
+            if promote.get("ok") is False:
+                task = _fetch_task(desk, config["project"], task_id) or task
+                status = str(task.get("status") or "")
+                if status != "in_progress":
+                    return {
+                        "ok": False,
+                        "step": "claim",
+                        "error": promote.get("error") or "claim failed",
+                        "desk": promote,
+                    }
+        elif status != "in_progress":
+            return {
+                "ok": False,
+                "step": "claim",
+                "status": status,
+                "error": "cannot close from status %r" % (status or "(unknown)",),
+            }
+
+        claim_comment = desk_comment(build_integrator_claim_body())
+        if claim_comment.get("ok") is False or claim_comment.get("error"):
+            return {
+                "ok": False,
+                "step": "claim",
+                "error": claim_comment.get("error") or "integrator claim marker rejected",
+                "desk": claim_comment,
             }
 
         body = build_close_body(evidence)
-        comment = post_comment(task_id, body)
-        if comment.get("ok") is False or comment.get("error"):
+        close_comment = desk_comment(body)
+        if close_comment.get("ok") is False or close_comment.get("error"):
             return {
                 "ok": False,
                 "step": "close_comment",
-                "error": comment.get("error") or "close comment rejected",
-                "desk": comment,
+                "error": close_comment.get("error") or "close comment rejected",
+                "desk": close_comment,
+            }
+
+        done_patch = desk_patch_status("done")
+        if done_patch.get("ok") is False or done_patch.get("error"):
+            return {
+                "ok": False,
+                "step": "set_done",
+                "error": done_patch.get("error") or "status=done patch rejected",
+                "desk": done_patch,
             }
 
         task = _fetch_task(desk, config["project"], task_id)
@@ -2221,9 +2299,15 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
                 "step": "confirm_done",
                 "status": status,
                 "error": "desk status is %r after close (want done)" % (status or "(unknown)",),
-                "desk": comment,
+                "desk": done_patch,
             }
-        return {"ok": True, "status": "done", "claim": claim, "comment": comment}
+        return {
+            "ok": True,
+            "status": "done",
+            "claim": claim_comment,
+            "comment": close_comment,
+            "done": done_patch,
+        }
 
     return {
         "run_suites": run_suites,
@@ -2984,6 +3068,9 @@ def run_one(
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
         return result
+    # Landed merge commit on origin/main (from synced host checkout, not the
+    # seat checkout tip which may lag or include unrelated local state).
+    merge_landing_sha = sync.get("sha") or merge_landing_sha
 
     current_version = ops["read_version"](main_checkout)
     new_version = bump_version(current_version, config["version_bump"])
