@@ -1126,7 +1126,7 @@ def clear_recovery_round_state(
         "cleared_reason": _nonempty_str(reason, "reason"),
         "cleared_at": _utc_iso_z(),
     }
-    for key in ("later_findings", "last_review"):
+    for key in ("later_findings", "last_review", "suites_ok_sha"):
         if key in previous:
             state[key] = previous[key]
     write_recovery_state(local_root, task_id, state)
@@ -1142,7 +1142,7 @@ def _carry_recovery_state(state: Dict[str, Any], rounds_used: int, **extra: Any)
     round's review does not happen to repeat it (wf-268).
     """
     new_state: Dict[str, Any] = {"rounds_used": rounds_used}
-    for key in ("cleared_by", "cleared_reason", "cleared_at", "last_review", "later_findings"):
+    for key in ("cleared_by", "cleared_reason", "cleared_at", "last_review", "later_findings", "suites_ok_sha"):
         if key in state:
             new_state[key] = state[key]
     new_state.update(extra)
@@ -1904,7 +1904,7 @@ def run_one(
     append_ledger_row(config["local_root"], project, "DISCOVER", ticket=task_id, worker=order["worker"])
 
     try:
-        suite = ops["run_suites"](checkout)
+        current_head_sha = ops["checkout_head_sha"](checkout)
     except FileNotFoundError:
         # The seat's checkout is not where the template or its Workdir line
         # says (pc-1487 rehearsal): stop this order with a durable comment
@@ -1916,7 +1916,17 @@ def run_one(
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
         return result
-    append_ledger_row(config["local_root"], project, "SUITES", ticket=task_id, rc=suite["rc"])
+
+    suites_ok_sha = state.get("suites_ok_sha")
+    if current_head_sha and suites_ok_sha and current_head_sha == suites_ok_sha:
+        # This exact commit already passed suites in a previous pass on this
+        # order (wf-271: a pass that is only waiting on CI or a clean review
+        # must not re-run suites just because nothing merged yet).
+        suite = {"rc": 0, "output": ""}
+        append_ledger_row(config["local_root"], project, "SUITES", ticket=task_id, rc=0, cached=True)
+    else:
+        suite = ops["run_suites"](checkout)
+        append_ledger_row(config["local_root"], project, "SUITES", ticket=task_id, rc=suite["rc"])
     decision = decide_after_suites(suite["rc"], rounds_used, config["max_recovery_rounds"])
     result["suites"] = {"rc": suite["rc"]}
 
@@ -1940,11 +1950,15 @@ def run_one(
         write_receipt(config["local_root"], project, result)
         return result
 
+    # Suites passed (fresh or cached) for this exact SHA — record it so a
+    # later pass on the same unmerged head skips re-running them (wf-271).
+    state = _carry_recovery_state(state, rounds_used, suites_ok_sha=current_head_sha)
+    write_recovery_state(config["local_root"], task_id, state)
+
     ops["push_branch"](checkout, branch)
     pr = ops["open_or_update_pr"](checkout, branch, config["pr_base"], order.get("title", task_id), "Ticket: %s" % task_id)
     result["pr"] = pr
 
-    current_head_sha = ops["checkout_head_sha"](checkout)
     max_findings = config["max_findings_per_round"]
     if last_review and last_review.get("sha"):
         stale_sha = not ops["sha_exists"](checkout, last_review["sha"])
@@ -1961,73 +1975,97 @@ def run_one(
             stale_sha = True
         if stale_sha:
             last_review = None
-    if last_review and last_review.get("sha"):
-        # Correction round: only the delta since the commit the prior review
-        # saw, plus the prior findings — never a re-audit of the whole PR
-        # (wf-268; the pc-1492 rehearsal's nine passes each re-reviewed the
-        # entire diff and kept finding new items on the same large surface).
-        diff = ops["diff_text"](checkout, last_review["sha"])
-        # A correction delta that is empty once test hunks are stripped is the
-        # same silent-clear hole as an empty diff (wf-268 third pass): fall back
-        # to the full base review instead of letting a scoped-empty prompt close
-        # open blockers.
-        if not diff.strip() or not strip_test_hunks_from_diff(diff).strip():
-            # A non-zero diff rc and a truly empty correction diff collapse
-            # to the same empty string here; either way this must never look
-            # like "no non-test changes" to the reviewer. Fall back to a
-            # full pr_base review with no previous findings (wf-268
-            # second-pass finding 3).
-            last_review = None
+
+    if last_review and last_review.get("sha") == current_head_sha:
+        # This exact commit already went through review in a previous pass
+        # (wf-271: waiting on CI or a clean check must not re-dispatch the
+        # non-deterministic reviewer against an unchanged head — that turns
+        # a clean verdict into a fresh recovery round for nothing). Reuse
+        # the recorded verdict instead of reviewing again.
+        findings = list(last_review.get("findings") or [])
+        new_later_findings: List[str] = []
+        findings_from_cache = True
+    else:
+        findings_from_cache = False
+        if last_review and last_review.get("sha"):
+            # Correction round: only the delta since the commit the prior review
+            # saw, plus the prior findings — never a re-audit of the whole PR
+            # (wf-268; the pc-1492 rehearsal's nine passes each re-reviewed the
+            # entire diff and kept finding new items on the same large surface).
+            diff = ops["diff_text"](checkout, last_review["sha"])
+            # A correction delta that is empty once test hunks are stripped is the
+            # same silent-clear hole as an empty diff (wf-268 third pass): fall back
+            # to the full base review instead of letting a scoped-empty prompt close
+            # open blockers.
+            if not diff.strip() or not strip_test_hunks_from_diff(diff).strip():
+                # A non-zero diff rc and a truly empty correction diff collapse
+                # to the same empty string here; either way this must never look
+                # like "no non-test changes" to the reviewer. Fall back to a
+                # full pr_base review with no previous findings (wf-268
+                # second-pass finding 3).
+                last_review = None
+                diff = ops["diff_text"](checkout, config["pr_base"])
+                prompt = build_reviewer_prompt(order, diff, max_findings=max_findings)
+            else:
+                prompt = build_reviewer_prompt(
+                    order, diff, max_findings=max_findings,
+                    previous_findings=last_review.get("findings"),
+                )
+        else:
             diff = ops["diff_text"](checkout, config["pr_base"])
             prompt = build_reviewer_prompt(order, diff, max_findings=max_findings)
-        else:
-            prompt = build_reviewer_prompt(
-                order, diff, max_findings=max_findings,
-                previous_findings=last_review.get("findings"),
-            )
-    else:
-        diff = ops["diff_text"](checkout, config["pr_base"])
-        prompt = build_reviewer_prompt(order, diff, max_findings=max_findings)
-    review = ops["dispatch_reviewer"](reviewer, prompt)
-    append_ledger_row(config["local_root"], project, "REVIEW", ticket=task_id, reviewer=reviewer, ok=review.get("ok"))
+        review = ops["dispatch_reviewer"](reviewer, prompt)
+        append_ledger_row(config["local_root"], project, "REVIEW", ticket=task_id, reviewer=reviewer, ok=review.get("ok"))
 
-    if review.get("retry"):
-        # The reviewer's own lock was held by another concurrently running
-        # shift of the same reviewer — this dispatch never actually ran, so
-        # there is no review to act on. Never charge this against the
-        # recovery-round budget or read a stranger's in-flight review as
-        # ours; just retry the whole review step on the next pass.
-        append_ledger_row(config["local_root"], project, "SKIP", ticket=task_id, reason="reviewer lock held")
-        result["outcome"] = "review_retry"
-        result["reason"] = review.get("output") or "reviewer dispatch skipped; retry next pass"
-        write_receipt(config["local_root"], project, result)
-        return result
+        if review.get("retry"):
+            # The reviewer's own lock was held by another concurrently running
+            # shift of the same reviewer — this dispatch never actually ran, so
+            # there is no review to act on. Never charge this against the
+            # recovery-round budget or read a stranger's in-flight review as
+            # ours; just retry the whole review step on the next pass.
+            append_ledger_row(config["local_root"], project, "SKIP", ticket=task_id, reason="reviewer lock held")
+            result["outcome"] = "review_retry"
+            result["reason"] = review.get("output") or "reviewer dispatch skipped; retry next pass"
+            write_receipt(config["local_root"], project, result)
+            return result
 
-    if review.get("empty"):
-        reason = review.get("output") or "reviewer output was empty after DONE"
-        ops["post_comment"](task_id, stopped_comment_body(reason))
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
-        result["outcome"] = "review_empty"
-        result["reason"] = reason
-        write_receipt(config["local_root"], project, result)
-        return result
+        if review.get("empty"):
+            reason = review.get("output") or "reviewer output was empty after DONE"
+            ops["post_comment"](task_id, stopped_comment_body(reason))
+            append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+            result["outcome"] = "review_empty"
+            result["reason"] = reason
+            write_receipt(config["local_root"], project, result)
+            return result
 
-    if review.get("stale"):
-        # The output file was never rewritten after DONE — whatever it
-        # contains is leftover from an earlier, unrelated dispatch and must
-        # never be parsed as this dispatch's findings or merged on.
-        reason = review.get("output") or "reviewer output was unchanged after DONE (stale)"
-        ops["post_comment"](task_id, stopped_comment_body(reason))
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
-        result["outcome"] = "review_stale"
-        result["reason"] = reason
-        write_receipt(config["local_root"], project, result)
-        return result
+        if review.get("stale"):
+            # The output file was never rewritten after DONE — whatever it
+            # contains is leftover from an earlier, unrelated dispatch and must
+            # never be parsed as this dispatch's findings or merged on.
+            reason = review.get("output") or "reviewer output was unchanged after DONE (stale)"
+            ops["post_comment"](task_id, stopped_comment_body(reason))
+            append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+            result["outcome"] = "review_stale"
+            result["reason"] = reason
+            write_receipt(config["local_root"], project, result)
+            return result
 
-    raw_findings = parse_reviewer_findings(review.get("output", "")) if review.get("ok") else [
-        "reviewer dispatch failed"
-    ]
-    findings, new_later_findings = cap_findings(raw_findings, max_findings)
+        if not review.get("ok"):
+            # A dispatch failure (ledger read/write error, non-zero reviewer
+            # rc, etc.) is not a review verdict for this SHA — caching it as
+            # ``last_review`` would make a transient failure stick until a
+            # new commit, the same non-retry the "retry" branch above exists
+            # to avoid (wf-271 second-pass finding 1). Retry the review
+            # itself next pass instead of recording synthetic findings.
+            reason = review.get("output") or "reviewer dispatch failed"
+            append_ledger_row(config["local_root"], project, "SKIP", ticket=task_id, reason=reason)
+            result["outcome"] = "review_retry"
+            result["reason"] = reason
+            write_receipt(config["local_root"], project, result)
+            return result
+
+        raw_findings = parse_reviewer_findings(review.get("output", ""))
+        findings, new_later_findings = cap_findings(raw_findings, max_findings)
     result["findings"] = findings
     # Later findings accumulate across rounds — a finding capped out of an
     # earlier round's reply must not disappear just because this round's
@@ -2042,6 +2080,24 @@ def run_one(
     newly_added_later = later_findings[len(existing_later):]
     if newly_added_later:
         append_ledger_row(config["local_root"], project, "LATER", ticket=task_id, count=len(newly_added_later))
+
+    if findings_from_cache and findings:
+        # These exact findings were already posted and charged against the
+        # recovery budget in the pass that first discovered them at this
+        # SHA. Re-running decide_after_findings here would burn another
+        # recovery round and re-dispatch the seat for nothing while it is
+        # still working on the original blockers (wf-271 second-pass
+        # finding 2) — repost the recorded findings for visibility but do
+        # not advance rounds_used or touch the seat again; wait for a new
+        # commit instead.
+        append_ledger_row(config["local_root"], project, "FINDINGS", ticket=task_id, count=len(findings))
+        ops["post_comment"](task_id, findings_comment_body(findings))
+        if later_findings:
+            ops["post_comment"](task_id, later_findings_comment_body(later_findings))
+        result["outcome"] = "waiting_on_findings"
+        result["reason"] = "findings already reported for %s; waiting for a new commit" % current_head_sha
+        write_receipt(config["local_root"], project, result)
+        return result
 
     findings_decision = decide_after_findings(findings, rounds_used, config["max_recovery_rounds"])
     if findings_decision["action"] != "proceed":
@@ -2070,6 +2126,16 @@ def run_one(
 
     if later_findings:
         ops["post_comment"](task_id, later_findings_comment_body(later_findings))
+
+    # A clean verdict for this SHA is a fact that must stick (wf-271): record
+    # it so a pass that only ends up waiting on CI does not re-review the
+    # same unchanged head next time.
+    state = _carry_recovery_state(
+        state, rounds_used,
+        last_review={"sha": current_head_sha, "findings": findings},
+        later_findings=later_findings,
+    )
+    write_recovery_state(config["local_root"], task_id, state)
 
     # Re-checked freshly, immediately before the merge call itself — this is
     # the merge gate at merge time, not a decision made earlier in the pass.
