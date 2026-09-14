@@ -1891,7 +1891,56 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
         return comment
 
     def close_order(task_id: str, evidence: Dict[str, str]) -> Dict[str, Any]:
-        return post_comment(task_id, build_close_body(evidence))
+        """Claim as integrator, post §5 close-out, confirm desk status is done.
+
+        The desk refuses a close from an identity that has not claimed the
+        order; callers must treat ``ok`` and ``status`` before pruning or
+        clearing local post-merge state (wf-277).
+        """
+        import urllib.parse
+        from .engine import _fetch_task
+
+        dry, hermetic = hermetic_dry_run(False)
+        if dry:
+            return {
+                "ok": True, "dry_run": True, "hermetic": hermetic,
+                "status": "done",
+            }
+
+        q = urllib.parse.urlencode({"product": config["project"]})
+        task_url = "%s/api/admin/tasks/%s?%s" % (
+            desk, urllib.parse.quote(task_id, safe=""), q,
+        )
+        claim = _req("PATCH", task_url, {"status": "in_progress", "author": "integrator"})
+        if claim.get("ok") is False or claim.get("error"):
+            return {
+                "ok": False,
+                "step": "claim",
+                "error": claim.get("error") or "claim failed",
+                "desk": claim,
+            }
+
+        body = build_close_body(evidence)
+        comment = post_comment(task_id, body)
+        if comment.get("ok") is False or comment.get("error"):
+            return {
+                "ok": False,
+                "step": "close_comment",
+                "error": comment.get("error") or "close comment rejected",
+                "desk": comment,
+            }
+
+        task = _fetch_task(desk, config["project"], task_id)
+        status = str((task or {}).get("status") or "")
+        if status != "done":
+            return {
+                "ok": False,
+                "step": "confirm_done",
+                "status": status,
+                "error": "desk status is %r after close (want done)" % (status or "(unknown)",),
+                "desk": comment,
+            }
+        return {"ok": True, "status": "done", "claim": claim, "comment": comment}
 
     return {
         "run_suites": run_suites,
@@ -2026,10 +2075,24 @@ def _finish_after_stage(
         "links": pr.get("url") or "",
         "follow_ups": "; ".join(later_findings) if later_findings else "none",
     }
-    ops["close_order"](task_id, evidence)
+    close = ops["close_order"](task_id, evidence)
+    result["close"] = close
+    confirmed_status = close.get("status") or ""
+    if close.get("ok") is not True or confirmed_status != "done":
+        ops["park_seat"](task_id)
+        append_ledger_row(
+            config["local_root"], project, "CLOSE", ticket=task_id,
+            status=confirmed_status or "failed",
+            error=close.get("error") or "close not confirmed",
+        )
+        result["outcome"] = "close_failed"
+        result["reason"] = close.get("error") or "desk did not confirm done"
+        write_receipt(config["local_root"], project, result)
+        return result
+
     if later_findings:
         append_ledger_row(config["local_root"], project, "LATER", ticket=task_id, count=len(later_findings))
-    append_ledger_row(config["local_root"], project, "CLOSE", ticket=task_id)
+    append_ledger_row(config["local_root"], project, "CLOSE", ticket=task_id, status="done")
     worker = result.get("worker")
     if worker:
         from .prune import prune_after_close
