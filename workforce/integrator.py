@@ -1333,8 +1333,6 @@ def seat_in_flight(local_root: str, roster_path: Optional[str] = None) -> bool:
     from . import provider_qualification as pq_mod
     from . import roster as roster_mod
 
-    if pq_mod.scan_active_locks(local_root):
-        return True
     seats: Optional[List[str]] = None
     if roster_path:
         try:
@@ -1342,6 +1340,15 @@ def seat_in_flight(local_root: str, roster_path: Optional[str] = None) -> bool:
             seats = [n for n, w in rost.workers.items() if getattr(w, "kind", "lane") == "lane"]
         except Exception:  # noqa: BLE001 — an unreadable roster must not unblock a restart
             seats = None
+    locks = pq_mod.scan_active_locks(local_root)
+    if seats is None:
+        if locks:
+            return True
+    else:
+        # The integrator holds its own integrator.lock for the whole pass
+        # that asks this question; a job's lock is not a seat mid-shift.
+        if any(str(row.get("worker") or "") in seats for row in locks):
+            return True
     return _any_open_ledger_shift(local_root, seats)
 
 
