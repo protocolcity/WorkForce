@@ -1195,17 +1195,22 @@ def test_clear_recovery_state_clears_external_activator_pending_file(tmp_path):
     ``<version>.pending`` in the same directory for ``wf-activator.sh`` to
     consume outside any pass. Clearing only the integrator's own
     ``<task-id>.json`` bookkeeping marker left that restart signal behind
-    for a stuck order a person just reset or abandoned."""
+    for a stuck order a person just reset or abandoned. The pending file is
+    named from the raw release basename (``V=$(basename "$REL")`` in
+    ``wf-activate.sh``, not a sanitized form) -- WorkForce's own local-suffix
+    versions contain ``+`` (wf-276 recovery round 3, finding 1), so this must
+    be covered with such a version, not just a plain one."""
     local_root = str(tmp_path / "local")
+    version = "0.1.9+consolidation.31"
     integrator.write_pending_activation(local_root, "wf-1", {
-        "task_id": "wf-1", "project": "workforce", "version": "1.0.1",
-        "release_root": "/releases/1.0.1", "requested_at": "2026-01-01T00:00:00Z",
+        "task_id": "wf-1", "project": "workforce", "version": version,
+        "release_root": "/releases/%s" % version, "requested_at": "2026-01-01T00:00:00Z",
     })
     pending_dir = os.path.join(local_root, "state", "integrator-activate")
     os.makedirs(pending_dir, exist_ok=True)
-    pending_file = os.path.join(pending_dir, "1.0.1.pending")
+    pending_file = os.path.join(pending_dir, "%s.pending" % version)
     with open(pending_file, "w", encoding="utf-8") as fh:
-        fh.write("/releases/1.0.1\n")
+        fh.write("/releases/%s\n" % version)
 
     integrator.clear_recovery_state(local_root, "wf-1")
 
@@ -1215,15 +1220,16 @@ def test_clear_recovery_state_clears_external_activator_pending_file(tmp_path):
 
 def test_clear_recovery_round_state_clears_external_activator_pending_file(tmp_path):
     local_root = str(tmp_path / "local")
+    version = "0.1.9+consolidation.31"
     integrator.write_pending_activation(local_root, "wf-1", {
-        "task_id": "wf-1", "project": "workforce", "version": "1.0.1",
-        "release_root": "/releases/1.0.1", "requested_at": "2026-01-01T00:00:00Z",
+        "task_id": "wf-1", "project": "workforce", "version": version,
+        "release_root": "/releases/%s" % version, "requested_at": "2026-01-01T00:00:00Z",
     })
     pending_dir = os.path.join(local_root, "state", "integrator-activate")
     os.makedirs(pending_dir, exist_ok=True)
-    pending_file = os.path.join(pending_dir, "1.0.1.pending")
+    pending_file = os.path.join(pending_dir, "%s.pending" % version)
     with open(pending_file, "w", encoding="utf-8") as fh:
-        fh.write("/releases/1.0.1\n")
+        fh.write("/releases/%s\n" % version)
 
     integrator.clear_recovery_round_state(local_root, "wf-1", "you", "reset for a fresh attempt")
 
