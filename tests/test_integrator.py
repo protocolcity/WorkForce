@@ -1521,6 +1521,96 @@ def test_run_one_resumes_from_activate_after_seat_in_flight_without_remerging(tm
 
 
 # --------------------------------------------------------------------------
+# wf-276 — activation_mode "handoff": never restart the daemon in-pass
+# --------------------------------------------------------------------------
+
+
+def test_run_one_handoff_writes_pending_marker_and_never_activates(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, activation_mode="handoff")
+    ops = FakeOps(tmp_path)
+    order = make_order()
+
+    result = integrator.run_one(order, cfg, ops.as_dict())
+
+    assert result["outcome"] == "activation_handoff"
+    assert "run_activate" not in ops.calls
+    assert "close_order" not in ops.calls
+    marker = integrator.read_pending_activation(cfg["local_root"], order["task_id"])
+    assert marker is not None
+    assert marker["version"] == "1.0.1"
+    assert marker["release_root"] == os.path.join(cfg["release_root"], "1.0.1")
+
+
+def test_run_one_handoff_pending_retries_without_stop_or_park(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, activation_mode="handoff")
+    ops = FakeOps(tmp_path, verify_ok=False)
+    order = make_order()
+
+    first = integrator.run_one(order, cfg, ops.as_dict())
+    assert first["outcome"] == "activation_handoff"
+
+    # Marker exists but the scheduled activator has not restarted yet.
+    second = integrator.run_one(order, cfg, ops.as_dict())
+    assert second["outcome"] == "activation_pending"
+    assert "close_order" not in ops.calls
+    assert "post_comment" not in ops.calls
+    assert "park_seat" not in ops.calls
+    assert "stop_seat" not in ops.calls
+    marker = integrator.read_pending_activation(cfg["local_root"], order["task_id"])
+    assert marker is not None
+
+
+def test_run_one_handoff_closes_once_marker_is_already_active(tmp_path):
+    """Done-when: a pass with a marker for an already-active release closes."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, activation_mode="handoff")
+    ops = FakeOps(tmp_path, verify_ok=False)
+    order = make_order()
+
+    first = integrator.run_one(order, cfg, ops.as_dict())
+    assert first["outcome"] == "activation_handoff"
+    assert "run_activate" not in ops.calls
+
+    # The scheduled activator restarted the daemon between passes.
+    ops.verify_ok = True
+    second = integrator.run_one(order, cfg, ops.as_dict())
+
+    assert second["outcome"] == "closed"
+    assert "run_activate" not in ops.calls
+    assert "close_order" in ops.calls
+    assert integrator.read_pending_activation(cfg["local_root"], order["task_id"]) is None
+
+
+def test_run_one_handoff_never_restarts_when_seat_in_flight(tmp_path):
+    """The handoff write is not gated on seat_in_flight — the restart itself
+    (the thing seat_in_flight guards) never happens inside this pass."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, activation_mode="handoff")
+    _write_live_lock(cfg["local_root"], "tester")
+    ops = FakeOps(tmp_path)
+    order = make_order()
+
+    result = integrator.run_one(order, cfg, ops.as_dict())
+
+    assert result["outcome"] == "activation_handoff"
+    assert "run_activate" not in ops.calls
+
+
+def test_load_config_rejects_unknown_activation_mode(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    with pytest.raises(integrator.IntegratorError):
+        base_config(tmp_path, roster_path, activation_mode="restart")
+
+
+def test_load_config_defaults_activation_mode_to_in_pass(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    assert cfg["activation_mode"] == "in_pass"
+
+
+# --------------------------------------------------------------------------
 # wf-265 review recovery — refuse the version bump when main moved
 # (finding 6)
 # --------------------------------------------------------------------------

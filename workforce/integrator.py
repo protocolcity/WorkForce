@@ -53,6 +53,11 @@ _REQUIRED_CONFIG_KEYS = (
 
 _VERSION_BUMP_RULES = ("major", "minor", "patch", "local-suffix")
 
+# "in_pass" (default): activate and verify inline, as every non-daemon
+# project does. "handoff": never restart from inside the pass — write a
+# pending-activation marker instead (wf-276; see the marker helpers below).
+_ACTIVATION_MODES = ("in_pass", "handoff")
+
 # Providers stay replaceable: which reviewer covers which implementation
 # provider is data, not a hard-coded branch per vendor name.
 DEFAULT_REVIEWER_BY_PROVIDER = {
@@ -193,6 +198,12 @@ def load_config(path: str) -> Dict[str, Any]:
         local_root, "COORDINATOR.lock"
     )
 
+    activation_mode = raw.get("activation_mode", "in_pass")
+    if activation_mode not in _ACTIVATION_MODES:
+        raise IntegratorError(
+            "activation_mode must be one of %s" % "/".join(_ACTIVATION_MODES)
+        )
+
     return {
         "config_path": str(raw_path),
         "local_root": local_root,
@@ -228,6 +239,7 @@ def load_config(path: str) -> Dict[str, Any]:
             raw.get("coordinator_lock_ttl_secs"), "coordinator_lock_ttl_secs",
             _DEFAULT_COORDINATOR_LOCK_TTL_SECS,
         ),
+        "activation_mode": activation_mode,
         "checkout_template": raw.get("checkout_template", _DEFAULT_CHECKOUT_TEMPLATE),
         "checkout_templates": dict(raw.get("checkout_templates") or {}),
         "branch_template": raw.get("branch_template", _DEFAULT_BRANCH_TEMPLATE),
@@ -1262,6 +1274,60 @@ def clear_post_merge_state(local_root: str, task_id: str) -> None:
 
 
 # --------------------------------------------------------------------------
+# Pending-activation handoff (per task id, durable across passes) — wf-276
+# --------------------------------------------------------------------------
+#
+# A daemon project's own release restarts the process the integrator pass
+# is running under, so activating from inside the pass kills the pass
+# before the ACTIVATE row, the installed-version verify, and the close are
+# written. In ``activation_mode: "handoff"`` the pass never restarts
+# anything itself: it writes this marker (the release the pass wants
+# active) and ends the pass with outcome ``activation_handoff``. A
+# scheduled activator outside any pass — the daemon's own job scheduling,
+# not this module — reads the marker and performs the restart once no
+# implementation lane is in flight. The next pass that finds a marker
+# checks the installed version: not yet the marker's version is
+# ``activation_pending`` (retry next pass, no stop/park — this is the
+# expected wait, not a failure); already the marker's version clears the
+# marker and closes the order from here, without ever having called
+# ``run_activate`` itself.
+
+
+def _pending_activation_path(local_root: str, task_id: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(task_id))
+    return os.path.join(local_root, "state", "integrator-activate", "%s.json" % safe)
+
+
+def read_pending_activation(local_root: str, task_id: str) -> Optional[Dict[str, Any]]:
+    path = _pending_activation_path(local_root, task_id)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_pending_activation(local_root: str, task_id: str, state: Dict[str, Any]) -> None:
+    path = _pending_activation_path(local_root, task_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2)
+    os.replace(tmp, path)
+
+
+def clear_pending_activation(local_root: str, task_id: str) -> None:
+    path = _pending_activation_path(local_root, task_id)
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------
 # Ledger + receipts
 # --------------------------------------------------------------------------
 
@@ -1940,6 +2006,113 @@ def _dry_plan(order: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _close_merged_order(
+    task_id: str,
+    project: str,
+    config: Dict[str, Any],
+    ops: Dict[str, Callable],
+    post_merge: Dict[str, Any],
+    result: Dict[str, Any],
+    verified: Dict[str, Any],
+    screenshots: List[str],
+    pr: Dict[str, Any],
+    reviewer: str,
+    new_version: str,
+) -> Dict[str, Any]:
+    """Evidence, close, prune, and local-state cleanup once install is verified.
+
+    Shared by the in-pass path (verified right after ``run_activate``) and
+    the handoff path (verified on a later pass against a pending-activation
+    marker, wf-276) — everything after "the install is confirmed" is the
+    same either way.
+    """
+    result["installed_verified"] = verified.get("ok")
+    result["screenshots"] = screenshots
+    later_findings = post_merge.get("later_findings") or []
+    evidence = {
+        "completed": "Merged PR %s and released version %s." % (pr.get("url") or pr.get("number"), new_version),
+        "verification": "Suites green; reviewer (%s) reported no findings; CI green; installed version verified=%s."
+        % (reviewer, verified.get("ok")),
+        "links": pr.get("url") or "",
+        "follow_ups": "; ".join(later_findings) if later_findings else "none",
+    }
+    ops["close_order"](task_id, evidence)
+    if later_findings:
+        append_ledger_row(config["local_root"], project, "LATER", ticket=task_id, count=len(later_findings))
+    append_ledger_row(config["local_root"], project, "CLOSE", ticket=task_id)
+    worker = result.get("worker")
+    if worker:
+        from .prune import prune_after_close
+
+        result["prune"] = prune_after_close(config, worker, task_id)
+    clear_recovery_state(config["local_root"], task_id)
+    clear_post_merge_state(config["local_root"], task_id)
+    result["outcome"] = "closed"
+    write_receipt(config["local_root"], project, result)
+    return result
+
+
+def _finish_after_stage_handoff(
+    task_id: str,
+    project: str,
+    config: Dict[str, Any],
+    ops: Dict[str, Callable],
+    post_merge: Dict[str, Any],
+    result: Dict[str, Any],
+    ctx: Dict[str, str],
+    new_version: str,
+    pr: Dict[str, Any],
+    reviewer: str,
+) -> Dict[str, Any]:
+    """``activation_mode: "handoff"`` — never restart from inside the pass.
+
+    First pass to reach here after merge/bump/stage writes the
+    pending-activation marker and stops; it never calls ``run_activate``, so
+    the daemon this pass runs under is never touched. A later pass that
+    finds the marker checks the installed version itself: not yet the
+    marker's version is the ordinary, expected wait for the scheduled
+    activator (outcome ``activation_pending``, no stop/park — this is not a
+    failure); already the marker's version clears the marker and closes.
+    """
+    local_root = config["local_root"]
+    pending = read_pending_activation(local_root, task_id)
+    if pending is None or pending.get("version") != new_version:
+        release_dir = os.path.join(config["release_root"], new_version)
+        write_pending_activation(local_root, task_id, {
+            "task_id": task_id,
+            "project": project,
+            "version": new_version,
+            "release_root": release_dir,
+            "requested_at": _utc_iso_z(),
+        })
+        append_ledger_row(local_root, project, "ACTIVATE", ticket=task_id, outcome="activation_handoff")
+        result["outcome"] = "activation_handoff"
+        result["reason"] = (
+            "activation handed off to the scheduled activator; release %s is pending at %s"
+            % (new_version, release_dir)
+        )
+        write_receipt(local_root, project, result)
+        return result
+
+    verified = ops["verify_installed_version"](new_version, ctx)
+    if not verified.get("ok"):
+        append_ledger_row(local_root, project, "SKIP", ticket=task_id, reason="activation_pending")
+        result["outcome"] = "activation_pending"
+        result["reason"] = (
+            "activation marker for %s is set but the installed version is not yet %s"
+            % (new_version, new_version)
+        )
+        write_receipt(local_root, project, result)
+        return result
+
+    clear_pending_activation(local_root, task_id)
+    screenshots = ops["capture_screenshots"](ctx)
+    return _close_merged_order(
+        task_id, project, config, ops, post_merge, result,
+        verified, screenshots, pr, reviewer, new_version,
+    )
+
+
 def _finish_after_stage(
     task_id: str,
     project: str,
@@ -1962,6 +2135,11 @@ def _finish_after_stage(
     result["version"] = {"from": current_version, "to": new_version}
     ctx = {"version": new_version, "checkout": config["main_checkout"]}
 
+    if config.get("activation_mode") == "handoff":
+        return _finish_after_stage_handoff(
+            task_id, project, config, ops, post_merge, result, ctx, new_version, pr, reviewer,
+        )
+
     if seat_in_flight(config["local_root"], roster_path=config.get("roster_path")):
         append_ledger_row(config["local_root"], project, "SKIP", ticket=task_id, reason="seat_in_flight")
         result["outcome"] = "activate_skipped"
@@ -1979,10 +2157,10 @@ def _finish_after_stage(
 
     verified = ops["verify_installed_version"](new_version, ctx)
     screenshots = ops["capture_screenshots"](ctx)
-    result["installed_verified"] = verified.get("ok")
-    result["screenshots"] = screenshots
 
     if not verified.get("ok"):
+        result["installed_verified"] = verified.get("ok")
+        result["screenshots"] = screenshots
         body = (
             "Blocked: installed build does not report the bumped version\n"
             "Expected: %s\n"
@@ -2018,28 +2196,10 @@ def _finish_after_stage(
         write_receipt(config["local_root"], project, result)
         return result
 
-    later_findings = post_merge.get("later_findings") or []
-    evidence = {
-        "completed": "Merged PR %s and released version %s." % (pr.get("url") or pr.get("number"), new_version),
-        "verification": "Suites green; reviewer (%s) reported no findings; CI green; installed version verified=%s."
-        % (reviewer, verified.get("ok")),
-        "links": pr.get("url") or "",
-        "follow_ups": "; ".join(later_findings) if later_findings else "none",
-    }
-    ops["close_order"](task_id, evidence)
-    if later_findings:
-        append_ledger_row(config["local_root"], project, "LATER", ticket=task_id, count=len(later_findings))
-    append_ledger_row(config["local_root"], project, "CLOSE", ticket=task_id)
-    worker = result.get("worker")
-    if worker:
-        from .prune import prune_after_close
-
-        result["prune"] = prune_after_close(config, worker, task_id)
-    clear_recovery_state(config["local_root"], task_id)
-    clear_post_merge_state(config["local_root"], task_id)
-    result["outcome"] = "closed"
-    write_receipt(config["local_root"], project, result)
-    return result
+    return _close_merged_order(
+        task_id, project, config, ops, post_merge, result,
+        verified, screenshots, pr, reviewer, new_version,
+    )
 
 
 def _stop_seat_and_record(
