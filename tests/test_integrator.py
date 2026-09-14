@@ -1013,6 +1013,67 @@ def test_clear_recovery_round_state_preserves_later_findings_and_last_review(tmp
     assert integrator.read_recovery_state(local_root, "wf-1") == state
 
 
+# --------------------------------------------------------------------------
+# wf-271: a clean/findings verdict is a fact about a SHA, not about a pass —
+# a later pass on an unchanged head must skip suites and review, not turn a
+# non-deterministic reviewer loose on the same commit again.
+# --------------------------------------------------------------------------
+
+
+def test_run_one_same_sha_repeated_pass_reviews_and_suites_once_while_waiting(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, ci_status="failure", head_shas=["sha-x"])
+    order = make_order()
+
+    first = integrator.run_one(order, cfg, ops.as_dict())
+    assert first["outcome"] == "waiting"
+    second = integrator.run_one(order, cfg, ops.as_dict())
+    assert second["outcome"] == "waiting"
+
+    assert ops.calls.count("run_suites") == 1
+    assert ops.calls.count("dispatch_reviewer") == 1
+    state = integrator.read_recovery_state(cfg["local_root"], "wf-1")
+    assert state["suites_ok_sha"] == "sha-x"
+    assert state["last_review"] == {"sha": "sha-x", "findings": []}
+
+
+def test_run_one_new_commit_after_waiting_triggers_a_fresh_delta_review(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, ci_status="failure", head_shas=["sha-x", "sha-y"])
+    order = make_order()
+
+    integrator.run_one(order, cfg, ops.as_dict())
+    second = integrator.run_one(order, cfg, ops.as_dict())
+
+    assert second["outcome"] == "waiting"
+    assert ops.calls.count("run_suites") == 2
+    assert ops.calls.count("dispatch_reviewer") == 2
+    assert ops.diff_text_bases[-1] == "sha-x"
+    state = integrator.read_recovery_state(cfg["local_root"], "wf-1")
+    assert state["suites_ok_sha"] == "sha-y"
+    assert state["last_review"] == {"sha": "sha-y", "findings": []}
+
+
+def test_run_one_recorded_findings_with_no_new_commit_reposts_without_reviewing(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_recovery_rounds=3)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {
+        "rounds_used": 1,
+        "suites_ok_sha": "sha-x",
+        "last_review": {"sha": "sha-x", "findings": ["fix the thing"]},
+    })
+    ops = FakeOps(tmp_path, head_shas=["sha-x"])
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+
+    assert result["outcome"] == "recovering"
+    assert result["findings"] == ["fix the thing"]
+    assert "dispatch_reviewer" not in ops.calls
+    assert "run_suites" not in ops.calls
+    assert "post_comment" in ops.calls
+
+
 def test_clear_recovery_round_state_with_no_prior_state_has_no_later_findings(tmp_path):
     local_root = str(tmp_path / "local")
     state = integrator.clear_recovery_round_state(local_root, "wf-1", "you", "first clear")
@@ -2450,15 +2511,22 @@ def test_checkout_templates_override_per_worker(tmp_path):
 
 
 def test_run_one_stops_with_checkout_missing_when_suites_cannot_start(tmp_path, monkeypatch):
-    """A missing checkout raises FileNotFoundError from the real run_suites; the
-    pass must stop the order with checkout_missing, not die."""
+    """A missing checkout raises FileNotFoundError from the real
+    checkout_head_sha/run_suites; the pass must stop the order with
+    checkout_missing, not die."""
     w = make_worker(tmp_path, name="tester", command=["claude", "-p", "x"])
     roster_path = write_roster(tmp_path, [w])
     cfg = make_config(tmp_path, roster_path)
     posted = []
+    def checkout_head_sha(checkout):
+        raise FileNotFoundError(checkout)
     def run_suites(checkout):
         raise FileNotFoundError(checkout)
-    ops = {"run_suites": run_suites, "post_comment": lambda tid, body: posted.append((tid, body))}
+    ops = {
+        "checkout_head_sha": checkout_head_sha,
+        "run_suites": run_suites,
+        "post_comment": lambda tid, body: posted.append((tid, body)),
+    }
     order = {"task_id": "wf-9", "worker": "tester", "provider": "claude", "title": "t", "checkout_override": None}
     result = integrator.run_one(order, cfg, ops)
     assert result["outcome"] == "checkout_missing"
