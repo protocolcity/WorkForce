@@ -346,6 +346,11 @@ class FakeOps:
         self.head_shas = overrides.get("head_shas", ["sha-head-1", "sha-head-2", "sha-head-3"])
         self.close_evidence = None
         self.sha_exists_val = overrides.get("sha_exists_val", True)
+        self.sha_reachable_val = overrides.get("sha_reachable_val", True)
+        self.diff_text_val = overrides.get(
+            "diff_text_val", "diff --git a/src/x.py b/src/x.py\n+1\n",
+        )
+        self.diff_text_bases = []
 
     def _record(self, name, *a, **kw):
         self.calls.append(name)
@@ -361,7 +366,10 @@ class FakeOps:
     def diff_text(self, checkout, base):
         self._record("diff_text")
         self.diff_text_base = base
-        return "diff --git a/src/x.py b/src/x.py\n+1\n"
+        self.diff_text_bases.append(base)
+        if isinstance(self.diff_text_val, dict):
+            return self.diff_text_val.get(base, "diff --git a/src/x.py b/src/x.py\n+1\n")
+        return self.diff_text_val
 
     def checkout_head_sha(self, checkout):
         self._record("checkout_head_sha")
@@ -372,6 +380,10 @@ class FakeOps:
     def sha_exists(self, checkout, sha):
         self._record("sha_exists")
         return self.sha_exists_val
+
+    def sha_reachable(self, checkout, sha):
+        self._record("sha_reachable")
+        return self.sha_reachable_val
 
     def push_branch(self, checkout, branch):
         self._record("push_branch")
@@ -476,6 +488,7 @@ class FakeOps:
             "diff_text": self.diff_text,
             "checkout_head_sha": self.checkout_head_sha,
             "sha_exists": self.sha_exists,
+            "sha_reachable": self.sha_reachable,
             "push_branch": self.push_branch,
             "open_or_update_pr": self.open_or_update_pr,
             "ci_status": self.ci_status_fn,
@@ -939,6 +952,109 @@ def test_run_one_stop_after_a_human_clear_reports_who_cleared_it(tmp_path):
     assert result["outcome"] == "stopped"
     assert result["last_cleared"]["by"] == "you"
     assert result["last_cleared"]["reason"] == "cleared for a fresh attempt"
+
+
+# --------------------------------------------------------------------------
+# wf-268 second-pass cursor-reviewer findings (PR 28 re-review):
+# 1. later_findings must de-duplicate across rounds on normalised text
+# 2. a human clear must preserve later_findings and last_review
+# 3. an unreachable (not just missing) sha, or an empty correction diff,
+#    must fall back to a full pr_base review
+# --------------------------------------------------------------------------
+
+
+def test_dedupe_findings_drops_repeats_on_normalised_text_first_seen_order():
+    items = ["Fix the thing.", "other finding", "  fix the thing.  ", "FIX THE THING."]
+    assert integrator._dedupe_findings(items) == ["Fix the thing.", "other finding"]
+
+
+def test_run_one_accumulated_later_findings_deduplicate_on_normalised_text(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_findings_per_round=1, max_recovery_rounds=3)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {
+        "rounds_used": 1,
+        "last_review": {"sha": "sha-round-1", "findings": ["blocker one"]},
+        "later_findings": ["earlier later a"],
+    })
+    ops = FakeOps(tmp_path, review_findings=["blocker two", "  Earlier Later A  "])
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "recovering"
+    assert result["later_findings"] == ["earlier later a"]
+    state = integrator.read_recovery_state(cfg["local_root"], "wf-1")
+    assert state["later_findings"] == ["earlier later a"]
+
+
+def test_run_one_accumulated_later_findings_reach_close_without_duplicates(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_findings_per_round=1, max_recovery_rounds=3)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {
+        "rounds_used": 1,
+        "last_review": {"sha": "sha-round-1", "findings": []},
+        "later_findings": ["earlier later a", "earlier later a"],
+    })
+    ops = FakeOps(tmp_path)  # clean pass: no new findings, proceeds to merge
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "closed"
+    assert ops.close_evidence["follow_ups"] == "earlier later a"
+
+
+def test_clear_recovery_round_state_preserves_later_findings_and_last_review(tmp_path):
+    local_root = str(tmp_path / "local")
+    integrator.write_recovery_state(local_root, "wf-1", {
+        "rounds_used": 2,
+        "later_findings": ["earlier later a"],
+        "last_review": {"sha": "sha-round-1", "findings": ["still open"]},
+    })
+    state = integrator.clear_recovery_round_state(local_root, "wf-1", "you", "seat fixed everything by hand")
+    assert state["rounds_used"] == 0
+    assert state["cleared_by"] == "you"
+    assert state["later_findings"] == ["earlier later a"]
+    assert state["last_review"] == {"sha": "sha-round-1", "findings": ["still open"]}
+    assert integrator.read_recovery_state(local_root, "wf-1") == state
+
+
+def test_clear_recovery_round_state_with_no_prior_state_has_no_later_findings(tmp_path):
+    local_root = str(tmp_path / "local")
+    state = integrator.clear_recovery_round_state(local_root, "wf-1", "you", "first clear")
+    assert state["rounds_used"] == 0
+    assert "later_findings" not in state
+    assert "last_review" not in state
+
+
+def test_run_one_unreachable_last_review_sha_falls_back_to_full_pr_base_review(tmp_path):
+    """sha_exists alone is existence-only: a rebased-away commit can still
+    exist as an unreachable object. sha_reachable (merge-base
+    --is-ancestor) must catch this and fall back to a full review."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_recovery_rounds=3)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {
+        "rounds_used": 1,
+        "last_review": {"sha": "sha-unreachable", "findings": ["fix the thing"]},
+    })
+    ops = FakeOps(tmp_path, sha_exists_val=True, sha_reachable_val=False)
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert "sha_reachable" in ops.calls
+    assert ops.diff_text_base == cfg["pr_base"]
+    assert result["outcome"] == "closed"
+
+
+def test_run_one_empty_correction_diff_falls_back_to_full_pr_base_review(tmp_path):
+    """A non-zero diff rc and a truly empty correction diff collapse to the
+    same empty string; either way it must never look like "no non-test
+    changes" to the reviewer and skip re-auditing."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_recovery_rounds=3)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {
+        "rounds_used": 1,
+        "last_review": {"sha": "sha-round-1", "findings": ["fix the thing"]},
+    })
+    ops = FakeOps(tmp_path, diff_text_val={
+        "sha-round-1": "",
+        cfg["pr_base"]: "diff --git a/src/x.py b/src/x.py\n+1\n",
+    })
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert ops.diff_text_bases == ["sha-round-1", cfg["pr_base"]]
+    assert result["outcome"] == "closed"
 
 
 def test_main_clear_recovery_cli_resets_state(tmp_path):

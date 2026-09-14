@@ -755,6 +755,26 @@ def cap_findings(
     return items[:max_findings], items[max_findings:]
 
 
+def _dedupe_findings(items: Sequence[str]) -> List[str]:
+    """Drop repeats of *items* on normalised text, keeping first-seen order.
+
+    A correction round's reviewer often repeats an earlier round's capped
+    "later" item verbatim (or with only whitespace/case differences); without
+    this the accumulated later-findings list, the comment, the post-merge
+    state and the close follow-ups all grow a duplicate per repeat (wf-268
+    second-pass finding 1).
+    """
+    seen = set()
+    out: List[str] = []
+    for item in items:
+        key = re.sub(r"\s+", " ", item.strip()).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
 # A reviewer's real reply is prose, not the documented JSON shape: cursor
 # and workflow reviewer sessions print "--- pass N ---" markers around one
 # NDJSON line per event, and the finding text itself is free-form markdown
@@ -1062,14 +1082,22 @@ def clear_recovery_round_state(
     clear*, not since the order was first discovered — and records who
     cleared it and why so a later stop's receipt shows that history
     (wf-268: the pc-1492 rehearsal needed a person to clear state twice
-    with no durable record of who did it or why).
+    with no durable record of who did it or why). ``later_findings`` and
+    ``last_review`` are carried over, not dropped: a human clear is about
+    the stuck round count, not about forgetting capped follow-ups or the
+    review scope, and a close right after a clear must still show the real
+    follow_ups (wf-268 second-pass finding 2).
     """
-    state = {
+    previous = read_recovery_state(local_root, task_id) or {}
+    state: Dict[str, Any] = {
         "rounds_used": 0,
         "cleared_by": _nonempty_str(cleared_by, "cleared_by"),
         "cleared_reason": _nonempty_str(reason, "reason"),
         "cleared_at": _utc_iso_z(),
     }
+    for key in ("later_findings", "last_review"):
+        if key in previous:
+            state[key] = previous[key]
     write_recovery_state(local_root, task_id, state)
     return state
 
@@ -1406,6 +1434,15 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
         r = _run(["git", "cat-file", "-e", "%s^{commit}" % sha], cwd=checkout)
         return r["rc"] == 0
 
+    def sha_reachable(checkout: str, sha: str) -> bool:
+        # sha_exists is existence-only: after a rebase/force-push the old
+        # commit can still exist as an unreachable object, so
+        # ``git diff sha...HEAD`` fails and comes back empty. Reachability
+        # (is *sha* an ancestor of HEAD) is the stricter check that catches
+        # this before ever attempting the diff (wf-268 second-pass finding 3).
+        r = _run(["git", "merge-base", "--is-ancestor", sha, "HEAD"], cwd=checkout)
+        return r["rc"] == 0
+
     def push_branch(checkout: str, branch: str) -> Dict[str, Any]:
         return _run(["git", "push", "-u", "origin", "HEAD:%s" % branch], cwd=checkout)
 
@@ -1658,6 +1695,7 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
         "diff_text": diff_text,
         "checkout_head_sha": checkout_head_sha,
         "sha_exists": sha_exists,
+        "sha_reachable": sha_reachable,
         "push_branch": push_branch,
         "open_or_update_pr": open_or_update_pr,
         "ci_status": ci_status,
@@ -1874,23 +1912,41 @@ def run_one(
 
     current_head_sha = ops["checkout_head_sha"](checkout)
     max_findings = config["max_findings_per_round"]
-    if last_review and last_review.get("sha") and not ops["sha_exists"](checkout, last_review["sha"]):
-        # The commit the prior review saw is gone (rebase/force-push): a
-        # diff against it would fail and come back empty, letting the
-        # reviewer see "(no non-test changes)" and say none without ever
-        # re-auditing the change. Drop the stale review and fall back to a
-        # full pr_base review with no previous findings (wf-268).
-        last_review = None
+    if last_review and last_review.get("sha"):
+        stale_sha = not ops["sha_exists"](checkout, last_review["sha"])
+        sha_reachable = ops.get("sha_reachable")
+        if not stale_sha and sha_reachable is not None and not sha_reachable(checkout, last_review["sha"]):
+            # The commit the prior review saw still exists as an object but
+            # is no longer an ancestor of HEAD (rebase/force-push): a diff
+            # against it would fail and come back empty, letting the
+            # reviewer see "(no non-test changes)" and say none without ever
+            # re-auditing the change. Drop the stale review and fall back to
+            # a full pr_base review with no previous findings (wf-268;
+            # wf-268 second-pass finding 3 — sha_exists alone is
+            # existence-only and misses this).
+            stale_sha = True
+        if stale_sha:
+            last_review = None
     if last_review and last_review.get("sha"):
         # Correction round: only the delta since the commit the prior review
         # saw, plus the prior findings — never a re-audit of the whole PR
         # (wf-268; the pc-1492 rehearsal's nine passes each re-reviewed the
         # entire diff and kept finding new items on the same large surface).
         diff = ops["diff_text"](checkout, last_review["sha"])
-        prompt = build_reviewer_prompt(
-            order, diff, max_findings=max_findings,
-            previous_findings=last_review.get("findings"),
-        )
+        if not diff.strip():
+            # A non-zero diff rc and a truly empty correction diff collapse
+            # to the same empty string here; either way this must never look
+            # like "no non-test changes" to the reviewer. Fall back to a
+            # full pr_base review with no previous findings (wf-268
+            # second-pass finding 3).
+            last_review = None
+            diff = ops["diff_text"](checkout, config["pr_base"])
+            prompt = build_reviewer_prompt(order, diff, max_findings=max_findings)
+        else:
+            prompt = build_reviewer_prompt(
+                order, diff, max_findings=max_findings,
+                previous_findings=last_review.get("findings"),
+            )
     else:
         diff = ops["diff_text"](checkout, config["pr_base"])
         prompt = build_reviewer_prompt(order, diff, max_findings=max_findings)
@@ -1937,12 +1993,17 @@ def run_one(
     result["findings"] = findings
     # Later findings accumulate across rounds — a finding capped out of an
     # earlier round's reply must not disappear just because this round's
-    # review does not happen to repeat it (wf-268 finding 2).
-    later_findings = list(state.get("later_findings") or []) + list(new_later_findings)
+    # review does not happen to repeat it (wf-268 finding 2), but a repeat of
+    # the same item on normalised text must not duplicate in the accumulated
+    # list, the comment, the post-merge state or the close follow-ups
+    # (wf-268 second-pass finding 1).
+    existing_later = _dedupe_findings(list(state.get("later_findings") or []))
+    later_findings = _dedupe_findings(existing_later + list(new_later_findings))
     if later_findings:
         result["later_findings"] = later_findings
-    if new_later_findings:
-        append_ledger_row(config["local_root"], project, "LATER", ticket=task_id, count=len(new_later_findings))
+    newly_added_later = later_findings[len(existing_later):]
+    if newly_added_later:
+        append_ledger_row(config["local_root"], project, "LATER", ticket=task_id, count=len(newly_added_later))
 
     findings_decision = decide_after_findings(findings, rounds_used, config["max_recovery_rounds"])
     if findings_decision["action"] != "proceed":
