@@ -1190,6 +1190,47 @@ def test_clear_recovery_state_clears_pending_activation_marker(tmp_path):
     assert integrator.read_pending_activation(local_root, "wf-1") is None
 
 
+def test_clear_recovery_state_clears_external_activator_pending_file(tmp_path):
+    """wf-276 recovery round 2, finding 2: ``wf-activate.sh`` leaves
+    ``<version>.pending`` in the same directory for ``wf-activator.sh`` to
+    consume outside any pass. Clearing only the integrator's own
+    ``<task-id>.json`` bookkeeping marker left that restart signal behind
+    for a stuck order a person just reset or abandoned."""
+    local_root = str(tmp_path / "local")
+    integrator.write_pending_activation(local_root, "wf-1", {
+        "task_id": "wf-1", "project": "workforce", "version": "1.0.1",
+        "release_root": "/releases/1.0.1", "requested_at": "2026-01-01T00:00:00Z",
+    })
+    pending_dir = os.path.join(local_root, "state", "integrator-activate")
+    os.makedirs(pending_dir, exist_ok=True)
+    pending_file = os.path.join(pending_dir, "1.0.1.pending")
+    with open(pending_file, "w", encoding="utf-8") as fh:
+        fh.write("/releases/1.0.1\n")
+
+    integrator.clear_recovery_state(local_root, "wf-1")
+
+    assert integrator.read_pending_activation(local_root, "wf-1") is None
+    assert not os.path.exists(pending_file)
+
+
+def test_clear_recovery_round_state_clears_external_activator_pending_file(tmp_path):
+    local_root = str(tmp_path / "local")
+    integrator.write_pending_activation(local_root, "wf-1", {
+        "task_id": "wf-1", "project": "workforce", "version": "1.0.1",
+        "release_root": "/releases/1.0.1", "requested_at": "2026-01-01T00:00:00Z",
+    })
+    pending_dir = os.path.join(local_root, "state", "integrator-activate")
+    os.makedirs(pending_dir, exist_ok=True)
+    pending_file = os.path.join(pending_dir, "1.0.1.pending")
+    with open(pending_file, "w", encoding="utf-8") as fh:
+        fh.write("/releases/1.0.1\n")
+
+    integrator.clear_recovery_round_state(local_root, "wf-1", "you", "reset for a fresh attempt")
+
+    assert integrator.read_pending_activation(local_root, "wf-1") is None
+    assert not os.path.exists(pending_file)
+
+
 def test_run_one_stop_after_a_human_clear_reports_who_cleared_it(tmp_path):
     roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
     cfg = base_config(tmp_path, roster_path, max_recovery_rounds=1)
@@ -1790,6 +1831,26 @@ def test_run_one_handoff_closes_once_marker_is_already_active(tmp_path):
     assert "run_activate" in ops.calls
     assert "close_order" in ops.calls
     assert integrator.read_pending_activation(cfg["local_root"], order["task_id"]) is None
+
+
+def test_run_one_handoff_stops_and_parks_when_activate_ok_but_verify_fails(tmp_path):
+    """wf-276 recovery round 2, finding 1: when ``activate_cmd`` reports rc 0
+    (already active) it has, per its own contract, already removed the
+    external ``.pending`` marker — there is no restart signal left anywhere
+    for a later pass to wait on. Retrying would just re-call activate_cmd
+    and repeat the same rc-0/verify-fail outcome forever, so this must stop
+    and park for a person instead of recording ``activation_pending``."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, activation_mode="handoff")
+    ops = FakeOps(tmp_path, activate_rc=0, verify_ok=False, verify_observed="1.0.0")
+    order = make_order()
+
+    result = integrator.run_one(order, cfg, ops.as_dict())
+
+    assert result["outcome"] == "install_not_verified"
+    assert "close_order" not in ops.calls
+    assert "post_comment" in ops.calls
+    assert "park_seat" in ops.calls
 
 
 def test_run_one_handoff_never_restarts_when_seat_in_flight(tmp_path):

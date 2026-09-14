@@ -1356,11 +1356,31 @@ def write_pending_activation(local_root: str, task_id: str, state: Dict[str, Any
 
 
 def clear_pending_activation(local_root: str, task_id: str) -> None:
+    """Clear this module's own bookkeeping marker *and* the external
+    activator's restart signal for the same version.
+
+    ``activate_cmd`` (``wf-activate.sh``) writes ``<version>.pending`` in the
+    same ``integrator-activate`` directory for ``wf-activator.sh`` to consume
+    outside any pass — clearing only ``<task-id>.json`` here left that file
+    behind for a stuck order a person just reset or abandoned, and the
+    external activator would still restart a release for it (wf-276 recovery
+    round 2, finding 2).
+    """
+    marker = read_pending_activation(local_root, task_id)
     path = _pending_activation_path(local_root, task_id)
     try:
         os.remove(path)
     except OSError:
         pass
+    version = (marker or {}).get("version")
+    if version:
+        pending_file = os.path.join(
+            os.path.dirname(path), "%s.pending" % re.sub(r"[^A-Za-z0-9_.-]", "_", str(version)),
+        )
+        try:
+            os.remove(pending_file)
+        except OSError:
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -2293,22 +2313,45 @@ def _finish_after_stage_handoff(
 
     verified = ops["verify_installed_version"](new_version, ctx)
     if not verified.get("ok"):
-        # activate_cmd reported the release already active but the install
-        # verify disagrees — treat as still pending rather than closing on
-        # an unconfirmed version (mirrors in_pass's own verify gate).
-        write_pending_activation(local_root, task_id, {
-            "task_id": task_id,
-            "project": project,
-            "version": new_version,
-            "release_root": release_dir,
-            "requested_at": pending.get("requested_at") if pending and not first else _utc_iso_z(),
-        })
-        append_ledger_row(local_root, project, "SKIP", ticket=task_id, reason="activation_pending")
-        result["outcome"] = "activation_pending"
-        result["reason"] = (
-            "activate_cmd reported %s active but installed version is not yet verified"
-            % new_version
+        # activate_cmd (rc 0) already reported the release active and, per
+        # its own contract, removed the .pending marker the external
+        # activator reads — there is no restart signal left anywhere for a
+        # later pass to wait on. Retrying would just re-run activate_cmd and
+        # hit the same rc-0/verify-fail outcome forever, unlike the ordinary
+        # rc!=0 branch above where the activator genuinely has work queued.
+        # Stop and park for a person, mirroring in_pass's own verify gate,
+        # instead of spinning on activation_pending (wf-276 finding 1).
+        result["installed_verified"] = verified.get("ok")
+        body = (
+            "Blocked: activate_cmd reported %s active but installed build does not "
+            "report the bumped version\n"
+            "Expected: %s\n"
+            "Observed: %s\n"
+            "Next step: workforce integrate --config %s "
+            "--clear-recovery %s --cleared-by <who> --reason \"<why>\""
+            % (
+                new_version, new_version, verified.get("observed") or "(unknown)",
+                config.get("config_path", ""), task_id,
+            )
         )
+        ops["post_comment"](task_id, body)
+        park_result = ops["park_seat"](task_id)
+        if park_result.get("ok") is False:
+            ops["post_comment"](
+                task_id,
+                "Blocked: automatic re-park to in_review failed (%s) after "
+                "the stop above; this order is exposed in backlog and a "
+                "person must re-park it to in_review by hand."
+                % (park_result.get("error") or "unknown error"),
+            )
+            append_ledger_row(
+                local_root, project, "PARK_FAILED",
+                ticket=task_id, error=park_result.get("error") or "unknown error",
+            )
+        else:
+            append_ledger_row(local_root, project, "STOP", ticket=task_id, reason="install not verified")
+        result["outcome"] = "install_not_verified"
+        result["reason"] = "installed build does not report version %s" % new_version
         write_receipt(local_root, project, result)
         return result
 
