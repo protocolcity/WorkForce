@@ -2171,6 +2171,19 @@ def _stop_seat_and_record(
     return stop_result
 
 
+def _stop_recovery_exhausted(
+    ops: Dict[str, Callable], config: Dict[str, Any], project: str, task_id: str, reason: str,
+) -> Dict[str, Any]:
+    """Suite/findings stop after recovery rounds are exhausted.
+
+    ``release_seat`` drops the implementation-seat claim so the seat is not
+    left busy on a stopped order; ``stop_seat`` posts the durable stop note
+    and re-parks to ``in_review`` (wf-270).
+    """
+    ops["release_seat"](task_id, reason)
+    return _stop_seat_and_record(ops, config, project, task_id, reason)
+
+
 def run_one(
     order: Dict[str, Any],
     config: Dict[str, Any],
@@ -2261,7 +2274,7 @@ def run_one(
     result["suites"] = {"rc": suite["rc"]}
 
     if decision["action"] == "stop":
-        _stop_seat_and_record(ops, config, project, task_id, decision["reason"])
+        _stop_recovery_exhausted(ops, config, project, task_id, decision["reason"])
         result["outcome"] = "stopped"
         result["reason"] = decision["reason"]
         write_receipt(config["local_root"], project, result)
@@ -2442,7 +2455,7 @@ def run_one(
         if later_findings:
             ops["post_comment"](task_id, later_findings_comment_body(later_findings))
         if findings_decision["action"] == "stop":
-            _stop_seat_and_record(ops, config, project, task_id, findings_decision["reason"])
+            _stop_recovery_exhausted(ops, config, project, task_id, findings_decision["reason"])
             result["outcome"] = "stopped"
         else:
             deferred = _defer_recovery_if_seat_busy(
