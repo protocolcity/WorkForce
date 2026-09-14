@@ -1928,7 +1928,8 @@ def _finish_after_stage(
                 config["local_root"], project, "PARK_FAILED",
                 ticket=task_id, error=park_result.get("error") or "unknown error",
             )
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason="install not verified")
+        else:
+            append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason="install not verified")
         result["outcome"] = "install_not_verified"
         result["reason"] = "installed build does not report version %s" % new_version
         write_receipt(config["local_root"], project, result)
@@ -1956,6 +1957,24 @@ def _finish_after_stage(
     result["outcome"] = "closed"
     write_receipt(config["local_root"], project, result)
     return result
+
+
+def _stop_seat_and_record(
+    ops: Dict[str, Callable], config: Dict[str, Any], project: str, task_id: str, reason: str,
+) -> Dict[str, Any]:
+    """Call ops["stop_seat"] and only log STOP if the re-park actually held.
+
+    stop_seat() already posts its own Blocked/PARK_FAILED escalation when the
+    re-park PATCH fails; a plain STOP row here on top of that would read as
+    "this order is safely parked" when it is really still sitting exposed in
+    backlog (wf-270 recovery round 5).
+    """
+    stop_result = ops["stop_seat"](task_id, reason)
+    park = (stop_result or {}).get("park") or {}
+    if park.get("ok") is False:
+        return stop_result
+    append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+    return stop_result
 
 
 def run_one(
@@ -2024,8 +2043,7 @@ def run_one(
         # says (pc-1487 rehearsal): stop this order with a durable comment
         # instead of letting the whole pass die.
         reason = "checkout missing: %s (seat Workdir: line or checkout_templates needed)" % checkout
-        ops["stop_seat"](task_id, reason)
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        _stop_seat_and_record(ops, config, project, task_id, reason)
         result["outcome"] = "checkout_missing"
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
@@ -2035,8 +2053,7 @@ def run_one(
     result["suites"] = {"rc": suite["rc"]}
 
     if decision["action"] == "stop":
-        ops["stop_seat"](task_id, decision["reason"])
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=decision["reason"])
+        _stop_seat_and_record(ops, config, project, task_id, decision["reason"])
         result["outcome"] = "stopped"
         result["reason"] = decision["reason"]
         write_receipt(config["local_root"], project, result)
@@ -2119,8 +2136,7 @@ def run_one(
 
     if review.get("empty"):
         reason = review.get("output") or "reviewer output was empty after DONE"
-        ops["stop_seat"](task_id, reason)
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        _stop_seat_and_record(ops, config, project, task_id, reason)
         result["outcome"] = "review_empty"
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
@@ -2131,8 +2147,7 @@ def run_one(
         # contains is leftover from an earlier, unrelated dispatch and must
         # never be parsed as this dispatch's findings or merged on.
         reason = review.get("output") or "reviewer output was unchanged after DONE (stale)"
-        ops["stop_seat"](task_id, reason)
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        _stop_seat_and_record(ops, config, project, task_id, reason)
         result["outcome"] = "review_stale"
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
@@ -2164,8 +2179,7 @@ def run_one(
         if later_findings:
             ops["post_comment"](task_id, later_findings_comment_body(later_findings))
         if findings_decision["action"] == "stop":
-            ops["stop_seat"](task_id, findings_decision["reason"])
-            append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=findings_decision["reason"])
+            _stop_seat_and_record(ops, config, project, task_id, findings_decision["reason"])
             result["outcome"] = "stopped"
         else:
             ops["release_seat"](task_id, findings_decision["reason"])
@@ -2203,8 +2217,7 @@ def run_one(
     pre_merge_sha = ops["remote_head_sha"](checkout, config["pr_base"])
     if not pre_merge_sha:
         reason = "could not read origin/%s before merge; not bumping" % config["pr_base"]
-        ops["stop_seat"](task_id, reason)
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        _stop_seat_and_record(ops, config, project, task_id, reason)
         result["outcome"] = "main_unverified"
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
@@ -2213,8 +2226,7 @@ def run_one(
     merge = ops["merge_pr"](checkout, pr.get("number"))
     if merge.get("rc") != 0:
         reason = "merge_pr failed (rc=%s)" % merge.get("rc")
-        ops["stop_seat"](task_id, reason)
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        _stop_seat_and_record(ops, config, project, task_id, reason)
         result["outcome"] = "merge_failed"
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
@@ -2228,16 +2240,14 @@ def run_one(
     merge_parent_sha = ops["merge_commit_parent_sha"](checkout, config["pr_base"])
     if not merge_parent_sha:
         reason = "could not read merge commit parent for origin/%s after merge; not bumping" % config["pr_base"]
-        ops["stop_seat"](task_id, reason)
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        _stop_seat_and_record(ops, config, project, task_id, reason)
         result["outcome"] = "main_unverified"
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
         return result
     if pre_merge_sha != merge_parent_sha:
         reason = "origin/%s moved during merge; not bumping" % config["pr_base"]
-        ops["stop_seat"](task_id, reason)
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        _stop_seat_and_record(ops, config, project, task_id, reason)
         result["outcome"] = "main_moved"
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
@@ -2249,8 +2259,7 @@ def run_one(
     sync = ops["sync_main_checkout"](main_checkout, config["pr_base"])
     if not sync.get("sha"):
         reason = "could not sync main_checkout to origin/%s; not bumping" % config["pr_base"]
-        ops["stop_seat"](task_id, reason)
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        _stop_seat_and_record(ops, config, project, task_id, reason)
         result["outcome"] = "main_unverified"
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
@@ -2263,8 +2272,7 @@ def run_one(
     push = ops["commit_and_push_version"](main_checkout, config["pr_base"], new_version)
     if push.get("rc") != 0:
         reason = "version bump commit/push to origin/%s failed (rc=%s)" % (config["pr_base"], push.get("rc"))
-        ops["stop_seat"](task_id, reason)
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        _stop_seat_and_record(ops, config, project, task_id, reason)
         result["outcome"] = "main_unverified"
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
@@ -2278,8 +2286,7 @@ def run_one(
     post_push_sha = ops["remote_head_sha"](main_checkout, config["pr_base"])
     if not pushed_sha or not post_push_sha or pushed_sha != post_push_sha:
         reason = "origin/%s moved during the version bump push; not staging" % config["pr_base"]
-        ops["stop_seat"](task_id, reason)
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        _stop_seat_and_record(ops, config, project, task_id, reason)
         result["outcome"] = "main_moved"
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)

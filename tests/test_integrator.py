@@ -2604,6 +2604,104 @@ def test_clear_recovery_round_state_without_park_seat_has_no_park_key(tmp_path):
     local_root = str(tmp_path / "local")
     state = integrator.clear_recovery_round_state(local_root, "wf-1", "you", "first clear")
     assert "park" not in state
+
+
+# --------------------------------------------------------------------------
+# wf-270 recovery round 5 — a failed re-park must not also log STOP
+# --------------------------------------------------------------------------
+
+
+def test_run_one_checkout_missing_skips_stop_ledger_row_when_repark_fails(tmp_path):
+    """stop_seat already escalates a failed re-park with its own PARK_FAILED
+    row; run_one must not additionally log a plain STOP on top of that, or
+    the ledger reads as if the order stayed safely parked when it is really
+    still exposed in backlog (round 4 finding 1, not fully closed)."""
+    w = make_worker(tmp_path, name="tester", command=["claude", "-p", "x"])
+    roster_path = write_roster(tmp_path, [w])
+    cfg = make_config(tmp_path, roster_path)
+
+    def run_suites(checkout):
+        raise FileNotFoundError(checkout)
+
+    def stop_seat(tid, reason):
+        return {"ok": True, "park": {"ok": False, "error": "desk unreachable"}}
+
+    ops = {"run_suites": run_suites, "post_comment": lambda tid, body: None, "stop_seat": stop_seat}
+    order = {"task_id": "wf-9", "worker": "tester", "provider": "claude", "title": "t", "checkout_override": None}
+    result = integrator.run_one(order, cfg, ops)
+    assert result["outcome"] == "checkout_missing"
+
+    log_path = os.path.join(cfg["local_root"], "ledger", "integrator-workforce.log")
+    with open(log_path, encoding="utf-8") as fh:
+        ledger_text = fh.read()
+    assert "STOP" not in ledger_text
+    assert "DISCOVER" in ledger_text
+
+
+def test_run_one_checkout_missing_logs_stop_when_repark_succeeds(tmp_path):
+    """The normal case: a successful re-park still logs STOP as before."""
+    w = make_worker(tmp_path, name="tester", command=["claude", "-p", "x"])
+    roster_path = write_roster(tmp_path, [w])
+    cfg = make_config(tmp_path, roster_path)
+
+    def run_suites(checkout):
+        raise FileNotFoundError(checkout)
+
+    def stop_seat(tid, reason):
+        return {"ok": True, "park": {"ok": True}}
+
+    ops = {"run_suites": run_suites, "post_comment": lambda tid, body: None, "stop_seat": stop_seat}
+    order = {"task_id": "wf-9", "worker": "tester", "provider": "claude", "title": "t", "checkout_override": None}
+    result = integrator.run_one(order, cfg, ops)
+    assert result["outcome"] == "checkout_missing"
+
+    log_path = os.path.join(cfg["local_root"], "ledger", "integrator-workforce.log")
+    with open(log_path, encoding="utf-8") as fh:
+        ledger_text = fh.read()
+    assert "STOP" in ledger_text
+
+
+def test_finish_after_stage_install_not_verified_skips_stop_row_when_repark_fails(tmp_path, monkeypatch):
+    """The install_not_verified path in _finish_after_stage has the same
+    failure class as stop_seat and must not log STOP when park_seat fails."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    local_root = str(tmp_path / "local")
+    cfg = base_config(tmp_path, roster_path, local_root=local_root)
+
+    posted = []
+
+    def post_comment(tid, body):
+        posted.append((tid, body))
+        return {"ok": True}
+
+    def park_seat(tid):
+        return {"ok": False, "error": "desk unreachable"}
+
+    def verify_installed_version(*a, **k):
+        return {"ok": False, "observed": "0.0.0"}
+
+    ops = {
+        "post_comment": post_comment,
+        "park_seat": park_seat,
+        "run_activate": lambda ctx: {"rc": 0},
+        "verify_installed_version": verify_installed_version,
+        "capture_screenshots": lambda ctx: [],
+    }
+    post_merge = {
+        "task_id": "wf-9", "pr": {"url": "http://x"}, "reviewer": "cursor-reviewer",
+        "version": {"from": "1.2.2", "to": "1.2.3"},
+    }
+    result = {"generated_at": integrator._utc_iso_z(), "task_id": "wf-9", "outcome": None}
+    out = integrator._finish_after_stage("wf-9", "workforce", cfg, ops, post_merge, result)
+    assert out["outcome"] == "install_not_verified"
+
+    log_path = os.path.join(local_root, "ledger", "integrator-workforce.log")
+    with open(log_path, encoding="utf-8") as fh:
+        ledger_text = fh.read()
+    assert "STOP" not in ledger_text
+    assert "PARK_FAILED" in ledger_text
+
+
 def test_ci_state_from_check_rows_buckets():
     f = integrator.ci_state_from_check_rows
     assert f([{"bucket": "pass", "state": "SUCCESS"}, {"bucket": "skipping", "state": "SKIPPED"}]) == "success"
