@@ -1203,6 +1203,11 @@ def clear_recovery_state(local_root: str, task_id: str) -> None:
         os.remove(path)
     except OSError:
         pass
+    # A stuck handoff order reset here must not leave a pending-activation
+    # marker behind: the external activator reads that marker outside any
+    # pass and would restart the daemon for an order that was just reset or
+    # abandoned (wf-276 finding 3).
+    clear_pending_activation(local_root, task_id)
 
 
 def clear_recovery_round_state(
@@ -1239,6 +1244,10 @@ def clear_recovery_round_state(
         if key in previous:
             state[key] = previous[key]
     write_recovery_state(local_root, task_id, state)
+    # Same reasoning as clear_recovery_state (wf-276 finding 3): a stuck
+    # handoff order cleared by a person must not leave a pending-activation
+    # marker for the external activator to act on outside this pass.
+    clear_pending_activation(local_root, task_id)
     if park_seat is not None:
         state["park"] = park_seat(task_id)
     return state
@@ -2130,27 +2139,40 @@ def _finish_after_stage_handoff(
 ) -> Dict[str, Any]:
     """``activation_mode: "handoff"`` — never restart from inside the pass.
 
-    First pass to reach here after merge/bump/stage writes the
-    pending-activation marker and stops; it never calls ``run_activate``, so
-    the daemon this pass runs under is never touched. A later pass that
-    finds the marker checks the installed version itself: not yet the
-    marker's version is the ordinary, expected wait for the scheduled
-    activator (outcome ``activation_pending``, no stop/park — this is not a
-    failure); already the marker's version clears the marker and closes.
+    ``activate_cmd`` (``wf-activate.sh`` in production) is still called every
+    pass, same as ``in_pass`` mode: it is what actually leaves the pending
+    marker the external activator (``wf-activator.sh``, scheduled outside any
+    pass) consumes, and it is the tool that knows whether the release is
+    already active without this module hard-coding that protocol. The
+    difference from ``in_pass`` is only in how a nonzero rc is read: never a
+    stop, always the ordinary "handed off, retry next pass" outcome, because
+    the wrapper's own contract is "never restart, exit 1 to mean pending"
+    (wf-276 host comment). This module's own marker under
+    ``integrator-activate/<task-id>.json`` is bookkeeping only — it decides
+    whether this is the first handoff (outcome ``activation_handoff``) or a
+    later poll (``activation_pending``) — not the protocol the activator
+    reads.
     """
     local_root = config["local_root"]
+    release_dir = os.path.join(config["release_root"], new_version)
     pending = read_pending_activation(local_root, task_id)
-    if pending is None or pending.get("version") != new_version:
-        release_dir = os.path.join(config["release_root"], new_version)
+    first = pending is None or pending.get("version") != new_version
+
+    activate = ops["run_activate"](ctx)
+    if activate["rc"] != 0:
         write_pending_activation(local_root, task_id, {
             "task_id": task_id,
             "project": project,
             "version": new_version,
             "release_root": release_dir,
-            "requested_at": _utc_iso_z(),
+            "requested_at": pending.get("requested_at") if pending and not first else _utc_iso_z(),
         })
-        append_ledger_row(local_root, project, "ACTIVATE", ticket=task_id, outcome="activation_handoff")
-        result["outcome"] = "activation_handoff"
+        outcome = "activation_handoff" if first else "activation_pending"
+        if first:
+            append_ledger_row(local_root, project, "ACTIVATE", ticket=task_id, outcome=outcome)
+        else:
+            append_ledger_row(local_root, project, "SKIP", ticket=task_id, reason=outcome)
+        result["outcome"] = outcome
         result["reason"] = (
             "activation handed off to the scheduled activator; release %s is pending at %s"
             % (new_version, release_dir)
@@ -2160,11 +2182,21 @@ def _finish_after_stage_handoff(
 
     verified = ops["verify_installed_version"](new_version, ctx)
     if not verified.get("ok"):
+        # activate_cmd reported the release already active but the install
+        # verify disagrees — treat as still pending rather than closing on
+        # an unconfirmed version (mirrors in_pass's own verify gate).
+        write_pending_activation(local_root, task_id, {
+            "task_id": task_id,
+            "project": project,
+            "version": new_version,
+            "release_root": release_dir,
+            "requested_at": pending.get("requested_at") if pending and not first else _utc_iso_z(),
+        })
         append_ledger_row(local_root, project, "SKIP", ticket=task_id, reason="activation_pending")
         result["outcome"] = "activation_pending"
         result["reason"] = (
-            "activation marker for %s is set but the installed version is not yet %s"
-            % (new_version, new_version)
+            "activate_cmd reported %s active but installed version is not yet verified"
+            % new_version
         )
         write_receipt(local_root, project, result)
         return result
