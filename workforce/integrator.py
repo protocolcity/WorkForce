@@ -574,6 +574,25 @@ def decide_after_suites(
     }
 
 
+def decide_after_merge_base(
+    conflict: bool, recovery_rounds_used: int, max_recovery_rounds: int,
+) -> Dict[str, str]:
+    """proceed | recover | stop, from a pr_base merge conflict and history."""
+    if not conflict:
+        return {"action": "proceed", "reason": "merge clean"}
+    if recovery_rounds_used >= max_recovery_rounds:
+        return {
+            "action": "stop",
+            "reason": "recovery rounds exhausted after merge conflict (%d/%d)"
+            % (recovery_rounds_used, max_recovery_rounds),
+        }
+    return {
+        "action": "recover",
+        "reason": "merge conflict merging base into branch; recovery round %d/%d"
+        % (recovery_rounds_used + 1, max_recovery_rounds),
+    }
+
+
 def decide_after_findings(
     findings: Sequence[str], recovery_rounds_used: int, max_recovery_rounds: int,
 ) -> Dict[str, str]:
@@ -1093,6 +1112,14 @@ def suite_failure_comment_body(output: str, round_no: int, max_rounds: int) -> s
     )
 
 
+def merge_base_conflict_comment_body(paths: Sequence[str], round_no: int, max_rounds: int) -> str:
+    return (
+        "Blocked: merge conflict merging base into branch (recovery round %d/%d)\n"
+        "Next step: resolve the conflict in the paths below, then re-run the integrator pass.\n\n%s"
+        % (round_no, max_rounds, "\n".join("- %s" % p for p in paths) if paths else "(no paths reported)")
+    )
+
+
 def later_findings_comment_body(later: Sequence[str]) -> str:
     lines = ["Follow-up: %d lower-priority finding(s) noted, not blocking" % len(later)]
     for f in later:
@@ -1267,8 +1294,8 @@ def clear_post_merge_state(local_root: str, task_id: str) -> None:
 
 _LEDGER_EVENTS = (
     "DISCOVER", "SUITES", "RECOVER", "STOP", "REVIEW", "FINDINGS", "LATER",
-    "WAIT_CI", "MERGE", "STAGE", "ACTIVATE", "CLOSE", "PRUNE", "DRY_RUN", "SKIP",
-    "PARK_FAILED",
+    "WAIT_CI", "MERGE", "MERGE_BASE", "STAGE", "ACTIVATE", "CLOSE", "PRUNE",
+    "DRY_RUN", "SKIP", "PARK_FAILED",
 )
 
 
@@ -1603,6 +1630,42 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
     def push_branch(checkout: str, branch: str) -> Dict[str, Any]:
         return _run(["git", "push", "-u", "origin", "HEAD:%s" % branch], cwd=checkout)
 
+    def merge_base_into_branch(checkout: str, branch: str, base: str) -> Dict[str, Any]:
+        """Merge ``origin/<base>`` into *branch* before suites (wf-274).
+
+        No rebase, no force: a clean merge commits as "Merge <base> into
+        <branch> (integrator)" and is pushed with the branch; a conflicting
+        merge aborts cleanly and reports the conflicting paths, leaving the
+        seat's own commits untouched. A merge failure that leaves no
+        conflicted paths (missing origin/<base>, dirty tree, merge already
+        in progress, ...) is reported as an operational failure
+        (``ok=False, conflict=False``) rather than a conflict, so callers
+        don't misroute it as something the seat can fix by redoing work.
+        """
+        fetch = _run(["git", "fetch", "origin"], cwd=checkout)
+        if fetch["rc"] != 0:
+            return {"ok": False, "conflict": False, "paths": [], "sha": "", "output": fetch["output"]}
+        pre_sha = _run(["git", "rev-parse", "HEAD"], cwd=checkout)
+        merge = _run(
+            ["git", "merge", "--no-ff", "origin/%s" % base,
+             "-m", "Merge %s into %s (integrator)" % (base, branch)],
+            cwd=checkout,
+        )
+        if merge["rc"] != 0:
+            unmerged = _run(["git", "diff", "--name-only", "--diff-filter=U"], cwd=checkout)
+            paths = [p for p in unmerged["output"].splitlines() if p.strip()]
+            _run(["git", "merge", "--abort"], cwd=checkout)
+            if paths:
+                return {"ok": False, "conflict": True, "paths": paths, "output": merge["output"]}
+            return {"ok": False, "conflict": False, "paths": [], "output": merge["output"]}
+        post_sha = _run(["git", "rev-parse", "HEAD"], cwd=checkout)
+        new_sha = post_sha["output"].strip() if post_sha["rc"] == 0 else ""
+        if new_sha and new_sha != pre_sha["output"].strip():
+            push = _run(["git", "push", "origin", "HEAD:%s" % branch], cwd=checkout)
+            if push["rc"] != 0:
+                return {"ok": False, "conflict": False, "paths": [], "sha": new_sha, "output": push["output"]}
+        return {"ok": True, "conflict": False, "paths": [], "sha": new_sha, "output": merge["output"]}
+
     def open_or_update_pr(checkout: str, branch: str, base: str, title: str, body: str) -> Dict[str, Any]:
         view = _run(["gh", "pr", "view", branch, "--json", "number,url"], cwd=checkout)
         if view["rc"] == 0:
@@ -1895,6 +1958,7 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
 
     return {
         "run_suites": run_suites,
+        "merge_base_into_branch": merge_base_into_branch,
         "checkout_clean": checkout_clean,
         "diff_text": diff_text,
         "checkout_head_sha": checkout_head_sha,
@@ -2120,6 +2184,7 @@ def run_one(
     append_ledger_row(config["local_root"], project, "DISCOVER", ticket=task_id, worker=order["worker"])
 
     try:
+        merge_base = ops["merge_base_into_branch"](checkout, branch, config["pr_base"])
         current_head_sha = ops["checkout_head_sha"](checkout)
     except FileNotFoundError:
         # The seat's checkout is not where the template or its Workdir line
@@ -2128,6 +2193,51 @@ def run_one(
         reason = "checkout missing: %s (seat Workdir: line or checkout_templates needed)" % checkout
         _stop_seat_and_record(ops, config, project, task_id, reason)
         result["outcome"] = "checkout_missing"
+        result["reason"] = reason
+        write_receipt(config["local_root"], project, result)
+        return result
+
+    append_ledger_row(
+        config["local_root"], project, "MERGE_BASE", ticket=task_id,
+        conflict=bool(merge_base.get("conflict")),
+    )
+    if not merge_base.get("ok") and not merge_base.get("conflict"):
+        # A merge failure that leaves no conflicted paths (fetch/push error,
+        # dirty tree, merge already in progress, ...) is an operational
+        # failure, not something the seat can fix by redoing work: stop this
+        # pass without touching recovery state so the next integrator pass
+        # retries against a clean checkout.
+        reason = "merge_base_into_branch failed merging %s into %s (no conflict): %s" % (
+            config["pr_base"], branch, (merge_base.get("output") or "").strip() or "(no output)",
+        )
+        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        result["outcome"] = "merge_base_failed"
+        result["reason"] = reason
+        write_receipt(config["local_root"], project, result)
+        return result
+    if merge_base.get("conflict"):
+        paths = merge_base.get("paths") or []
+        result["conflict_paths"] = paths
+        merge_decision = decide_after_merge_base(True, rounds_used, config["max_recovery_rounds"])
+        reason = "merge conflict merging %s into %s (paths: %s)" % (
+            config["pr_base"], branch, ", ".join(paths) if paths else "unknown",
+        )
+        if merge_decision["action"] == "stop":
+            _stop_seat_and_record(ops, config, project, task_id, merge_decision["reason"])
+            result["outcome"] = "stopped"
+            result["reason"] = merge_decision["reason"]
+            write_receipt(config["local_root"], project, result)
+            return result
+        ops["post_comment"](
+            task_id,
+            merge_base_conflict_comment_body(paths, rounds_used + 1, config["max_recovery_rounds"]),
+        )
+        ops["release_seat"](task_id, reason)
+        dispatch_seat_recovery(reason)
+        next_state = _carry_recovery_state(state, rounds_used + 1)
+        write_recovery_state(config["local_root"], task_id, next_state)
+        append_ledger_row(config["local_root"], project, "RECOVER", ticket=task_id, reason=reason)
+        result["outcome"] = "merge_base_conflict"
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
         return result
