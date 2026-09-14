@@ -194,6 +194,7 @@ def load_config(path: str) -> Dict[str, Any]:
     )
 
     return {
+        "config_path": str(raw_path),
         "local_root": local_root,
         "roster_path": roster_path,
         "project": project,
@@ -592,6 +593,35 @@ def decide_after_findings(
     }
 
 
+# Provider-planted identity scratch (seat_templates.py plants these into a
+# dispatched checkout for cursor-agent/grok CLI to read their own MCP/config
+# from <cwd>). exclude_from_git() (task_runner.py) is meant to keep git from
+# seeing them, but engine-mediated recovery can run a provider's own dispatch
+# path before that plant happens; treating them as always-untracked here is
+# the belt to that exclude's suspenders so a leftover scratch dir never reads
+# as "checkout is not clean" (wf-270).
+_PROVIDER_SCRATCH_DIRS = (".cursor/", ".grok/")
+
+
+def _strip_provider_scratch(porcelain_output: str) -> str:
+    """*porcelain_output* (``git status --porcelain``) minus provider scratch lines."""
+    kept = []
+    for line in porcelain_output.splitlines():
+        path = line[3:] if len(line) > 3 else ""
+        # git quotes paths containing spaces/special chars in double quotes
+        # (C-style); strip them so a quoted ".cursor/..." still matches.
+        if len(path) >= 2 and path[0] == '"' and path[-1] == '"':
+            path = path[1:-1]
+        bare = path.rstrip("/")
+        if any(
+            path.startswith(d) or bare == d.rstrip("/")
+            for d in _PROVIDER_SCRATCH_DIRS
+        ):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def decide_merge_ready(
     *, ci_status: str, findings: Sequence[str], checkout_clean: bool,
 ) -> Tuple[bool, str]:
@@ -675,20 +705,44 @@ def strip_test_hunks_from_diff(diff_text: str) -> str:
     return "".join(kept)
 
 
+def suite_result_summary(rc: Optional[int], output: str) -> str:
+    """One-line-plus-tail summary of a suite run for the reviewer prompt.
+
+    A correction-round reviewer that only sees the delta diff has no way to
+    know the suites passed in the same pass, so it can raise a "cannot pass
+    the suites" finding that flatly contradicts a green run (wf-269). Stating
+    the result here removes that guesswork.
+    """
+    if rc is None:
+        return "Suites in this pass: not run."
+    if rc == 0:
+        return "Suites in this pass: green (rc 0)."
+    excerpt = (output or "").strip()
+    if len(excerpt) > 2000:
+        excerpt = excerpt[-2000:]
+    return "Suites in this pass: red (rc %d) — tail:\n%s" % (rc, excerpt or "(no output)")
+
+
 def build_reviewer_prompt(
     order: Dict[str, Any],
     diff: str,
     *,
     max_findings: int = _DEFAULT_MAX_FINDINGS_PER_ROUND,
     previous_findings: Optional[Sequence[str]] = None,
+    branch_diff: Optional[str] = None,
+    suite_rc: Optional[int] = None,
+    suite_output: str = "",
 ) -> str:
     """Deterministic reviewer prompt: scope from the order, diff minus tests.
 
     Round one (``previous_findings`` empty) reviews the whole PR diff.
     A correction round (``previous_findings`` non-empty) reviews only the
     delta *diff* since the prior review's commit, plus the prior findings
-    list, and asks whether each is closed and whether the correction
-    introduced a new defect — never a re-audit of the whole change.
+    list, plus the *full* branch diff against the PR base as read-only
+    context and the suite result of the same pass — a previous finding
+    fixed by an earlier commit on the same branch (outside the correction
+    delta) must close instead of being reported open again (wf-269;
+    wf-272).
     """
     scoped_diff = strip_test_hunks_from_diff(diff)
     cap_line = (
@@ -709,9 +763,12 @@ def build_reviewer_prompt(
         )
         lines.extend([
             "",
-            "Only the correction diff since the prior review is included below — not the "
-            "whole PR. For each finding above, judge whether it is now closed, and whether "
-            "the correction introduced a new defect. Do not re-audit code outside this diff.",
+            "The correction diff since the prior review is included below, followed by "
+            "the full branch diff against the PR base as read-only context. Mark a "
+            "finding above closed if the branch as a whole addresses it, even if the fix "
+            "landed in an earlier commit outside the correction diff. Report only defects "
+            "introduced by the correction diff; do not re-audit the branch context.",
+            suite_result_summary(suite_rc, suite_output),
             cap_line,
             "",
             "Respond with a single JSON object: "
@@ -721,6 +778,9 @@ def build_reviewer_prompt(
             "",
             "--- correction diff (tests excluded) ---",
             scoped_diff or "(no non-test changes)",
+            "",
+            "--- full branch diff vs PR base, read-only context (tests excluded) ---",
+            strip_test_hunks_from_diff(branch_diff or "") or "(no non-test changes)",
         ])
         return "\n".join(lines)
 
@@ -1040,11 +1100,13 @@ def later_findings_comment_body(later: Sequence[str]) -> str:
     return "\n".join(lines)
 
 
-def stopped_comment_body(reason: str) -> str:
+def stopped_comment_body(reason: str, *, config_path: str, task_id: str) -> str:
+    """The Blocked: comment a stop posts — names the exact clear command (wf-270)."""
     return (
         "Blocked: integrator stopped this order — %s\n"
-        "Next step: a person clears this before further automated attempts."
-        % reason
+        "Next step: workforce integrate --config %s "
+        "--clear-recovery %s --cleared-by <who> --reason \"<why>\""
+        % (reason, config_path, task_id)
     )
 
 
@@ -1106,6 +1168,7 @@ def clear_recovery_state(local_root: str, task_id: str) -> None:
 
 def clear_recovery_round_state(
     local_root: str, task_id: str, cleared_by: str, reason: str,
+    *, park_seat: Optional[Callable[[str], Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """A person clearing an order stuck at ``max_recovery_rounds``.
 
@@ -1118,6 +1181,13 @@ def clear_recovery_round_state(
     the stuck round count, not about forgetting capped follow-ups or the
     review scope, and a close right after a clear must still show the real
     follow_ups (wf-268 second-pass finding 2).
+
+    *park_seat*, when given, re-parks the order to ``in_review`` after the
+    local state is cleared, under key ``"park"`` on the returned state —
+    clearing local JSON alone leaves an order that fell to ``backlog``
+    (a pre-fix stop or a failed re-park) invisible to
+    :func:`discover_candidates` even after this clear (wf-270 recovery
+    round 4, finding 2).
     """
     previous = read_recovery_state(local_root, task_id) or {}
     state: Dict[str, Any] = {
@@ -1130,6 +1200,8 @@ def clear_recovery_round_state(
         if key in previous:
             state[key] = previous[key]
     write_recovery_state(local_root, task_id, state)
+    if park_seat is not None:
+        state["park"] = park_seat(task_id)
     return state
 
 
@@ -1196,6 +1268,7 @@ def clear_post_merge_state(local_root: str, task_id: str) -> None:
 _LEDGER_EVENTS = (
     "DISCOVER", "SUITES", "RECOVER", "STOP", "REVIEW", "FINDINGS", "LATER",
     "WAIT_CI", "MERGE", "STAGE", "ACTIVATE", "CLOSE", "PRUNE", "DRY_RUN", "SKIP",
+    "PARK_FAILED",
 )
 
 
@@ -1260,10 +1333,13 @@ def _any_open_ledger_shift(
 ) -> bool:
     """True when a roster lane seat's ledger has a non-stale open shift.
 
-    Skips the integrator's own ``integrator-<project>.log`` files — those
-    are this job's receipts, not an implementation seat's shift record.
-    Retired identities and START rows older than the seat's budget are
-    ignored.
+    With *implementation_seats* given (the roster's lanes) only those ledgers
+    are read: a job's own ledger (the integrator's ``integrator.log`` is
+    open for the whole pass that asks this question, and so are the
+    supervisor's and loop-health's while they run) and retired identities'
+    files must never read as a seat mid-shift, or activation is skipped
+    forever. Skips ``integrator-<project>.log`` receipts. START rows older
+    than the seat's budget are ignored.
     """
     from . import ledger as ledger_mod
 
@@ -1340,26 +1416,44 @@ def _seat_open_ledger_shift(local_root: str, seat: str, worker: Any) -> bool:
     return True
 
 
-def seat_in_flight(local_root: str, workers: Optional[Dict[str, Any]] = None) -> bool:
-    """True when a roster lane seat holds a live lock or a non-stale open shift.
+def seat_in_flight(
+    local_root: str,
+    workers: Optional[Dict[str, Any]] = None,
+    *,
+    roster_path: Optional[str] = None,
+) -> bool:
+    """True when any implementation seat holds a live lock or a non-stale open shift.
 
-    With no *workers*, any live lock or open ledger shift is in-flight (legacy
+    Activation restarts the WorkForce install a live seat is running under;
+    this must never fire while a seat is mid-shift, live-locked or not.
+    With *workers* or *roster_path* the scan is limited to roster lanes
+    (implementation seats); jobs and retired identities are not seats.
+    With neither, any live lock or open ledger shift is in-flight (legacy
     fail-safe for callers that still use the one-arg form).
     """
     from . import provider_qualification as pq_mod
+    from . import roster as roster_mod
 
-    if not workers:
+    resolved_workers: Optional[Dict[str, Any]] = workers
+    if roster_path:
+        try:
+            rost = roster_mod.load(path=roster_path)
+            resolved_workers = rost.workers
+        except Exception:  # noqa: BLE001 — an unreadable roster must not unblock a restart
+            resolved_workers = None
+
+    if not resolved_workers:
         if pq_mod.scan_active_locks(local_root):
             return True
         return _legacy_any_open_ledger_shift(local_root)
 
-    implementation_seats = _implementation_seats(workers)
+    implementation_seats = _implementation_seats(resolved_workers)
     if not implementation_seats:
         return False
     for row in pq_mod.scan_active_locks(local_root):
         if row["worker"] in implementation_seats:
             return True
-    return _any_open_ledger_shift(local_root, workers, implementation_seats)
+    return _any_open_ledger_shift(local_root, resolved_workers, implementation_seats)
 
 
 def _seat_has_active_lock(local_root: str, seat: str) -> bool:
@@ -1468,9 +1562,37 @@ def discover_candidates(
             "provider": provider,
             "title": str(t.get("title") or ""),
             "checkout_override": checkout_override,
+            "_sort_key": _parked_sort_key(t, tid),
         })
-    candidates.sort(key=lambda c: c["task_id"])
+    # wf-273 — desk list order with --limit N per pass let a newer order
+    # keep winning while an older parked one (e.g. wf-271) starved. Oldest
+    # parked-at first within priority tier, task id as the final tiebreak
+    # for determinism when priority and age both tie or are unknown.
+    candidates.sort(key=lambda c: c["_sort_key"])
+    for c in candidates:
+        del c["_sort_key"]
     return candidates[:headroom] if headroom < len(candidates) else candidates
+
+
+def _parked_sort_key(task: Dict[str, Any], task_id: str) -> Tuple[int, float, str]:
+    """(priority, parked-at age, task_id) — lower priority number is more
+    urgent (desk convention: 1=urgent ... 4=low); unset priority is treated
+    as the desk default (3) so it neither jumps nor starves behind explicit
+    priorities. ``updated_at`` is the best available parked-at proxy (the
+    desk stamps it on the in_review transition); unknown age sorts last
+    within its tier rather than jumping the queue."""
+    raw_priority = task.get("priority")
+    try:
+        priority = int(raw_priority)
+    except (TypeError, ValueError):
+        priority = 3
+    age = float("inf")
+    updated = task.get("updated_at")
+    if isinstance(updated, str):
+        dt = _parse_iso_z(updated)
+        if dt is not None:
+            age = dt.timestamp()
+    return (priority, age, task_id)
 
 
 # --------------------------------------------------------------------------
@@ -1566,7 +1688,7 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
 
     def checkout_clean(checkout: str) -> bool:
         r = _run(["git", "status", "--porcelain"], cwd=checkout)
-        return r["rc"] == 0 and not r["output"].strip()
+        return r["rc"] == 0 and not _strip_provider_scratch(r["output"]).strip()
 
     def diff_text(checkout: str, base: str) -> str:
         r = _run(["git", "diff", "%s...HEAD" % base], cwd=checkout)
@@ -1830,6 +1952,55 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
         # Blocked:-headed comments already move the ticket to backlog.
         return post_comment(task_id, "Blocked: %s" % reason)
 
+    def park_seat(task_id: str) -> Dict[str, Any]:
+        """Set the order's status back to ``in_review`` directly.
+
+        A Blocked:-headed comment auto-transitions a ticket to backlog
+        (PROTOCOL.md §5 comment lifecycle); a stopped order must stay parked
+        so the next scheduled pass discovers it without a hand, and a fresh
+        seat shift is never dispatched over the stopped order's branch
+        (wf-270).
+        """
+        import urllib.parse
+        dry, hermetic = hermetic_dry_run(False)
+        if dry:
+            return {"ok": True, "dry_run": True, "hermetic": hermetic}
+        q = urllib.parse.urlencode({"product": config["project"]})
+        url = "%s/api/admin/tasks/%s?%s" % (
+            desk, urllib.parse.quote(task_id, safe=""), q,
+        )
+        return _req("PATCH", url, {"status": "in_review", "author": "integrator"})
+
+    def stop_seat(task_id: str, reason: str) -> Dict[str, Any]:
+        """Post the Blocked stop comment, then re-park the order in_review."""
+        comment = post_comment(
+            task_id,
+            stopped_comment_body(
+                reason, config_path=config.get("config_path", ""), task_id=task_id,
+            ),
+        )
+        park_result = park_seat(task_id)
+        if park_result.get("ok") is False:
+            # A stop comment already moved the ticket to backlog (PROTOCOL.md
+            # §5 comment lifecycle); a failed re-park PATCH leaves it there
+            # with nothing surfacing the failure, silently recreating the
+            # exact hole wf-270 exists to close. Escalate with a second
+            # comment and a distinct ledger event instead of letting the
+            # caller record a plain STOP as if the order stayed parked.
+            post_comment(
+                task_id,
+                "Blocked: automatic re-park to in_review failed (%s) after "
+                "the stop above; this order is exposed in backlog and a "
+                "person must re-park it to in_review by hand."
+                % (park_result.get("error") or "unknown error"),
+            )
+            append_ledger_row(
+                config["local_root"], config["project"], "PARK_FAILED",
+                ticket=task_id, error=park_result.get("error") or "unknown error",
+            )
+        comment["park"] = park_result
+        return comment
+
     def close_order(task_id: str, evidence: Dict[str, str]) -> Dict[str, Any]:
         return post_comment(task_id, build_close_body(evidence))
 
@@ -1858,6 +2029,8 @@ def default_ops(config: Dict[str, Any]) -> Dict[str, Callable]:
         "capture_screenshots": capture_screenshots,
         "post_comment": post_comment,
         "release_seat": release_seat,
+        "park_seat": park_seat,
+        "stop_seat": stop_seat,
         "close_order": close_order,
     }
 
@@ -1900,9 +2073,7 @@ def _finish_after_stage(
     result["version"] = {"from": current_version, "to": new_version}
     ctx = {"version": new_version, "checkout": config["main_checkout"]}
 
-    # Activation restarts the install any live seat is running under — use the
-    # legacy fail-safe scan (any lock or open shift), not roster-scoped only.
-    if seat_in_flight(config["local_root"]):
+    if seat_in_flight(config["local_root"], roster_path=config.get("roster_path")):
         append_ledger_row(config["local_root"], project, "SKIP", ticket=task_id, reason="seat_in_flight")
         result["outcome"] = "activate_skipped"
         result["reason"] = "an implementation seat is in flight; retry activation next pass"
@@ -1927,11 +2098,32 @@ def _finish_after_stage(
             "Blocked: installed build does not report the bumped version\n"
             "Expected: %s\n"
             "Observed: %s\n"
-            "Next step: a person clears this before further automated attempts."
-            % (new_version, verified.get("observed") or "(unknown)")
+            "Next step: workforce integrate --config %s "
+            "--clear-recovery %s --cleared-by <who> --reason \"<why>\""
+            % (
+                new_version, verified.get("observed") or "(unknown)",
+                config.get("config_path", ""), task_id,
+            )
         )
         ops["post_comment"](task_id, body)
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason="install not verified")
+        park_result = ops["park_seat"](task_id)
+        if park_result.get("ok") is False:
+            # Same failure class as stop_seat's re-park (wf-270 recovery
+            # round 4, finding 1): a failed PATCH must not read as a
+            # successful STOP, or the order sits invisible in backlog.
+            ops["post_comment"](
+                task_id,
+                "Blocked: automatic re-park to in_review failed (%s) after "
+                "the stop above; this order is exposed in backlog and a "
+                "person must re-park it to in_review by hand."
+                % (park_result.get("error") or "unknown error"),
+            )
+            append_ledger_row(
+                config["local_root"], project, "PARK_FAILED",
+                ticket=task_id, error=park_result.get("error") or "unknown error",
+            )
+        else:
+            append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason="install not verified")
         result["outcome"] = "install_not_verified"
         result["reason"] = "installed build does not report version %s" % new_version
         write_receipt(config["local_root"], project, result)
@@ -1959,6 +2151,24 @@ def _finish_after_stage(
     result["outcome"] = "closed"
     write_receipt(config["local_root"], project, result)
     return result
+
+
+def _stop_seat_and_record(
+    ops: Dict[str, Callable], config: Dict[str, Any], project: str, task_id: str, reason: str,
+) -> Dict[str, Any]:
+    """Call ops["stop_seat"] and only log STOP if the re-park actually held.
+
+    stop_seat() already posts its own Blocked/PARK_FAILED escalation when the
+    re-park PATCH fails; a plain STOP row here on top of that would read as
+    "this order is safely parked" when it is really still sitting exposed in
+    backlog (wf-270 recovery round 5).
+    """
+    stop_result = ops["stop_seat"](task_id, reason)
+    park = (stop_result or {}).get("park") or {}
+    if park.get("ok") is False:
+        return stop_result
+    append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+    return stop_result
 
 
 def run_one(
@@ -2031,8 +2241,7 @@ def run_one(
         # says (pc-1487 rehearsal): stop this order with a durable comment
         # instead of letting the whole pass die.
         reason = "checkout missing: %s (seat Workdir: line or checkout_templates needed)" % checkout
-        ops["post_comment"](task_id, stopped_comment_body(reason))
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        _stop_seat_and_record(ops, config, project, task_id, reason)
         result["outcome"] = "checkout_missing"
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
@@ -2052,8 +2261,7 @@ def run_one(
     result["suites"] = {"rc": suite["rc"]}
 
     if decision["action"] == "stop":
-        ops["release_seat"](task_id, stopped_comment_body(decision["reason"]))
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=decision["reason"])
+        _stop_seat_and_record(ops, config, project, task_id, decision["reason"])
         result["outcome"] = "stopped"
         result["reason"] = decision["reason"]
         write_receipt(config["local_root"], project, result)
@@ -2133,9 +2341,13 @@ def run_one(
                 diff = ops["diff_text"](checkout, config["pr_base"])
                 prompt = build_reviewer_prompt(order, diff, max_findings=max_findings)
             else:
+                branch_diff = ops["diff_text"](checkout, config["pr_base"])
                 prompt = build_reviewer_prompt(
                     order, diff, max_findings=max_findings,
                     previous_findings=last_review.get("findings"),
+                    branch_diff=branch_diff,
+                    suite_rc=suite["rc"],
+                    suite_output=suite["output"],
                 )
         else:
             diff = ops["diff_text"](checkout, config["pr_base"])
@@ -2157,8 +2369,7 @@ def run_one(
 
         if review.get("empty"):
             reason = review.get("output") or "reviewer output was empty after DONE"
-            ops["post_comment"](task_id, stopped_comment_body(reason))
-            append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+            _stop_seat_and_record(ops, config, project, task_id, reason)
             result["outcome"] = "review_empty"
             result["reason"] = reason
             write_receipt(config["local_root"], project, result)
@@ -2169,8 +2380,7 @@ def run_one(
             # contains is leftover from an earlier, unrelated dispatch and must
             # never be parsed as this dispatch's findings or merged on.
             reason = review.get("output") or "reviewer output was unchanged after DONE (stale)"
-            ops["post_comment"](task_id, stopped_comment_body(reason))
-            append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+            _stop_seat_and_record(ops, config, project, task_id, reason)
             result["outcome"] = "review_stale"
             result["reason"] = reason
             write_receipt(config["local_root"], project, result)
@@ -2232,8 +2442,7 @@ def run_one(
         if later_findings:
             ops["post_comment"](task_id, later_findings_comment_body(later_findings))
         if findings_decision["action"] == "stop":
-            ops["release_seat"](task_id, stopped_comment_body(findings_decision["reason"]))
-            append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=findings_decision["reason"])
+            _stop_seat_and_record(ops, config, project, task_id, findings_decision["reason"])
             result["outcome"] = "stopped"
         else:
             deferred = _defer_recovery_if_seat_busy(
@@ -2286,8 +2495,7 @@ def run_one(
     pre_merge_sha = ops["remote_head_sha"](checkout, config["pr_base"])
     if not pre_merge_sha:
         reason = "could not read origin/%s before merge; not bumping" % config["pr_base"]
-        ops["post_comment"](task_id, stopped_comment_body(reason))
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        _stop_seat_and_record(ops, config, project, task_id, reason)
         result["outcome"] = "main_unverified"
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
@@ -2296,8 +2504,7 @@ def run_one(
     merge = ops["merge_pr"](checkout, pr.get("number"))
     if merge.get("rc") != 0:
         reason = "merge_pr failed (rc=%s)" % merge.get("rc")
-        ops["post_comment"](task_id, stopped_comment_body(reason))
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        _stop_seat_and_record(ops, config, project, task_id, reason)
         result["outcome"] = "merge_failed"
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
@@ -2311,16 +2518,14 @@ def run_one(
     merge_parent_sha = ops["merge_commit_parent_sha"](checkout, config["pr_base"])
     if not merge_parent_sha:
         reason = "could not read merge commit parent for origin/%s after merge; not bumping" % config["pr_base"]
-        ops["post_comment"](task_id, stopped_comment_body(reason))
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        _stop_seat_and_record(ops, config, project, task_id, reason)
         result["outcome"] = "main_unverified"
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
         return result
     if pre_merge_sha != merge_parent_sha:
         reason = "origin/%s moved during merge; not bumping" % config["pr_base"]
-        ops["post_comment"](task_id, stopped_comment_body(reason))
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        _stop_seat_and_record(ops, config, project, task_id, reason)
         result["outcome"] = "main_moved"
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
@@ -2332,8 +2537,7 @@ def run_one(
     sync = ops["sync_main_checkout"](main_checkout, config["pr_base"])
     if not sync.get("sha"):
         reason = "could not sync main_checkout to origin/%s; not bumping" % config["pr_base"]
-        ops["post_comment"](task_id, stopped_comment_body(reason))
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        _stop_seat_and_record(ops, config, project, task_id, reason)
         result["outcome"] = "main_unverified"
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
@@ -2346,8 +2550,7 @@ def run_one(
     push = ops["commit_and_push_version"](main_checkout, config["pr_base"], new_version)
     if push.get("rc") != 0:
         reason = "version bump commit/push to origin/%s failed (rc=%s)" % (config["pr_base"], push.get("rc"))
-        ops["post_comment"](task_id, stopped_comment_body(reason))
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        _stop_seat_and_record(ops, config, project, task_id, reason)
         result["outcome"] = "main_unverified"
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
@@ -2361,8 +2564,7 @@ def run_one(
     post_push_sha = ops["remote_head_sha"](main_checkout, config["pr_base"])
     if not pushed_sha or not post_push_sha or pushed_sha != post_push_sha:
         reason = "origin/%s moved during the version bump push; not staging" % config["pr_base"]
-        ops["post_comment"](task_id, stopped_comment_body(reason))
-        append_ledger_row(config["local_root"], project, "STOP", ticket=task_id, reason=reason)
+        _stop_seat_and_record(ops, config, project, task_id, reason)
         result["outcome"] = "main_moved"
         result["reason"] = reason
         write_receipt(config["local_root"], project, result)
@@ -2430,11 +2632,24 @@ def main(argv=None) -> int:
             return 1
         try:
             config = load_config(args.config)
-            clear_recovery_round_state(config["local_root"], args.clear_recovery, args.cleared_by, args.reason)
+            ops = default_ops(config)
+            state = clear_recovery_round_state(
+                config["local_root"], args.clear_recovery, args.cleared_by, args.reason,
+                park_seat=ops["park_seat"],
+            )
         except IntegratorError as exc:
             print("Integrator clear-recovery failed: %s" % exc, file=sys.stderr)
             return 1
-        print("Cleared recovery state for %s (by %s)." % (args.clear_recovery, args.cleared_by))
+        park_result = state.get("park") or {}
+        if park_result.get("ok") is False:
+            print(
+                "Integrator clear-recovery: cleared recovery state for %s but "
+                "failed to re-park in_review: %s"
+                % (args.clear_recovery, park_result.get("error") or "unknown error"),
+                file=sys.stderr,
+            )
+            return 1
+        print("Cleared recovery state for %s (by %s) and re-parked in_review." % (args.clear_recovery, args.cleared_by))
         return 0
 
     try:

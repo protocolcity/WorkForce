@@ -418,6 +418,16 @@ def main(argv=None) -> int:
         "--limit", type=int, default=1,
         help="max parked orders to drive this pass (default: 1)",
     )
+    p_integrate.add_argument(
+        "--clear-recovery", metavar="TASK_ID",
+        help="reset a stopped order's recovery-round count to 0",
+    )
+    p_integrate.add_argument(
+        "--cleared-by", help="who is clearing --clear-recovery (required with it)",
+    )
+    p_integrate.add_argument(
+        "--reason", help="why --clear-recovery is being done (required with it)",
+    )
 
     p_repin = sub.add_parser(
         "repin",
@@ -1172,6 +1182,31 @@ def main(argv=None) -> int:
 
     if args.cmd == "integrate":
         from . import integrator as integrator_mod
+        if args.clear_recovery:
+            if not args.cleared_by or not args.reason:
+                print("integrate: --clear-recovery requires --cleared-by and --reason", file=sys.stderr)
+                return 1
+            try:
+                cfg = integrator_mod.load_config(args.config)
+                ops = integrator_mod.default_ops(cfg)
+                state = integrator_mod.clear_recovery_round_state(
+                    cfg["local_root"], args.clear_recovery, args.cleared_by, args.reason,
+                    park_seat=ops["park_seat"],
+                )
+            except integrator_mod.IntegratorError as exc:
+                print("integrate: clear-recovery failed: %s" % exc, file=sys.stderr)
+                return 1
+            park_result = state.get("park") or {}
+            if park_result.get("ok") is False:
+                print(
+                    "integrate: cleared recovery state for %s but failed to "
+                    "re-park in_review: %s"
+                    % (args.clear_recovery, park_result.get("error") or "unknown error"),
+                    file=sys.stderr,
+                )
+                return 1
+            print("integrate: cleared recovery state for %s (by %s) and re-parked in_review." % (args.clear_recovery, args.cleared_by))
+            return 0
         try:
             cfg = integrator_mod.load_config(args.config)
             results = integrator_mod.run_pass(
