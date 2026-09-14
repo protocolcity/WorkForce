@@ -2495,3 +2495,14 @@ def test_parse_reviewer_findings_fenced_json_after_prose_counts_entries():
         "Finding 4 is closed.\n"
     )
     assert integrator.parse_reviewer_findings(text) == ["first defect", "second defect"]
+
+
+def test_ci_state_from_check_rows_buckets():
+    f = integrator.ci_state_from_check_rows
+    assert f([{"bucket": "pass", "state": "SUCCESS"}, {"bucket": "skipping", "state": "SKIPPED"}]) == "success"
+    assert f([{"bucket": "pass", "state": "SUCCESS"}, {"bucket": "pending", "state": "PENDING"}]) == "pending"
+    assert f([{"bucket": "pass", "state": "SUCCESS"}, {"bucket": "fail", "state": "FAILURE"}]) == "failure"
+    assert f([{"bucket": "cancel", "state": "CANCELLED"}]) == "failure"
+    assert f([]) == "pending"
+    assert f([{"state": "SUCCESS"}]) == "success"
+    assert f([{"state": "IN_PROGRESS"}]) == "pending"
