@@ -1960,7 +1960,9 @@ def run_one(
         # the recorded verdict instead of reviewing again.
         findings = list(last_review.get("findings") or [])
         new_later_findings: List[str] = []
+        findings_from_cache = True
     else:
+        findings_from_cache = False
         if last_review and last_review.get("sha"):
             # Correction round: only the delta since the commit the prior review
             # saw, plus the prior findings — never a re-audit of the whole PR
@@ -2024,9 +2026,21 @@ def run_one(
             write_receipt(config["local_root"], project, result)
             return result
 
-        raw_findings = parse_reviewer_findings(review.get("output", "")) if review.get("ok") else [
-            "reviewer dispatch failed"
-        ]
+        if not review.get("ok"):
+            # A dispatch failure (ledger read/write error, non-zero reviewer
+            # rc, etc.) is not a review verdict for this SHA — caching it as
+            # ``last_review`` would make a transient failure stick until a
+            # new commit, the same non-retry the "retry" branch above exists
+            # to avoid (wf-271 second-pass finding 1). Retry the review
+            # itself next pass instead of recording synthetic findings.
+            reason = review.get("output") or "reviewer dispatch failed"
+            append_ledger_row(config["local_root"], project, "SKIP", ticket=task_id, reason=reason)
+            result["outcome"] = "review_retry"
+            result["reason"] = reason
+            write_receipt(config["local_root"], project, result)
+            return result
+
+        raw_findings = parse_reviewer_findings(review.get("output", ""))
         findings, new_later_findings = cap_findings(raw_findings, max_findings)
     result["findings"] = findings
     # Later findings accumulate across rounds — a finding capped out of an
@@ -2042,6 +2056,24 @@ def run_one(
     newly_added_later = later_findings[len(existing_later):]
     if newly_added_later:
         append_ledger_row(config["local_root"], project, "LATER", ticket=task_id, count=len(newly_added_later))
+
+    if findings_from_cache and findings:
+        # These exact findings were already posted and charged against the
+        # recovery budget in the pass that first discovered them at this
+        # SHA. Re-running decide_after_findings here would burn another
+        # recovery round and re-dispatch the seat for nothing while it is
+        # still working on the original blockers (wf-271 second-pass
+        # finding 2) — repost the recorded findings for visibility but do
+        # not advance rounds_used or touch the seat again; wait for a new
+        # commit instead.
+        append_ledger_row(config["local_root"], project, "FINDINGS", ticket=task_id, count=len(findings))
+        ops["post_comment"](task_id, findings_comment_body(findings))
+        if later_findings:
+            ops["post_comment"](task_id, later_findings_comment_body(later_findings))
+        result["outcome"] = "waiting_on_findings"
+        result["reason"] = "findings already reported for %s; waiting for a new commit" % current_head_sha
+        write_receipt(config["local_root"], project, result)
+        return result
 
     findings_decision = decide_after_findings(findings, rounds_used, config["max_recovery_rounds"])
     if findings_decision["action"] != "proceed":
