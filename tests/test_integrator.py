@@ -638,6 +638,8 @@ def test_run_one_suite_failure_stops_after_recovery_rounds_exhausted(tmp_path):
     ops = FakeOps(tmp_path, suite_rc=1)
     result = integrator.run_one(make_order(), cfg, ops.as_dict())
     assert result["outcome"] == "stopped"
+    assert "release_seat" in ops.calls
+    assert "stop_seat" in ops.calls
     assert "merge_pr" not in ops.calls
 
 
@@ -1570,6 +1572,32 @@ def test_run_one_resumes_from_activate_after_seat_in_flight_without_remerging(tm
     assert "run_activate" in ops.calls
     assert "close_order" in ops.calls
     assert second["version"] == {"from": "1.0.0", "to": "1.0.1"}
+
+
+def test_run_one_suite_recovery_seat_busy_leaves_rounds_unchanged(tmp_path):
+    worker = make_worker(tmp_path, name="tester")
+    roster_path = write_roster(tmp_path, [worker])
+    cfg = base_config(tmp_path, roster_path)
+    _write_live_lock(cfg["local_root"], "tester")
+    ops = FakeOps(tmp_path, suite_rc=1)
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "seat_busy"
+    assert result["seat"] == "tester"
+    assert "dispatch_recovery" not in ops.calls
+    assert "release_seat" not in ops.calls
+    assert integrator.read_recovery_state(cfg["local_root"], "wf-1")["rounds_used"] == 0
+
+
+def test_run_one_findings_stop_after_recovery_rounds_exhausted_releases_seat(tmp_path):
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_recovery_rounds=1)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {"rounds_used": 1})
+    ops = FakeOps(tmp_path, review_findings=["fix the thing"])
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert result["outcome"] == "stopped"
+    assert "release_seat" in ops.calls
+    assert "stop_seat" in ops.calls
+    assert "merge_pr" not in ops.calls
 
 
 def test_run_one_findings_recovery_seat_busy_leaves_rounds_unchanged(tmp_path):
