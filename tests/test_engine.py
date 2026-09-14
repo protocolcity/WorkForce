@@ -993,6 +993,20 @@ def test_preflight_resolves_relative_and_absolute_script_paths(tmp_path):
         )
 
 
+def test_missing_workdir_fails_closed_with_ledger_error(tmp_path):
+    """wf-269: a stale/misconfigured roster workdir must not raise a bare
+    OSError past dispatch()'s own error handling. os.statvfs on a missing
+    workdir (the observed bp-supervisor agent-exit shape) has to surface as
+    an ERROR row in the worker's own ledger, not an opaque exception that
+    only the caller's generic except-clause ever sees."""
+    w = make_worker(tmp_path, workdir=str(tmp_path / "does-not-exist"))
+    assert engine.dispatch(w, local(tmp_path)) == 1
+    text = ledger_text(tmp_path)
+    assert "ERROR" in text
+    assert "workdir unreadable" in text
+    assert "START" not in text
+
+
 def test_roster_isolates_duplicate_identity(tmp_path, caplog):
     """Second worker with duplicate identity is skipped; first survives."""
     import logging
@@ -1889,8 +1903,10 @@ def test_shift_finalize_skips_when_not_ff_able(tmp_path):
     from workforce.engine import Ledger, _finalize_shift_workdir
 
     led = Ledger(str(tmp_path / "local" / "ledger"), "tester")
-    kv = _finalize_shift_workdir(w, str(wt), led)
+    kv, note = _finalize_shift_workdir(w, str(wt), led)
     assert kv == {}
+    assert note is not None
+    assert "not ff-able" in note
     text = (tmp_path / "local" / "ledger" / "tester.log").read_text()
     assert "not ff-able" in text
     # Primary unchanged (still founder tip).

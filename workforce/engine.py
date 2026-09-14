@@ -778,6 +778,52 @@ def _fetch_task(
     return None
 
 
+def _post_shift_finalize_note(
+    worker: Worker,
+    body: str,
+    out_path: str,
+    recovery_task_id: Optional[str] = None,
+) -> dict:
+    """Record why a shift branch was kept after a non-ff finalize (wf-267)."""
+    from .capacity import hermetic_dry_run
+
+    task_id = recovery_task_id
+    if not task_id:
+        ref = _task_ref_from_pass_output(out_path, 0)
+        if ref:
+            task_id = ref[1]
+    receipt: dict = {"ok": True, "action": "would_note", "body": body}
+    if not task_id:
+        receipt["skipped"] = "no_task_ref"
+        return receipt
+    product = product_from_queue_url(worker.queue_url) or ""
+    if not product:
+        receipt["skipped"] = "no_product"
+        return receipt
+    dry_run, hermetic_block = hermetic_dry_run(False)
+    if dry_run:
+        if hermetic_block:
+            receipt["hermetic"] = True
+        receipt["task_id"] = task_id
+        return receipt
+    desk = desk_origin_from_queue_url(worker.queue_url or "")
+    if not desk:
+        receipt["skipped"] = "no_desk"
+        return receipt
+    q = urllib.parse.urlencode({"product": product})
+    url = "%s/api/admin/tasks/%s/comments?%s" % (
+        desk.rstrip("/"),
+        urllib.parse.quote(task_id, safe=""),
+        q,
+    )
+    out = _http_json("POST", url, {"body": body, "author": worker.identity or worker.name})
+    receipt["api"] = out
+    receipt["task_id"] = task_id
+    receipt["action"] = "noted" if out.get("ok") is not False and not out.get("error") else "note_failed"
+    receipt["ok"] = receipt["action"] == "noted"
+    return receipt
+
+
 def _release_stranded_ticket(
     desk: str,
     product: str,
@@ -1047,7 +1093,15 @@ def startup_reconcile(
 
 def _preflight(worker: Worker) -> Tuple[Optional[int], List[dict]]:
     """Pre-dispatch checks. Returns (ready count, ready task dicts)."""
-    if _free_mb(worker.workdir) < worker.min_free_mb:
+    try:
+        free_mb = _free_mb(worker.workdir)
+    except OSError as exc:
+        # A stale/misconfigured roster workdir must not raise a bare OSError
+        # past dispatch()'s InfraError handling — that would skip the
+        # worker's own ERROR ledger row entirely and surface only as an
+        # opaque "exception" string in the supervisor's receipt.
+        raise InfraError("workdir unreadable: %s" % exc)
+    if free_mb < worker.min_free_mb:
         raise _Skip("low disk (<%dMB free)" % worker.min_free_mb)
     # Resolution mirrors subprocess argv[0] rules so both this check and the
     # spawn agree: absolute paths checked directly; path-like commands
@@ -1436,7 +1490,7 @@ def _worktree_dirty(cwd: str) -> bool:
 
 def _finalize_shift_workdir(
     worker: Worker, shift_cwd: str, ledger: Ledger,
-) -> Dict[str, Union[str, int]]:
+) -> Tuple[Dict[str, Union[str, int]], Optional[str]]:
     """wf-153 slice 3 — after a successful shift, FF-merge shift → primary.
 
     When both trees are clean and primary HEAD is an ancestor of the shift
@@ -1444,49 +1498,53 @@ def _finalize_shift_workdir(
     Dirt or non-ff history → WARN and leave the shift branch for rescue.
     Does not push (PROCESS §5.1.3 land-on-main stays the hand's job).
 
-    Returns optional ledger kvs to attach to the shift's STOP line when an
-    FF landed (empty dict otherwise). Failures log WARN only.
+    Returns ``(stop_kv, desk_note)``. *stop_kv* carries optional ledger kvs
+    for the shift's STOP line when an FF landed (empty dict otherwise).
+    *desk_note* is a durable WorkLane comment body when the branch was kept
+    because shift HEAD is not ff-able onto primary (wf-267). Failures log
+    WARN only.
     """
     empty: Dict[str, Union[str, int]] = {}
+    no_note: Optional[str] = None
     if not getattr(worker, "shift_worktree", False):
-        return empty
+        return empty, no_note
     if not shift_cwd:
-        return empty
+        return empty, no_note
     try:
         same = os.path.realpath(shift_cwd) == os.path.realpath(worker.workdir)
     except OSError:
         same = shift_cwd == worker.workdir
     if same:
-        return empty  # isolation fell back to primary cwd — nothing to land
+        return empty, no_note  # isolation fell back to primary cwd — nothing to land
     if not _is_git_workdir(shift_cwd) or not _is_git_workdir(worker.workdir):
-        return empty
+        return empty, no_note
 
     if _worktree_dirty(shift_cwd):
         ledger.append(
             "WARN",
             reason="shift finalize: shift dirty; leave branch for rescue",
         )
-        return empty
+        return empty, no_note
     if _worktree_dirty(worker.workdir):
         ledger.append(
             "WARN",
             reason="shift finalize: primary dirty; leave branch for rescue",
         )
-        return empty
+        return empty, no_note
 
     shift_head = _git(shift_cwd, "rev-parse", "HEAD")
     if shift_head.returncode != 0 or not (shift_head.stdout or "").strip():
         ledger.append("WARN", reason="shift finalize: cannot read shift HEAD")
-        return empty
+        return empty, no_note
     shift_sha = shift_head.stdout.strip()
 
     primary_head = _git(worker.workdir, "rev-parse", "HEAD")
     if primary_head.returncode != 0 or not (primary_head.stdout or "").strip():
         ledger.append("WARN", reason="shift finalize: cannot read primary HEAD")
-        return empty
+        return empty, no_note
     primary_sha = primary_head.stdout.strip()
     if primary_sha == shift_sha:
-        return empty  # no commits on shift (or already landed)
+        return empty, no_note  # no commits on shift (or already landed)
 
     # primary must be ancestor of shift for a pure FF.
     anc = _git(
@@ -1497,7 +1555,10 @@ def _finalize_shift_workdir(
             "WARN",
             reason="shift finalize: not ff-able onto primary; leave branch for rescue",
         )
-        return empty
+        return empty, (
+            "Note: shift finalize kept branch for rescue — not ff-able onto "
+            "primary; diverged history was left for a person to land."
+        )
 
     merge = _git(worker.workdir, "merge", "--ff-only", shift_sha)
     if merge.returncode != 0:
@@ -1506,12 +1567,12 @@ def _finalize_shift_workdir(
             "WARN",
             reason="shift finalize: ff-only merge failed: %.120s" % err,
         )
-        return empty
+        return empty, no_note
     return {
         "shift_ff": 1,
         "shift_head": shift_sha[:12],
         "primary_was": primary_sha[:12],
-    }
+    }, no_note
 
 
 def _build_env(worker: Worker, predirty: Optional[str], secret: Optional[str],
@@ -2245,8 +2306,12 @@ def dispatch(
 
         def _stop_ok(reason: str) -> int:
             """Terminal STOP after a successful shift; attempt shift FF land."""
-            ff_kv = _finalize_shift_workdir(worker, shift_cwd, ledger)
+            ff_kv, finalize_note = _finalize_shift_workdir(worker, shift_cwd, ledger)
             ledger.append("STOP", reason=reason, **ff_kv, **recovery_kv)
+            if finalize_note:
+                _post_shift_finalize_note(
+                    worker, finalize_note, out_path, recovery_task_id=recovery_task_id,
+                )
             return 0
 
         # §6 multi-pass drain loop: re-spawn while budget, ceiling,
