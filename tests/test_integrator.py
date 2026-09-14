@@ -352,6 +352,7 @@ class FakeOps:
             "diff_text_val", "diff --git a/src/x.py b/src/x.py\n+1\n",
         )
         self.diff_text_bases = []
+        self.last_prompt = None
 
     def _record(self, name, *a, **kw):
         self.calls.append(name)
@@ -400,6 +401,7 @@ class FakeOps:
 
     def dispatch_reviewer(self, reviewer, prompt):
         self._record("dispatch_reviewer")
+        self.last_prompt = prompt
         if self.review_retry:
             return {"ok": False, "retry": True, "output": "reviewer dispatch skipped (lock held)"}
         if self.review_empty:
@@ -767,8 +769,49 @@ def test_build_reviewer_prompt_correction_round_scopes_to_delta_and_prior_findin
     assert "1. finding one" in prompt
     assert "2. finding two" in prompt
     assert "--- correction diff (tests excluded) ---" in prompt
-    assert "not the" in prompt.lower() and "whole pr" in prompt.lower()
+    assert "do not re-audit the branch context" in prompt.lower()
     assert "top 2" in prompt
+
+
+def test_build_reviewer_prompt_correction_round_includes_branch_diff_and_suite_result():
+    """wf-272: a finding closed by an earlier commit outside the correction
+    delta must be visible to the reviewer as the full branch diff, and a
+    green suite run must be stated so it cannot be contradicted."""
+    order = make_order()
+    prompt = integrator.build_reviewer_prompt(
+        order, "diff --git a/x b/x\n+2\n",
+        previous_findings=["fix the thing"],
+        branch_diff="diff --git a/y b/y\n+earlier fix\n",
+        suite_rc=0,
+        suite_output="",
+    )
+    assert "--- full branch diff vs pr base" in prompt.lower()
+    assert "+earlier fix" in prompt
+    assert "suites in this pass: green" in prompt.lower()
+    assert "mark a finding above closed if the branch as a whole addresses it" in prompt.lower()
+
+
+def test_build_reviewer_prompt_correction_round_states_red_suite_with_tail():
+    order = make_order()
+    prompt = integrator.build_reviewer_prompt(
+        order, "diff --git a/x b/x\n+2\n",
+        previous_findings=["fix the thing"],
+        branch_diff="diff --git a/y b/y\n+1\n",
+        suite_rc=1,
+        suite_output="FAILED tests/test_x.py::test_y",
+    )
+    assert "suites in this pass: red (rc 1)" in prompt.lower()
+    assert "FAILED tests/test_x.py::test_y" in prompt
+
+
+def test_suite_result_summary_green():
+    assert integrator.suite_result_summary(0, "") == "Suites in this pass: green (rc 0)."
+
+
+def test_suite_result_summary_red_includes_tail():
+    summary = integrator.suite_result_summary(1, "boom")
+    assert summary.startswith("Suites in this pass: red (rc 1)")
+    assert "boom" in summary
 
 
 def test_cap_findings_splits_blocking_and_later():
@@ -820,7 +863,30 @@ def test_run_one_correction_round_reviews_delta_since_prior_review_only(tmp_path
     })
     ops = FakeOps(tmp_path)  # clean pass: closes the finding
     result = integrator.run_one(make_order(), cfg, ops.as_dict())
-    assert ops.diff_text_base == "sha-round-1"
+    assert ops.diff_text_bases == ["sha-round-1", cfg["pr_base"]]
+    assert result["outcome"] == "closed"
+
+
+def test_run_one_correction_round_passes_branch_diff_and_suite_result_to_prompt(tmp_path):
+    """wf-269/wf-272: the finding was fixed in an earlier commit outside the
+    correction delta; the delta-round prompt must carry the full branch diff
+    and the same-pass green suite result so the reviewer closes it instead of
+    restating it as still open."""
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path, max_recovery_rounds=3)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {
+        "rounds_used": 1,
+        "last_review": {"sha": "sha-round-1", "findings": ["fix the thing"]},
+    })
+    ops = FakeOps(tmp_path, diff_text_val={
+        "sha-round-1": "diff --git a/README.md b/README.md\n+docs only\n",
+        cfg["pr_base"]: "diff --git a/src/x.py b/src/x.py\n+earlier fix for the thing\n",
+    }, suite_rc=0)
+    result = integrator.run_one(make_order(), cfg, ops.as_dict())
+    assert ops.diff_text_bases == ["sha-round-1", cfg["pr_base"]]
+    prompt = ops.last_prompt
+    assert "+earlier fix for the thing" in prompt
+    assert "suites in this pass: green" in prompt.lower()
     assert result["outcome"] == "closed"
 
 
@@ -866,7 +932,7 @@ def test_run_one_live_last_review_sha_still_scopes_to_delta(tmp_path):
     })
     ops = FakeOps(tmp_path, sha_exists_val=True)
     result = integrator.run_one(make_order(), cfg, ops.as_dict())
-    assert ops.diff_text_base == "sha-round-1"
+    assert ops.diff_text_bases == ["sha-round-1", cfg["pr_base"]]
     assert result["outcome"] == "closed"
 
 
@@ -1089,7 +1155,9 @@ def test_run_one_new_commit_after_waiting_triggers_a_fresh_delta_review(tmp_path
     assert second["outcome"] == "waiting"
     assert ops.calls.count("run_suites") == 2
     assert ops.calls.count("dispatch_reviewer") == 2
-    assert ops.diff_text_bases[-1] == "sha-x"
+    # the delta review diffs against the last reviewed sha; wf-272 also reads
+    # the whole branch diff (pr_base) for context, so both bases are asked for
+    assert "sha-x" in ops.diff_text_bases[-2:]
     state = integrator.read_recovery_state(cfg["local_root"], "wf-1")
     assert state["suites_ok_sha"] == "sha-y"
     assert state["last_review"] == {"sha": "sha-y", "findings": []}
