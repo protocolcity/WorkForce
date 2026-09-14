@@ -1777,6 +1777,33 @@ def _task_still_in_progress(desk: str, project: str, task_id: str) -> bool:
     return str(task.get("status") or "").lower() == "in_progress"
 
 
+def _is_terminal_result(worker: Worker, obj: Optional[dict]) -> bool:
+    """True when ``obj`` is a verified terminal result, per the adapter's own
+    completion contract — never the mere presence of a last parsed JSON
+    object, which can be an intermediate NDJSON diagnostic or a partially
+    flushed final line still being written (wf-266 review).
+
+    Two independent recognitions, either is sufficient: a generic
+    ``type == "end"`` or ``type == "result"`` wrapper (covers both a normal
+    end_turn NDJSON tail and grok's ``--output-format json`` shape), or —
+    for a worker that opted into wf-262 stop-reason verification — its own
+    ``completion_field`` resolving to one of ``completion_values``. A worker
+    that never opts in and whose output carries no recognizable ``type`` is
+    never treated as terminal by this check alone.
+    """
+    if not isinstance(obj, dict):
+        return False
+    if obj.get("type") in ("end", "result"):
+        return True
+    if worker.completion_field:
+        try:
+            value = _dig(obj, worker.completion_field)
+        except KeyError:
+            return False
+        return isinstance(value, str) and value in worker.completion_values
+    return False
+
+
 def _run_pass(
     argv: List[str], shift_cwd: str, env: Dict[str, str], outfh, out_path: str,
     pass_offset: int, deadline: float, worker: Worker,
@@ -1798,16 +1825,20 @@ def _run_pass(
     linger_since: Optional[float] = None
     while True:
         remain = deadline - time.monotonic()
-        if remain <= 0:
-            _terminate_process_group(proc)
-            return None, None
         if linger_since is not None:
+            # wf-266 review — once the linger is armed, budget expiry must
+            # still end the pass with the linger reason, never fall through
+            # to a bare "killed at budget" ERROR for a shift whose work is
+            # already confirmed done.
             grace_remain = worker.linger_grace_secs - (time.monotonic() - linger_since)
-            if grace_remain <= 0:
+            if remain <= 0 or grace_remain <= 0:
                 _terminate_process_group(proc)
                 return None, "provider lingered after result"
             wait_for = min(_LINGER_POLL_SECS, remain, grace_remain)
         else:
+            if remain <= 0:
+                _terminate_process_group(proc)
+                return None, None
             wait_for = min(_LINGER_POLL_SECS, remain)
         try:
             rc = proc.wait(timeout=max(wait_for, 0.01))
@@ -1817,7 +1848,9 @@ def _run_pass(
         if desk and linger_since is None:
             if task_ref is None:
                 task_ref = _task_ref_from_pass_output(out_path, pass_offset)
-            if task_ref is not None and _pass_result_json(out_path, pass_offset) is not None:
+            if task_ref is not None and _is_terminal_result(
+                worker, _pass_result_json(out_path, pass_offset),
+            ):
                 project, task_id = task_ref
                 if not _task_still_in_progress(desk, project, task_id):
                     linger_since = time.monotonic()
@@ -2218,6 +2251,18 @@ def dispatch(
             )
             if rc is None:
                 if linger_reason:
+                    # wf-266 review — a confirmed linger is not automatically
+                    # a completed turn; run the same wf-262 stop-reason
+                    # classification the normal rc==0 path uses, so a Grok
+                    # pass that printed stopReason cancelled before parking
+                    # still records the real denial instead of a false DONE.
+                    configured, _complete, stop_value = _classify_completion(
+                        worker, out_path, pass_offset,
+                    )
+                    if configured and stop_value == "cancelled":
+                        ledger.append("ERROR", reason="denied: cancelled",
+                                      on_pass=passes + 1, **recovery_kv)
+                        return 1
                     ledger.append("DONE", reason=linger_reason, rc=0, on_pass=passes + 1,
                                   secs=int(time.monotonic() - pass_t0), **recovery_kv)
                     return _stop_ok(linger_reason)
