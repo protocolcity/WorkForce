@@ -192,6 +192,13 @@ def test_close_evidence_links_cites_merge_and_version_shas():
     assert "http://pr/1" in links
 
 
+def test_build_integrator_claim_body_posts_owner_marker():
+    body = integrator.build_integrator_claim_body()
+    assert body.startswith("Owner: integrator\n")
+    assert "Start:" in body
+    assert "Plan:" in body
+
+
 def test_coordinator_lock_is_fresh(tmp_path):
     lock = tmp_path / "COORDINATOR.lock"
     assert integrator.coordinator_lock_is_fresh(str(lock), 900) is False
@@ -3500,18 +3507,32 @@ def test_default_ops_close_order_claims_posts_and_confirms_done(tmp_path, monkey
 
     roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
     cfg = base_config(tmp_path, roster_path)
-    desk_state = {"status": "in_review", "claimed": False}
+    desk_state = {"status": "in_review", "integrator_claimed": False}
     calls = []
 
     def fake_req(method, url, body=None, timeout=20.0):
         calls.append((method, body))
         if method == "PATCH" and body and body.get("status") == "in_progress":
-            desk_state["claimed"] = True
             desk_state["status"] = "in_progress"
             return {"ok": True}
-        if method == "POST" and body and "Completed:" in body.get("body", ""):
-            if not desk_state["claimed"]:
-                return {"ok": False, "error": "close requires claim first"}
+        if method == "POST" and body:
+            text = body.get("body", "")
+            author = body.get("author", "")
+            if text.startswith("Owner: integrator"):
+                if author != "integrator":
+                    return {"ok": False, "error": "claim requires integrator author"}
+                desk_state["integrator_claimed"] = True
+                return {"ok": True}
+            if "Completed:" in text:
+                if author != "integrator":
+                    return {"ok": False, "error": "close requires integrator author"}
+                if not desk_state["integrator_claimed"]:
+                    return {"ok": False, "error": "close requires claim first"}
+                # Comment alone does not transition — explicit PATCH required.
+                return {"ok": True}
+        if method == "PATCH" and body and body.get("status") == "done":
+            if not desk_state["integrator_claimed"]:
+                return {"ok": False, "error": "done requires claim first"}
             desk_state["status"] = "done"
             return {"ok": True}
         return {"ok": True}
@@ -3533,7 +3554,64 @@ def test_default_ops_close_order_claims_posts_and_confirms_done(tmp_path, monkey
     assert out["ok"] is True
     assert out["status"] == "done"
     assert desk_state["status"] == "done"
-    assert calls[0] == ("PATCH", {"status": "in_progress", "author": "integrator"})
+    assert desk_state["integrator_claimed"] is True
+    patch_calls = [c for c in calls if c[0] == "PATCH"]
+    post_calls = [c for c in calls if c[0] == "POST"]
+    assert patch_calls[0] == ("PATCH", {"status": "in_progress", "author": "integrator"})
+    assert post_calls[0][1]["body"].startswith("Owner: integrator")
+    assert post_calls[0][1]["author"] == "integrator"
+    assert "Completed:" in post_calls[1][1]["body"]
+    assert post_calls[1][1]["author"] == "integrator"
+    assert patch_calls[-1] == ("PATCH", {"status": "done", "author": "integrator"})
+
+
+def test_default_ops_close_order_reclaims_when_already_in_progress(tmp_path, monkeypatch):
+    from workforce import capacity as capacity_mod
+    from workforce import engine as engine_mod
+
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    desk_state = {"status": "in_progress", "integrator_claimed": False}
+    calls = []
+
+    def fake_req(method, url, body=None, timeout=20.0):
+        calls.append((method, body))
+        if method == "PATCH" and body and body.get("status") == "in_progress":
+            return {"ok": False, "error": "already in_progress under worker"}
+        if method == "POST" and body:
+            text = body.get("body", "")
+            if text.startswith("Owner: integrator"):
+                desk_state["integrator_claimed"] = True
+                return {"ok": True}
+            if "Completed:" in text and desk_state["integrator_claimed"]:
+                return {"ok": True}
+        if method == "PATCH" and body and body.get("status") == "done":
+            desk_state["status"] = "done"
+            return {"ok": True}
+        return {"ok": True}
+
+    def fake_fetch(desk, project, task_id, timeout=8.0):
+        return {"id": task_id, "status": desk_state["status"]}
+
+    monkeypatch.setenv("WORKFORCE_ALLOW_DESK", "1")
+    monkeypatch.setattr(capacity_mod, "_req", fake_req)
+    monkeypatch.setattr(engine_mod, "_fetch_task", fake_fetch)
+    ops = integrator.default_ops(cfg)
+    out = ops["close_order"]("wf-1", {
+        "completed": "merged",
+        "verification": "pytest green",
+        "links": "abc1234567",
+        "follow_ups": "none",
+    })
+    assert out["ok"] is True
+    assert out["status"] == "done"
+    in_progress_patches = [
+        c for c in calls
+        if c[0] == "PATCH" and c[1] and c[1].get("status") == "in_progress"
+    ]
+    assert in_progress_patches == []
+    assert calls[0][0] == "POST"
+    assert calls[0][1]["body"].startswith("Owner: integrator")
 
 
 def test_default_ops_close_order_fails_when_desk_stays_in_review(tmp_path, monkeypatch):
@@ -3542,16 +3620,23 @@ def test_default_ops_close_order_fails_when_desk_stays_in_review(tmp_path, monke
 
     roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
     cfg = base_config(tmp_path, roster_path)
+    desk_state = {"status": "in_review", "integrator_claimed": False}
 
     def fake_req(method, url, body=None, timeout=20.0):
-        if method == "PATCH":
+        if method == "PATCH" and body and body.get("status") == "in_progress":
+            desk_state["status"] = "in_progress"
             return {"ok": True}
-        if method == "POST":
+        if method == "POST" and body and body.get("body", "").startswith("Owner: integrator"):
+            desk_state["integrator_claimed"] = True
             return {"ok": True}
+        if method == "POST" and body and "Completed:" in body.get("body", ""):
+            return {"ok": True}
+        if method == "PATCH" and body and body.get("status") == "done":
+            return {"ok": False, "error": "bare done refused without close-out on ticket"}
         return {"ok": True}
 
     def fake_fetch(desk, project, task_id, timeout=8.0):
-        return {"id": task_id, "status": "in_review"}
+        return {"id": task_id, "status": desk_state["status"]}
 
     monkeypatch.setenv("WORKFORCE_ALLOW_DESK", "1")
     monkeypatch.setattr(capacity_mod, "_req", fake_req)
@@ -3564,8 +3649,8 @@ def test_default_ops_close_order_fails_when_desk_stays_in_review(tmp_path, monke
         "follow_ups": "none",
     })
     assert out["ok"] is False
-    assert out["step"] == "confirm_done"
-    assert out["status"] == "in_review"
+    assert out["step"] == "set_done"
+    assert desk_state["status"] == "in_progress"
 
 
 def test_finish_after_stage_close_failed_keeps_state_and_skips_prune(tmp_path, monkeypatch):
