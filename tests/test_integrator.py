@@ -183,6 +183,22 @@ def test_build_close_body_has_all_four_sections():
     assert "Follow-ups: none" in body
 
 
+def test_close_evidence_links_cites_merge_and_version_shas():
+    links = integrator.close_evidence_links(
+        "abc1234567890", "def9876543210", "http://pr/1",
+    )
+    assert "abc1234567890 (merge)" in links
+    assert "def9876543210 (version)" in links
+    assert "http://pr/1" in links
+
+
+def test_build_integrator_claim_body_posts_owner_marker():
+    body = integrator.build_integrator_claim_body()
+    assert body.startswith("Owner: integrator\n")
+    assert "Start:" in body
+    assert "Plan:" in body
+
+
 def test_coordinator_lock_is_fresh(tmp_path):
     lock = tmp_path / "COORDINATOR.lock"
     assert integrator.coordinator_lock_is_fresh(str(lock), 900) is False
@@ -401,6 +417,8 @@ class FakeOps:
         self._head_sha_calls = 0
         self.head_shas = overrides.get("head_shas", ["sha-head-1", "sha-head-2", "sha-head-3"])
         self.close_evidence = None
+        self.close_fail = overrides.get("close_fail", False)
+        self.close_fail_error = overrides.get("close_fail_error", "desk refused close")
         self.sha_exists_val = overrides.get("sha_exists_val", True)
         self.sha_reachable_val = overrides.get("sha_reachable_val", True)
         self.diff_text_val = overrides.get(
@@ -562,7 +580,13 @@ class FakeOps:
     def close_order(self, task_id, evidence):
         self._record("close_order")
         self.close_evidence = evidence
-        return {"ok": True}
+        if getattr(self, "close_fail", False):
+            return {
+                "ok": False,
+                "status": "in_review",
+                "error": getattr(self, "close_fail_error", "desk refused close"),
+            }
+        return {"ok": True, "status": "done"}
 
     def as_dict(self):
         return {
@@ -3470,3 +3494,310 @@ def test_seat_in_flight_ignores_a_job_lock_with_roster(tmp_path):
     assert integrator.seat_in_flight(local_root) is True
     _write_live_lock(local_root, "tester")
     assert integrator.seat_in_flight(local_root, roster_path=roster_path) is True
+
+
+# --------------------------------------------------------------------------
+# wf-277 — integrator close must claim, confirm done, then prune/clear
+# --------------------------------------------------------------------------
+
+
+def test_default_ops_close_order_claims_posts_and_confirms_done(tmp_path, monkeypatch):
+    from workforce import capacity as capacity_mod
+    from workforce import engine as engine_mod
+
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    desk_state = {"status": "in_review", "integrator_claimed": False}
+    calls = []
+
+    def fake_req(method, url, body=None, timeout=20.0):
+        calls.append((method, body))
+        if method == "PATCH" and body and body.get("status") == "in_progress":
+            desk_state["status"] = "in_progress"
+            return {"ok": True}
+        if method == "POST" and body:
+            text = body.get("body", "")
+            author = body.get("author", "")
+            if text.startswith("Owner: integrator"):
+                if author != "integrator":
+                    return {"ok": False, "error": "claim requires integrator author"}
+                desk_state["integrator_claimed"] = True
+                return {"ok": True}
+            if "Completed:" in text:
+                if author != "integrator":
+                    return {"ok": False, "error": "close requires integrator author"}
+                if not desk_state["integrator_claimed"]:
+                    return {"ok": False, "error": "close requires claim first"}
+                # Comment alone does not transition — explicit PATCH required.
+                return {"ok": True}
+        if method == "PATCH" and body and body.get("status") == "done":
+            if not desk_state["integrator_claimed"]:
+                return {"ok": False, "error": "done requires claim first"}
+            desk_state["status"] = "done"
+            return {"ok": True}
+        return {"ok": True}
+
+    def fake_fetch(desk, project, task_id, timeout=8.0):
+        return {"id": task_id, "status": desk_state["status"]}
+
+    monkeypatch.setenv("WORKFORCE_ALLOW_DESK", "1")
+    monkeypatch.setattr(capacity_mod, "_req", fake_req)
+    monkeypatch.setattr(engine_mod, "_fetch_task", fake_fetch)
+    ops = integrator.default_ops(cfg)
+    evidence = {
+        "completed": "merged",
+        "verification": "pytest green",
+        "links": "abc1234567",
+        "follow_ups": "none",
+    }
+    out = ops["close_order"]("wf-1", evidence)
+    assert out["ok"] is True
+    assert out["status"] == "done"
+    assert desk_state["status"] == "done"
+    assert desk_state["integrator_claimed"] is True
+    patch_calls = [c for c in calls if c[0] == "PATCH"]
+    post_calls = [c for c in calls if c[0] == "POST"]
+    assert patch_calls[0] == ("PATCH", {"status": "in_progress", "author": "integrator"})
+    assert post_calls[0][1]["body"].startswith("Owner: integrator")
+    assert post_calls[0][1]["author"] == "integrator"
+    assert "Completed:" in post_calls[1][1]["body"]
+    assert post_calls[1][1]["author"] == "integrator"
+    assert patch_calls[-1] == ("PATCH", {"status": "done", "author": "integrator"})
+
+
+def test_default_ops_close_order_reclaims_when_already_in_progress(tmp_path, monkeypatch):
+    from workforce import capacity as capacity_mod
+    from workforce import engine as engine_mod
+
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    desk_state = {"status": "in_progress", "integrator_claimed": False}
+    calls = []
+
+    def fake_req(method, url, body=None, timeout=20.0):
+        calls.append((method, body))
+        if method == "PATCH" and body and body.get("status") == "in_progress":
+            return {"ok": False, "error": "already in_progress under worker"}
+        if method == "POST" and body:
+            text = body.get("body", "")
+            if text.startswith("Owner: integrator"):
+                desk_state["integrator_claimed"] = True
+                return {"ok": True}
+            if "Completed:" in text and desk_state["integrator_claimed"]:
+                return {"ok": True}
+        if method == "PATCH" and body and body.get("status") == "done":
+            desk_state["status"] = "done"
+            return {"ok": True}
+        return {"ok": True}
+
+    def fake_fetch(desk, project, task_id, timeout=8.0):
+        return {"id": task_id, "status": desk_state["status"]}
+
+    monkeypatch.setenv("WORKFORCE_ALLOW_DESK", "1")
+    monkeypatch.setattr(capacity_mod, "_req", fake_req)
+    monkeypatch.setattr(engine_mod, "_fetch_task", fake_fetch)
+    ops = integrator.default_ops(cfg)
+    out = ops["close_order"]("wf-1", {
+        "completed": "merged",
+        "verification": "pytest green",
+        "links": "abc1234567",
+        "follow_ups": "none",
+    })
+    assert out["ok"] is True
+    assert out["status"] == "done"
+    in_progress_patches = [
+        c for c in calls
+        if c[0] == "PATCH" and c[1] and c[1].get("status") == "in_progress"
+    ]
+    assert in_progress_patches == []
+    assert calls[0][0] == "POST"
+    assert calls[0][1]["body"].startswith("Owner: integrator")
+
+
+def test_default_ops_close_order_succeeds_when_already_done(tmp_path, monkeypatch):
+    from workforce import capacity as capacity_mod
+    from workforce import engine as engine_mod
+
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    calls = []
+
+    def fake_req(method, url, body=None, timeout=20.0):
+        calls.append((method, body))
+        return {"ok": True}
+
+    def fake_fetch(desk, project, task_id, timeout=8.0):
+        return {"id": task_id, "status": "done"}
+
+    monkeypatch.setenv("WORKFORCE_ALLOW_DESK", "1")
+    monkeypatch.setattr(capacity_mod, "_req", fake_req)
+    monkeypatch.setattr(engine_mod, "_fetch_task", fake_fetch)
+    ops = integrator.default_ops(cfg)
+    out = ops["close_order"]("wf-1", {
+        "completed": "merged",
+        "verification": "pytest green",
+        "links": "abc1234567",
+        "follow_ups": "none",
+    })
+    assert out["ok"] is True
+    assert out["status"] == "done"
+    assert out.get("already_done") is True
+    assert calls == []
+
+
+def test_finish_after_stage_already_done_prunes_and_clears_state(tmp_path, monkeypatch):
+    from workforce import capacity as capacity_mod
+    from workforce import engine as engine_mod
+    from workforce import prune
+
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    post_merge = {
+        "pr": {"number": 1, "url": "http://pr/1"},
+        "reviewer": "cursor-reviewer",
+        "version": {"from": "1.0.0", "to": "1.0.1"},
+        "merge_sha": "abc1234567890",
+        "version_sha": "def9876543210",
+    }
+    integrator.write_post_merge_state(cfg["local_root"], "wf-1", post_merge)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {"rounds_used": 2})
+    prune_calls = []
+    monkeypatch.setattr(
+        prune, "prune_after_close",
+        lambda config, worker, task_id, **kw: prune_calls.append((worker, task_id)) or {"removed": []},
+    )
+
+    def fake_req(method, url, body=None, timeout=20.0):
+        return {"ok": True}
+
+    def fake_fetch(desk, project, task_id, timeout=8.0):
+        return {"id": task_id, "status": "done"}
+
+    monkeypatch.setenv("WORKFORCE_ALLOW_DESK", "1")
+    monkeypatch.setattr(capacity_mod, "_req", fake_req)
+    monkeypatch.setattr(engine_mod, "_fetch_task", fake_fetch)
+    ops = integrator.default_ops(cfg)
+    result = {
+        "generated_at": integrator._utc_iso_z(), "task_id": "wf-1", "worker": "tester",
+        "dry_run": False, "outcome": None,
+    }
+    out = integrator._finish_after_stage("wf-1", "workforce", cfg, ops, post_merge, result)
+    assert out["outcome"] == "closed"
+    assert out["close"]["ok"] is True
+    assert out["close"].get("already_done") is True
+    assert prune_calls == [("tester", "wf-1")]
+    assert integrator.read_post_merge_state(cfg["local_root"], "wf-1") is None
+    assert integrator.read_recovery_state(cfg["local_root"], "wf-1") == {"rounds_used": 0}
+
+
+def test_default_ops_close_order_fails_when_desk_stays_in_review(tmp_path, monkeypatch):
+    from workforce import capacity as capacity_mod
+    from workforce import engine as engine_mod
+
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    desk_state = {"status": "in_review", "integrator_claimed": False}
+
+    def fake_req(method, url, body=None, timeout=20.0):
+        if method == "PATCH" and body and body.get("status") == "in_progress":
+            desk_state["status"] = "in_progress"
+            return {"ok": True}
+        if method == "POST" and body and body.get("body", "").startswith("Owner: integrator"):
+            desk_state["integrator_claimed"] = True
+            return {"ok": True}
+        if method == "POST" and body and "Completed:" in body.get("body", ""):
+            return {"ok": True}
+        if method == "PATCH" and body and body.get("status") == "done":
+            return {"ok": False, "error": "bare done refused without close-out on ticket"}
+        return {"ok": True}
+
+    def fake_fetch(desk, project, task_id, timeout=8.0):
+        return {"id": task_id, "status": desk_state["status"]}
+
+    monkeypatch.setenv("WORKFORCE_ALLOW_DESK", "1")
+    monkeypatch.setattr(capacity_mod, "_req", fake_req)
+    monkeypatch.setattr(engine_mod, "_fetch_task", fake_fetch)
+    ops = integrator.default_ops(cfg)
+    out = ops["close_order"]("wf-1", {
+        "completed": "merged",
+        "verification": "pytest green",
+        "links": "abc1234567",
+        "follow_ups": "none",
+    })
+    assert out["ok"] is False
+    assert out["step"] == "set_done"
+    assert desk_state["status"] == "in_progress"
+
+
+def test_finish_after_stage_close_failed_keeps_state_and_skips_prune(tmp_path, monkeypatch):
+    from workforce import prune
+
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path, close_fail=True, close_fail_error="close requires claim first")
+    post_merge = {
+        "pr": {"number": 1, "url": "http://pr/1"},
+        "reviewer": "cursor-reviewer",
+        "version": {"from": "1.0.0", "to": "1.0.1"},
+        "merge_sha": "abc1234567890",
+        "version_sha": "def9876543210",
+    }
+    integrator.write_post_merge_state(cfg["local_root"], "wf-1", post_merge)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {"rounds_used": 1})
+    prune_calls = []
+    monkeypatch.setattr(prune, "prune_after_close", lambda *a, **k: prune_calls.append(a) or {"removed": []})
+    result = {
+        "generated_at": integrator._utc_iso_z(), "task_id": "wf-1", "worker": "tester",
+        "dry_run": False, "outcome": None,
+    }
+    out = integrator._finish_after_stage("wf-1", "workforce", cfg, ops.as_dict(), post_merge, result)
+    assert out["outcome"] == "close_failed"
+    assert "abc1234567890" in ops.close_evidence["links"]
+    assert "def9876543210" in ops.close_evidence["links"]
+    assert "park_seat" in ops.calls
+    assert prune_calls == []
+    assert integrator.read_post_merge_state(cfg["local_root"], "wf-1") == post_merge
+    assert integrator.read_recovery_state(cfg["local_root"], "wf-1")["rounds_used"] == 1
+    log_path = os.path.join(cfg["local_root"], "ledger", "integrator-workforce.log")
+    with open(log_path, encoding="utf-8") as fh:
+        ledger = fh.read()
+    assert " CLOSE " in ledger
+    assert "status=in_review" in ledger
+
+
+def test_finish_after_stage_confirmed_close_prunes_and_clears_state(tmp_path, monkeypatch):
+    from workforce import prune
+
+    roster_path = write_roster(tmp_path, [make_worker(tmp_path)])
+    cfg = base_config(tmp_path, roster_path)
+    ops = FakeOps(tmp_path)
+    post_merge = {
+        "pr": {"number": 1, "url": "http://pr/1"},
+        "reviewer": "cursor-reviewer",
+        "version": {"from": "1.0.0", "to": "1.0.1"},
+        "merge_sha": "abc1234567890",
+        "version_sha": "def9876543210",
+    }
+    integrator.write_post_merge_state(cfg["local_root"], "wf-1", post_merge)
+    integrator.write_recovery_state(cfg["local_root"], "wf-1", {"rounds_used": 1})
+    prune_calls = []
+    monkeypatch.setattr(
+        prune, "prune_after_close",
+        lambda config, worker, task_id, **kw: prune_calls.append((worker, task_id)) or {"removed": []},
+    )
+    result = {
+        "generated_at": integrator._utc_iso_z(), "task_id": "wf-1", "worker": "tester",
+        "dry_run": False, "outcome": None,
+    }
+    out = integrator._finish_after_stage("wf-1", "workforce", cfg, ops.as_dict(), post_merge, result)
+    assert out["outcome"] == "closed"
+    assert "abc1234567890" in ops.close_evidence["links"]
+    assert "def9876543210" in ops.close_evidence["links"]
+    assert prune_calls == [("tester", "wf-1")]
+    assert integrator.read_post_merge_state(cfg["local_root"], "wf-1") is None
+    assert integrator.read_recovery_state(cfg["local_root"], "wf-1") == {"rounds_used": 0}
+    log_path = os.path.join(cfg["local_root"], "ledger", "integrator-workforce.log")
+    with open(log_path, encoding="utf-8") as fh:
+        ledger = fh.read()
+    assert " CLOSE " in ledger
+    assert "status=done" in ledger
