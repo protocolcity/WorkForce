@@ -2996,6 +2996,57 @@ def test_park_seat_order_at_shift_end_covers_every_order_this_shift_prepared(tmp
     assert sorted(seen_tasks) == ["wf-1", "wf-2"]
 
 
+def test_park_seat_order_at_shift_end_recovery_shift_covers_all_prepared_orders(tmp_path, monkeypatch):
+    """A recovery shift must still park every order this pass prepared, not
+    only recovery_task_id (wf-275)."""
+    from workforce import engine as eng
+
+    out_path = tmp_path / "tester.out"
+    receipt_a = tmp_path / "receipt-a.json"
+    receipt_a.write_text(json.dumps({"project": "workforce", "task_id": "wf-1"}))
+    receipt_b = tmp_path / "receipt-b.json"
+    receipt_b.write_text(json.dumps({"project": "workforce", "task_id": "wf-2"}))
+    out_path.write_text(
+        "Prepared wf-1; not yet claimed. Receipt: %s\n"
+        "Prepared wf-2; not yet claimed. Receipt: %s\n" % (receipt_a, receipt_b),
+    )
+
+    seen_tasks = []
+
+    def fake_http(method, url, body=None, timeout=8.0):
+        if method == "GET":
+            task_id = "wf-1" if "/wf-1" in url else "wf-2"
+            return {
+                "ok": True,
+                "task": {
+                    "id": task_id, "status": "in_progress",
+                    "comments": [{"body": "Owner: tester-id", "author": "tester-id"}],
+                },
+            }
+        if method == "PATCH" and "comments" not in url:
+            return {"ok": True, "task": {"status": "in_review"}}
+        if method == "POST" and "comments" in url:
+            seen_tasks.append("/wf-1" in url and "wf-1" or "wf-2")
+            return {"ok": True, "comment": {"id": 1}}
+        raise AssertionError("unexpected %s %s" % (method, url))
+
+    monkeypatch.setattr(eng, "_http_json", fake_http)
+    monkeypatch.setenv("WORKFORCE_ALLOW_DESK", "1")
+
+    ledger = eng.Ledger(str(tmp_path / "local" / "ledger"), "tester")
+    w = make_worker(
+        tmp_path,
+        queue_url="http://desk.test/api/admin/tasks/ready?product=workforce&label=worker:tester",
+        identity="tester-id", name="tester",
+    )
+    receipt = eng._park_seat_order_at_shift_end(
+        w, str(tmp_path), str(out_path), "wf-2", ledger,
+    )
+    assert receipt["action"] == "parked"
+    assert {r["task_id"] for r in receipt["results"]} == {"wf-1", "wf-2"}
+    assert sorted(seen_tasks) == ["wf-1", "wf-2"]
+
+
 def test_dispatch_calls_park_seat_order_at_shift_end_on_successful_stop(tmp_path, monkeypatch):
     """The DONE/STOP finalize path always checks whether this pass's order
     needs an engine-driven park — not just on the shift_worktree branch."""
