@@ -2729,3 +2729,184 @@ def test_roster_skipped_row_stays_visible(tmp_path, caplog):
         r.worker("bad")
     with pytest.raises(RosterError, match="no worker 'nope'"):
         r.worker("nope")
+
+
+# ---------------------------------------------------------------------------
+# wf-273 — a shift that ends DONE without the seat parking its own order
+# leaves it in_progress and invisible to the integrator/supervisor.
+# ---------------------------------------------------------------------------
+
+def _write_pass_receipt(tmp_path, out_path, project, task_id):
+    """Write an out_path a pass would leave that names a prepared order."""
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text(json.dumps({"project": project, "task_id": task_id}))
+    out_path.write_text(
+        "Prepared %s; not yet claimed. Receipt: %s\n" % (task_id, receipt),
+    )
+    return str(receipt)
+
+
+def _git_repo_with_unpushed_commit(tmp_path, branch):
+    """Bare 'origin' + a clone on *branch* with one local commit not pushed."""
+    remote = tmp_path / "remote.git"
+    remote.mkdir()
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(remote), str(clone)], check=True)
+    subprocess.run(["git", "-C", str(clone), "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", str(clone), "config", "user.name", "t"], check=True)
+    (clone / "README.md").write_text("hi\n")
+    subprocess.run(["git", "-C", str(clone), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(clone), "commit", "-q", "-m", "init"], check=True)
+    subprocess.run(["git", "-C", str(clone), "push", "-q", "-u", "origin", "HEAD:main"], check=True)
+    subprocess.run(["git", "-C", str(clone), "checkout", "-q", "-b", branch], check=True)
+    (clone / "work.txt").write_text("done\n")
+    subprocess.run(["git", "-C", str(clone), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(clone), "commit", "-q", "-m", "shift work"], check=True)
+    return remote, clone
+
+
+def test_park_seat_order_at_shift_end_parks_and_pushes_unpushed_commits(tmp_path, monkeypatch):
+    from workforce import engine as eng
+
+    remote, clone = _git_repo_with_unpushed_commit(tmp_path, "workforce/task/tester/wf-9")
+    out_path = tmp_path / "tester.out"
+    _write_pass_receipt(tmp_path, out_path, "workforce", "wf-9")
+
+    posts = []
+
+    def fake_http(method, url, body=None, timeout=8.0):
+        if method == "GET" and "/wf-9" in url:
+            return {
+                "ok": True,
+                "task": {
+                    "id": "wf-9", "status": "in_progress",
+                    "comments": [{"body": "Owner: tester-id", "author": "tester-id"}],
+                },
+            }
+        if method == "POST" and "comments" in url:
+            posts.append(body)
+            return {"ok": True, "comment": {"id": 1}}
+        raise AssertionError("unexpected %s %s" % (method, url))
+
+    monkeypatch.setattr(eng, "_http_json", fake_http)
+    monkeypatch.setenv("WORKFORCE_ALLOW_DESK", "1")
+
+    ledger = eng.Ledger(str(tmp_path / "local" / "ledger"), "tester")
+    w = make_worker(
+        tmp_path,
+        queue_url="http://desk.test/api/admin/tasks/ready?product=workforce&label=worker:tester",
+        identity="tester-id", name="tester",
+    )
+    receipt = eng._park_seat_order_at_shift_end(w, str(clone), str(out_path), None, ledger)
+
+    assert receipt["action"] == "parked"
+    assert receipt["push"].startswith("pushed:")
+    assert len(posts) == 1
+    assert "Parked: parked by the engine at shift end (seat did not park)" in posts[0]["body"]
+    assert posts[0]["author"] == "tester-id"
+
+    remote_head = subprocess.run(
+        ["git", "-C", str(remote), "rev-parse", "workforce/task/tester/wf-9"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    local_head = subprocess.run(
+        ["git", "-C", str(clone), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert remote_head == local_head
+
+    ledger_lines = (tmp_path / "local" / "ledger" / "tester.log").read_text()
+    assert "engine-park-at-shift-end push" in ledger_lines
+    assert "engine-park-at-shift-end" in ledger_lines
+    assert "action=parked" in ledger_lines
+
+
+def test_park_seat_order_at_shift_end_noop_when_seat_already_parked(tmp_path, monkeypatch):
+    from workforce import engine as eng
+
+    out_path = tmp_path / "tester.out"
+    _write_pass_receipt(tmp_path, out_path, "workforce", "wf-9")
+
+    def fake_http(method, url, body=None, timeout=8.0):
+        if method == "GET" and "/wf-9" in url:
+            return {"ok": True, "task": {"id": "wf-9", "status": "in_review"}}
+        raise AssertionError("must not post when already parked: %s %s" % (method, url))
+
+    monkeypatch.setattr(eng, "_http_json", fake_http)
+    monkeypatch.setenv("WORKFORCE_ALLOW_DESK", "1")
+
+    ledger = eng.Ledger(str(tmp_path / "local" / "ledger"), "tester")
+    w = make_worker(
+        tmp_path,
+        queue_url="http://desk.test/api/admin/tasks/ready?product=workforce&label=worker:tester",
+        identity="tester-id", name="tester",
+    )
+    receipt = eng._park_seat_order_at_shift_end(w, str(tmp_path), str(out_path), None, ledger)
+    assert receipt["skipped"] == "not_in_progress"
+
+
+def test_park_seat_order_at_shift_end_noop_for_foreign_owner(tmp_path, monkeypatch):
+    from workforce import engine as eng
+
+    out_path = tmp_path / "tester.out"
+    _write_pass_receipt(tmp_path, out_path, "workforce", "wf-9")
+
+    def fake_http(method, url, body=None, timeout=8.0):
+        if method == "GET" and "/wf-9" in url:
+            return {
+                "ok": True,
+                "task": {
+                    "id": "wf-9", "status": "in_progress",
+                    "comments": [{"body": "Owner: someone-else", "author": "someone-else"}],
+                },
+            }
+        raise AssertionError("must not post for a foreign owner: %s %s" % (method, url))
+
+    monkeypatch.setattr(eng, "_http_json", fake_http)
+    monkeypatch.setenv("WORKFORCE_ALLOW_DESK", "1")
+
+    ledger = eng.Ledger(str(tmp_path / "local" / "ledger"), "tester")
+    w = make_worker(
+        tmp_path,
+        queue_url="http://desk.test/api/admin/tasks/ready?product=workforce&label=worker:tester",
+        identity="tester-id", name="tester",
+    )
+    receipt = eng._park_seat_order_at_shift_end(w, str(tmp_path), str(out_path), None, ledger)
+    assert receipt["skipped"] == "owner_mismatch"
+
+
+def test_park_seat_order_at_shift_end_noop_without_task_ref(tmp_path, monkeypatch):
+    from workforce import engine as eng
+
+    out_path = tmp_path / "tester.out"
+    out_path.write_text("nothing prepared this pass\n")
+
+    def boom(*a, **k):
+        raise AssertionError("must not contact the desk without a task ref")
+
+    monkeypatch.setattr(eng, "_http_json", boom)
+    monkeypatch.setenv("WORKFORCE_ALLOW_DESK", "1")
+
+    ledger = eng.Ledger(str(tmp_path / "local" / "ledger"), "tester")
+    w = make_worker(
+        tmp_path,
+        queue_url="http://desk.test/api/admin/tasks/ready?product=workforce&label=worker:tester",
+    )
+    receipt = eng._park_seat_order_at_shift_end(w, str(tmp_path), str(out_path), None, ledger)
+    assert receipt["skipped"] == "no_task_ref"
+
+
+def test_dispatch_calls_park_seat_order_at_shift_end_on_successful_stop(tmp_path, monkeypatch):
+    """The DONE/STOP finalize path always checks whether this pass's order
+    needs an engine-driven park — not just on the shift_worktree branch."""
+    from workforce import engine as eng
+
+    calls = []
+    monkeypatch.setattr(
+        eng, "_park_seat_order_at_shift_end",
+        lambda *a, **k: calls.append(a) or {"action": "skipped"},
+    )
+    w = make_worker(tmp_path)
+    assert eng.dispatch(w, local(tmp_path)) == 0
+    assert len(calls) == 1

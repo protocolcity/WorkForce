@@ -1327,9 +1327,37 @@ def discover_candidates(
             "provider": provider,
             "title": str(t.get("title") or ""),
             "checkout_override": checkout_override,
+            "_sort_key": _parked_sort_key(t, tid),
         })
-    candidates.sort(key=lambda c: c["task_id"])
+    # wf-273 — desk list order with --limit N per pass let a newer order
+    # keep winning while an older parked one (e.g. wf-271) starved. Oldest
+    # parked-at first within priority tier, task id as the final tiebreak
+    # for determinism when priority and age both tie or are unknown.
+    candidates.sort(key=lambda c: c["_sort_key"])
+    for c in candidates:
+        del c["_sort_key"]
     return candidates[:headroom] if headroom < len(candidates) else candidates
+
+
+def _parked_sort_key(task: Dict[str, Any], task_id: str) -> Tuple[int, float, str]:
+    """(priority, parked-at age, task_id) — lower priority number is more
+    urgent (desk convention: 1=urgent ... 4=low); unset priority is treated
+    as the desk default (3) so it neither jumps nor starves behind explicit
+    priorities. ``updated_at`` is the best available parked-at proxy (the
+    desk stamps it on the in_review transition); unknown age sorts last
+    within its tier rather than jumping the queue."""
+    raw_priority = task.get("priority")
+    try:
+        priority = int(raw_priority)
+    except (TypeError, ValueError):
+        priority = 3
+    age = float("inf")
+    updated = task.get("updated_at")
+    if isinstance(updated, str):
+        dt = _parse_iso_z(updated)
+        if dt is not None:
+            age = dt.timestamp()
+    return (priority, age, task_id)
 
 
 # --------------------------------------------------------------------------
