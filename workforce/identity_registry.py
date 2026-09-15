@@ -28,7 +28,7 @@ ENV_PROCESS_ALT = "TP_PROCESS"
 
 def _pkg_city_root() -> Path:
     """City root when installed as source (…/workforce/workforce/this.py → …/)."""
-    # workforce/workforce/identity_registry.py → parents[2] = city (OneSeo)
+    # workforce/workforce/identity_registry.py → parents[2] = city (workspace root)
     return Path(__file__).resolve().parents[2]
 
 
