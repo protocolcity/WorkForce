@@ -1481,39 +1481,9 @@ def test_main_clear_recovery_cli_resets_state(tmp_path):
 # --------------------------------------------------------------------------
 # wf-265 review recovery — findings parser (finding 3)
 # --------------------------------------------------------------------------
-
-_UPLIFT_DIR = "/Users/example_user/OneSeo/local/reports/parallel-plan-pass/uplift"
-_uplift_available = os.path.isdir(_UPLIFT_DIR)
-
-
-def _read_uplift(name):
-    with open(os.path.join(_UPLIFT_DIR, name), encoding="utf-8") as fh:
-        return fh.read()
-
-
-@pytest.mark.skipif(not _uplift_available, reason="host-local reviewer transcripts not present")
-def test_parse_reviewer_findings_real_cursor_pc_1485_three_items():
-    findings = integrator.parse_reviewer_findings(_read_uplift("cursor-reviewer.out.pc-1485"))
-    assert len(findings) == 3
-    assert all("what looks correct" not in f.lower() for f in findings)
-
-
-@pytest.mark.skipif(not _uplift_available, reason="host-local reviewer transcripts not present")
-def test_parse_reviewer_findings_real_grok_workflow_pc_1484_three_items():
-    findings = integrator.parse_reviewer_findings(_read_uplift("workflow-reviewer.out.pc-1484"))
-    assert len(findings) == 3
-    # Grok's NDJSON text events must be concatenated, not left as one blob
-    # per streamed fragment.
-    assert all(f.strip().startswith(("1.", "2.", "3.", "**1.", "**2.", "**3.")) for f in findings)
-
-
-@pytest.mark.skipif(not _uplift_available, reason="host-local reviewer transcripts not present")
-def test_parse_reviewer_findings_real_cursor_pc_1494_strips_trailing_checked_section():
-    findings = integrator.parse_reviewer_findings(_read_uplift("cursor-reviewer.out.pc-1494"))
-    assert len(findings) == 3
-    joined = " ".join(findings).lower()
-    assert "other acceptance items" not in joined
-    assert "cleared inbox-report not read" not in joined
+# Host-local reviewer transcripts used to live at a machine path. Those
+# tests are gone: the parser is covered by the synthetic cases below so
+# public CI never depends on, or publishes, a personal workspace path.
 
 
 def test_parse_reviewer_findings_none_with_trailing_what_looks_correct_section():

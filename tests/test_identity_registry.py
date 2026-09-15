@@ -77,7 +77,7 @@ def test_load_section_52_ids_from_env(tmp_path, monkeypatch):
 
 def test_resolve_process_md_walks_to_city_root(tmp_path, monkeypatch):
     """Shift worktrees sit deep under city; walk finds worklane/PROCESS.md."""
-    city = tmp_path / "OneSeo"
+    city = tmp_path / "workspace"
     process = city / "worklane" / "PROCESS.md"
     process.parent.mkdir(parents=True)
     process.write_text(SAMPLE)
