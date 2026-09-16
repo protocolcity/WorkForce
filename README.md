@@ -19,7 +19,7 @@ is on the floor, and what every shift cost.
 brew install protocolcity/tap/blueprint
 blueprint setup ~/my-city
 blueprint serve --root ~/my-city --with-engines
-# → http://127.0.0.1:8801/  (Map · Desk · Roster)
+# → http://127.0.0.1:8803/  (Map · Desk · Roster; :8801/:8802 redirect here)
 ```
 
 ## WorkForce alone
