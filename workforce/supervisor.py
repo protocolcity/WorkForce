@@ -369,22 +369,6 @@ def _kill_process_group(proc: "subprocess.Popen") -> None:
 _STDERR_SNIPPET_BYTES = 4096
 
 
-def _read_stderr_snippet(stream: Any, cap_bytes: int = _STDERR_SNIPPET_BYTES) -> str:
-    """Best-effort bounded read of a provider's stderr for a readable error.
-
-    Only called after the provider process has already exited, so the
-    pipe's write end is closed and this read cannot block indefinitely --
-    a bare "provider exited 1" is not itself a diagnosable failure report.
-    """
-    try:
-        data = stream.read(cap_bytes)
-    except (OSError, ValueError):
-        return ""
-    if not data:
-        return ""
-    return data.decode("utf-8", "replace").strip()[:cap_bytes]
-
-
 def _run_provider(argv: List[str], state: Dict[str, Any], time_budget_secs: int,
                    output_budget_bytes: int) -> Dict[str, Any]:
     """Exec the configured provider with the state as untrusted JSON stdin.
@@ -444,16 +428,20 @@ def _run_provider(argv: List[str], state: Dict[str, Any], time_budget_secs: int,
     stderr_open = True
     timed_out = False
     over_budget = False
-    while stdout_open:
+    while stdout_open or stderr_open:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             timed_out = True
             break
-        watch = [proc.stdout] if not stderr_open else [proc.stdout, proc.stderr]
+        watch = []
+        if stdout_open:
+            watch.append(proc.stdout)
+        if stderr_open:
+            watch.append(proc.stderr)
         ready, _, _ = select.select(watch, [], [], remaining)
         if not ready:
             continue
-        if proc.stdout in ready:
+        if stdout_open and proc.stdout in ready:
             data = os.read(proc.stdout.fileno(), 65536)
             if not data:
                 stdout_open = False
@@ -464,9 +452,12 @@ def _run_provider(argv: List[str], state: Dict[str, Any], time_budget_secs: int,
                     over_budget = True
                     break
         if stderr_open and proc.stderr in ready:
-            # Always drained so a chatty provider cannot fill the stderr pipe
-            # and deadlock itself against our stdout-only wait; only the
-            # first _STDERR_SNIPPET_BYTES are kept, for a readable failure.
+            # Always drained -- for as long as stdout is also open, so a
+            # chatty provider cannot fill the stderr pipe and deadlock
+            # itself, and after stdout closes too, so a provider that
+            # finishes stdout before exiting doesn't block on stderr
+            # either. Only the first _STDERR_SNIPPET_BYTES are kept, for a
+            # readable failure.
             data = os.read(proc.stderr.fileno(), 65536)
             if not data:
                 stderr_open = False
@@ -488,8 +479,6 @@ def _run_provider(argv: List[str], state: Dict[str, Any], time_budget_secs: int,
         return {"ok": False, "error": "provider output exceeded output_budget_bytes", "actions": []}
     if proc.returncode != 0:
         error = "provider exited %d" % proc.returncode
-        if stderr_open:
-            stderr_chunks.append(_read_stderr_snippet(proc.stderr).encode("utf-8", "replace"))
         snippet = b"".join(stderr_chunks)[:_STDERR_SNIPPET_BYTES].decode("utf-8", "replace").strip()
         if snippet:
             error += ": %s" % snippet
