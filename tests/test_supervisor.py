@@ -505,6 +505,38 @@ def test_run_provider_launch_failure_reported(tmp_path):
     assert "launch failed" in result["error"]
 
 
+def test_run_provider_nonzero_exit_includes_stderr_snippet(tmp_path):
+    # A bare "provider exited 1" is not a diagnosable report -- the operator
+    # needs the provider's own error text to fix root cause.
+    argv = [sys.executable, "-c",
+            "import sys; sys.stderr.write('boom: auth token missing\\n'); sys.exit(1)"]
+    result = supervisor._run_provider(argv, {}, time_budget_secs=5, output_budget_bytes=4096)
+    assert result["ok"] is False
+    assert "provider exited 1" in result["error"]
+    assert "boom: auth token missing" in result["error"]
+
+
+def test_run_provider_nonzero_exit_without_stderr_has_no_snippet_suffix(tmp_path):
+    argv = [sys.executable, "-c", "import sys; sys.exit(1)"]
+    result = supervisor._run_provider(argv, {}, time_budget_secs=5, output_budget_bytes=4096)
+    assert result["ok"] is False
+    assert result["error"] == "provider exited 1"
+
+
+def test_run_provider_stderr_flood_does_not_deadlock_stdout_read(tmp_path):
+    # A chatty provider filling its stderr pipe must not block itself (and
+    # therefore our stdout-only wait) forever -- stderr is drained live.
+    argv = [sys.executable, "-c", textwrap.dedent("""
+        import json, sys
+        for _ in range(2000):
+            sys.stderr.write('x' * 4096)
+        sys.stderr.flush()
+        print(json.dumps({'actions': []}))
+    """)]
+    result = supervisor._run_provider(argv, {}, time_budget_secs=10, output_budget_bytes=4096)
+    assert result["ok"] is True
+
+
 def test_run_provider_timeout_kills_full_process_group_not_just_leader(tmp_path):
     """A provider that forks a detached-looking child must not leave it running
     past the timeout -- proves killpg, not a plain proc.kill() on the leader only."""
