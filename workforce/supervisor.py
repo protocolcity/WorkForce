@@ -366,6 +366,9 @@ def _kill_process_group(proc: "subprocess.Popen") -> None:
         pass
 
 
+_STDERR_SNIPPET_BYTES = 4096
+
+
 def _run_provider(argv: List[str], state: Dict[str, Any], time_budget_secs: int,
                    output_budget_bytes: int) -> Dict[str, Any]:
     """Exec the configured provider with the state as untrusted JSON stdin.
@@ -395,7 +398,7 @@ def _run_provider(argv: List[str], state: Dict[str, Any], time_budget_secs: int,
     try:
         proc = subprocess.Popen(
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, start_new_session=True,
+            stderr=subprocess.PIPE, start_new_session=True,
         )
     except OSError as exc:
         return {"ok": False, "error": "provider launch failed: %s" % exc, "actions": []}
@@ -419,24 +422,48 @@ def _run_provider(argv: List[str], state: Dict[str, Any], time_budget_secs: int,
     deadline = time.monotonic() + time_budget_secs
     chunks: List[bytes] = []
     total = 0
+    stderr_chunks: List[bytes] = []
+    stderr_total = 0
+    stdout_open = True
+    stderr_open = True
     timed_out = False
     over_budget = False
-    while True:
+    while stdout_open or stderr_open:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             timed_out = True
             break
-        ready, _, _ = select.select([proc.stdout], [], [], remaining)
+        watch = []
+        if stdout_open:
+            watch.append(proc.stdout)
+        if stderr_open:
+            watch.append(proc.stderr)
+        ready, _, _ = select.select(watch, [], [], remaining)
         if not ready:
             continue
-        data = os.read(proc.stdout.fileno(), 65536)
-        if not data:
-            break  # EOF
-        chunks.append(data)
-        total += len(data)
-        if total >= output_budget_bytes:
-            over_budget = True
-            break
+        if stdout_open and proc.stdout in ready:
+            data = os.read(proc.stdout.fileno(), 65536)
+            if not data:
+                stdout_open = False
+            else:
+                chunks.append(data)
+                total += len(data)
+                if total >= output_budget_bytes:
+                    over_budget = True
+                    break
+        if stderr_open and proc.stderr in ready:
+            # Always drained -- for as long as stdout is also open, so a
+            # chatty provider cannot fill the stderr pipe and deadlock
+            # itself, and after stdout closes too, so a provider that
+            # finishes stdout before exiting doesn't block on stderr
+            # either. Only the first _STDERR_SNIPPET_BYTES are kept, for a
+            # readable failure.
+            data = os.read(proc.stderr.fileno(), 65536)
+            if not data:
+                stderr_open = False
+            elif stderr_total < _STDERR_SNIPPET_BYTES:
+                stderr_chunks.append(data)
+                stderr_total += len(data)
     if timed_out or over_budget:
         # Bound violated: kill the whole process group, not only proc itself,
         # so a provider that forked descendants cannot outlive the budget.
@@ -451,7 +478,11 @@ def _run_provider(argv: List[str], state: Dict[str, Any], time_budget_secs: int,
     if over_budget:
         return {"ok": False, "error": "provider output exceeded output_budget_bytes", "actions": []}
     if proc.returncode != 0:
-        return {"ok": False, "error": "provider exited %d" % proc.returncode, "actions": []}
+        error = "provider exited %d" % proc.returncode
+        snippet = b"".join(stderr_chunks)[:_STDERR_SNIPPET_BYTES].decode("utf-8", "replace").strip()
+        if snippet:
+            error += ": %s" % snippet
+        return {"ok": False, "error": error, "actions": []}
     stdout = b"".join(chunks)[:output_budget_bytes].decode("utf-8", "replace")
     try:
         parsed = json.loads(stdout)
