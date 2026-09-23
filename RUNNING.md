@@ -141,12 +141,24 @@ recovery reason) and `reason_sha` (its sha256, truncated) so the ledger names
 why the recovery ran, not just that it did. The engine still holds its own
 per-worker lock and enforces the worker's budget for the recovered attempt,
 and still makes no WorkLane writes.
-task_runner's own reservation lock and ready-eligibility re-check, run inside
-the spawned subprocess, are unchanged — a second concurrent start (through the
-engine or run directly) is still refused, and an ungated task still fails
-closed. Direct `task_runner --recover-receipt` invocation, outside `workforce
+The ordinary ready-count probe is skipped for an explicit receipt; an empty
+queue does not cancel that selected recovery. The spawned task runner still
+validates its target and holds the reservation lock. A second concurrent start
+or a gated target is refused. Direct `task_runner --recover-receipt` invocation, outside `workforce
 dispatch`, remains available for an operator who is not ready to route through
 the engine; it is simply not engine-visible.
+
+Manual recovery can also continue the original worker's own active or parked
+task without releasing its claim. It reads the exact task from WorkLane and
+requires matching project, task, assignment, execution label and a persisted
+Owner marker signed by that worker. Every gate, including timer holds, blocks
+this path. Failed or ambiguous ownership evidence blocks it as well. The task,
+runner configuration, source HEAD and instructions are checked again under the
+reservation lock immediately before execution. Existing partial files remain
+in the same checkout; an operator resume does not certify those edits as tested.
+Configured qualified routing cannot be bypassed through this manual path; use
+the guarded checkpoint handoff workflow below. Backlog reassignment recovery
+continues to require ready eligibility. No path silently changes providers.
 
 A recovered shift through the engine is always a forced single pass: the
 worker's own `max_passes` (drain or multi-pass) never re-spawns the recovery

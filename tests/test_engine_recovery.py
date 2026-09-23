@@ -35,7 +35,9 @@ def git(repo, *args):
 class _DeskHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.server.methods.append("GET")
-        body = json.dumps(self.server.feed).encode()
+        response = (getattr(self.server, "detail", self.server.feed)
+                    if "/ready?" not in self.path else self.server.feed)
+        body = json.dumps(response).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -363,6 +365,23 @@ def test_recovery_proceeds_when_the_ordinary_ready_queue_is_empty(tmp_path, prep
     start = next(l for l in text.splitlines() if " START " in l)
     assert "recovery=1" in start
     assert "queue=?" in start
+
+
+@pytest.mark.parametrize("status", ["in_progress", "in_review"])
+def test_empty_ready_queue_resumes_real_owned_task_subprocess(tmp_path, prepared, desk, status):
+    config, config_path, result, out_marker = prepared
+    worker = make_worker(tmp_path, config, config_path, desk, queue_count=0)
+    desk.feed = {"ok": True, "count": 0, "product": "product", "tasks": []}
+    task = dict(id="p-1", product="product", status=status,
+                labels=["worker:builder", "execution:bounded"],
+                comments=[dict(id=1, author="builder", body="Owner: builder\nPlan: Resume")])
+    desk.detail = {"ok": True, "product": "product", "task": task}
+    assert engine.dispatch(worker, local(tmp_path), recover_receipt=result["receipt"],
+                           recovery_reason="resume existing owner") == 0
+    assert out_marker.read_text() == "recovered-ok\n"
+    assert " STOP " in ledger_text(tmp_path)
+    assert "SKIP" not in ledger_text(tmp_path)
+    assert desk.detail["task"]["status"] == status
 
 
 def test_ordinary_empty_dispatch_without_recovery_stays_a_clean_skip(tmp_path, prepared, desk):

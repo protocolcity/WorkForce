@@ -54,6 +54,20 @@ def feed(task):
     return lambda url: {"count": 1, "tasks": [task]}
 
 
+def owned_detail_feed(task, ready_tasks=()):
+    """Ready feed excludes live claims (as the real desk does); the exact
+    task is only reachable through the per-task detail endpoint."""
+    def fetch(url):
+        if url.rstrip("/").endswith("/ready") or "/tasks/ready?" in url:
+            return {"count": len(ready_tasks), "tasks": list(ready_tasks)}
+        return {"ok": True, "product": task.get("product"), "task": task}
+    return fetch
+
+
+def owner_comment(owner, comment_id="1"):
+    return {"id": comment_id, "author": owner, "body": "Owner: " + owner}
+
+
 def test_isolates_two_tasks_and_preserves_primary_wip(setup):
     config, task = setup
     repo = Path(config["repository"])
@@ -321,6 +335,110 @@ def test_recover_rejects_unready_gated_done_or_wrong_owner(setup, change):
     prepared = prepare(config, feed(task))
     with pytest.raises(PreparationError):
         recover(config, prepared["receipt"], "resume after crash", feed(dict(task, **change)))
+
+
+# Same-owner recovery
+
+
+def test_recover_resumes_same_owner_parked_task_absent_from_ready_feed(setup):
+    """The actually observed manual continuation case: an in_review task
+    correctly owned by this worker never appears in the (backlog-only) ready
+    feed, so it must still be recoverable via the task detail endpoint."""
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    owned = dict(task, status="in_review", comments=[owner_comment("builder")])
+
+    result = recover(config, prepared["receipt"], "resume after quota reset", owned_detail_feed(owned))
+
+    assert result["checkout"] == prepared["checkout"]
+    receipt = json.loads(Path(result["receipt"]).read_text())
+    assert receipt["state"] == "recovered"
+    assert receipt["recovery_kind"] == "same_owner"
+
+
+def test_recover_resumes_same_owner_in_progress_task(setup):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    owned = dict(task, status="in_progress", comments=[owner_comment("builder")])
+
+    result = recover(config, prepared["receipt"], "resume after transport blip", owned_detail_feed(owned))
+
+    assert json.loads(Path(result["receipt"]).read_text())["recovery_kind"] == "same_owner"
+
+
+@pytest.mark.parametrize("change", [
+    {"status": "done"}, {"status": "canceled"}, {"status": "backlog"},
+    {"gate_type": "human"}, {"gate_type": "deferred"}, {"gate_type": "tracking"},
+    {"gate_type": "timer"}, {"gate_type": "unrecognized"},
+    {"labels": ["worker:other", "execution:bounded"]},
+    {"labels": ["worker:builder", "worker:other", "execution:bounded"]},
+    {"labels": ["worker:builder"]},
+    {"comments": [owner_comment("other")]},
+    {"comments": []},
+    {"comments": None},
+    {"comments": [dict(owner_comment("builder"), author="other")]},
+    {"comments": [dict(owner_comment("builder"), id=None)]},
+    {"comments": [owner_comment("builder"), dict(owner_comment("builder"), body="Owner:")]},
+    {"comments": [owner_comment("builder"), dict(owner_comment("builder"), body="Released by builder")]},
+    {"product": "other"},
+])
+def test_recover_same_owner_fails_closed_on_ambiguous_or_wrong_detail(setup, change):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    owned = dict(dict(task, status="in_review", comments=[owner_comment("builder")]), **change)
+    with pytest.raises(PreparationError):
+        recover(config, prepared["receipt"], "resume after crash", owned_detail_feed(owned))
+
+
+def test_recover_same_owner_never_resumes_after_handoff(setup, monkeypatch):
+    """An old owner can never use the same-owner path to resume a
+    reservation that was never theirs, even if WorkLane shows them as the
+    signed owner of some other worker's task detail."""
+    config, task = setup
+    prepared = prepare(config, feed(task))
+
+    other_config = dict(config, worker="other")
+    monkeypatch.setenv("WL_AGENT_ID", "other")
+    owned = dict(task, status="in_review", labels=["worker:other", "execution:bounded"],
+                 comments=[owner_comment("other")])
+
+    with pytest.raises(PreparationError):
+        recover(other_config, prepared["receipt"], "attempted takeover", owned_detail_feed(owned))
+
+
+def test_recover_same_owner_detail_response_must_match_requested_task(setup):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    owned = dict(task, id="different-task", status="in_review", comments=[owner_comment("builder")])
+    with pytest.raises(PreparationError):
+        recover(config, prepared["receipt"], "resume after crash", owned_detail_feed(owned))
+
+
+def test_manual_recovery_rechecks_owner_before_exec_without_routing_policy(setup):
+    from workforce.task_runner import _revalidate_launch
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    owned = dict(task, status="in_review", comments=[owner_comment("builder")])
+    result = recover(config, prepared["receipt"], "resume", owned_detail_feed(owned))
+    _revalidate_launch(config, result, owned_detail_feed(owned))
+    changed = dict(owned, comments=[owner_comment("other")])
+    with pytest.raises(PreparationError, match="owner"):
+        _revalidate_launch(config, result, owned_detail_feed(changed))
+    changed = dict(owned, gate_type="human")
+    with pytest.raises(PreparationError, match="gate"):
+        _revalidate_launch(config, result, owned_detail_feed(changed))
+
+
+def test_manual_recovery_rejects_failed_detail_envelope(setup):
+    config, task = setup
+    prepared = prepare(config, feed(task))
+    owned = dict(task, status="in_review", comments=[owner_comment("builder")])
+    ordinary = owned_detail_feed(owned)
+    def failed_detail(url):
+        result = ordinary(url)
+        return dict(result, ok=False) if "/ready?" not in url else result
+    with pytest.raises(PreparationError, match="detail"):
+        recover(config, prepared["receipt"], "resume", failed_detail)
 
 
 def test_recover_preserves_dirty_checkout_and_writes_unique_attempt(setup):
@@ -609,6 +727,23 @@ def test_bound_launch_rechecks_before_provider_exec(setup, tmp_path, change):
         p.write_text(json.dumps(raw))
     with pytest.raises((ValueError, PreparationError)):
         _revalidate_launch(config, result, feed(task))
+
+
+def test_manual_same_owner_cannot_bypass_configured_qualification(setup, tmp_path):
+    """Manual recovery cannot silently waive an installed routing policy."""
+    from workforce.task_runner import _revalidate_launch
+    config, task = setup
+    task["labels"] += ["work-kind:implement", "risk:low"]
+    candidate_id = "claude/sonnet-5@medium#%s::product" % ROUTING_HOST
+    config["routing_policy"] = _write_routing_policy(tmp_path, [_routing_seat_row()],
+        [_bounded_edit_result(candidate_id)])
+    config["routing_host"] = ROUTING_HOST
+    _bind_test_policy(config)
+    prepared = prepare(config, feed(task))
+    owned = dict(task, status="in_review", comments=[owner_comment("builder")])
+
+    with pytest.raises(PreparationError, match="qualified routing"):
+        recover(config, prepared["receipt"], "resume", owned_detail_feed(owned))
 
 
 def test_supervisor_context_cannot_launch_a_different_ready_task(setup, tmp_path, monkeypatch):

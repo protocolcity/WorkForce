@@ -26,6 +26,7 @@ from . import task_routing
 from . import routing_binding
 from .routing_policy import RoutingPolicyError, load_routing_policy
 from . import continuity_recovery as continuity_recovery_mod
+from ._utils import latest_signed_owner_id
 
 
 class PreparationError(RuntimeError):
@@ -125,6 +126,62 @@ def _eligible_tasks(config, fetch):
     return project, worker, eligible
 
 
+def _fetch_task_detail(config, task_id, fetch):
+    """Fetch the exact WorkLane task by id -- never the ready feed's projection.
+
+    Used only by explicit same-owner recovery: an owned in_progress/in_review
+    task never appears in the ready feed (it is not backlog), so eligibility
+    there cannot be decided from :func:`_eligible_tasks`. Fails closed on any
+    unavailable or mismatched response rather than assuming identity.
+    """
+    project = _slug(config["project"])
+    origin = config["desk_url"].rstrip("/")
+    detail = fetch(origin + "/api/admin/tasks/" + task_id + "?" + urlencode({"product": project}))
+    if (not isinstance(detail, dict) or detail.get("ok") is not True
+            or detail.get("product", project) != project):
+        raise PreparationError("Unavailable or malformed task detail")
+    task = detail.get("task")
+    if not isinstance(task, dict) or task.get("product") != project or task.get("id") != task_id:
+        raise PreparationError("Task detail response does not match the requested product/id")
+    return task
+
+
+def _same_owner_recovery_match(config, worker, task_id, fetch):
+    """Validate an explicit operator resume of the recovering worker's own
+    active or parked claim, fetched directly rather than via the ready feed.
+
+    This is the manual continuation case: a correctly owned in_progress or
+    in_review task is never ready-eligible, so it cannot be found by
+    :func:`_eligible_tasks`. Recovery here never infers ownership merely from
+    the worker:<name> label -- it also requires the latest signed Owner:
+    marker (PROCESS §5) to name this worker, and fails closed on any
+    unavailable, ambiguous, gated, or terminal detail.
+    """
+    required_label = config["required_label"]
+    if not isinstance(required_label, str) or not required_label:
+        raise PreparationError("An explicit execution eligibility label is required")
+    task = _fetch_task_detail(config, task_id, fetch)
+    if task.get("status") not in task_routing._LIVE_CLAIM_STATUSES:
+        raise PreparationError(
+            "Task is not an active or parked same-owner claim; release/reassign it in "
+            "WorkLane before recovery")
+    if task.get("gate_type") not in (None, ""):
+        raise PreparationError("Task carries a blocking gate; refusing explicit same-owner recovery")
+    labels = task.get("labels", [])
+    if not isinstance(labels, list):
+        raise PreparationError("Task detail returned invalid labels")
+    worker_labels = [x for x in labels if isinstance(x, str) and x.startswith("worker:")]
+    if worker_labels != ["worker:" + worker]:
+        raise PreparationError("Task worker label does not match the recovering worker")
+    if required_label not in labels:
+        raise PreparationError("Task does not carry the configured execution eligibility label")
+    if latest_signed_owner_id(task.get("comments")) != worker:
+        raise PreparationError(
+            "Latest signed WorkLane owner does not name the recovering worker; refusing "
+            "to infer ownership from the worker label alone")
+    return dict(task, product=config["project"])
+
+
 def _load_prepared_routing(config):
     context_raw = os.environ.get(routing_binding.CONTEXT_ENV)
     context = json.loads(context_raw) if context_raw else None
@@ -182,6 +239,20 @@ def _record_launch_binding(config, result, routing, task, qualification):
 
 def _revalidate_launch(config, result, fetch=_fetch):
     data = json.loads(Path(result["receipt"]).read_text())
+    if data.get("recovery_kind") == "same_owner":
+        if os.environ.get(routing_binding.CONTEXT_ENV) or config.get("routing_policy"):
+            raise PreparationError("qualified routing requires its guarded handoff path")
+        binding = data.get("manual_recovery") or {}
+        task = _same_owner_recovery_match(config, result["worker"], result["task_id"], fetch)
+        current = {
+            "runner_sha256": routing_binding.runner_digest(config),
+            "task_sha256": routing_binding.task_digest(task),
+            "head": _git(result["checkout"], "rev-parse", "HEAD"),
+            "authority_sha256": hashlib.sha256(_authority_text(config).encode()).hexdigest(),
+        }
+        if binding != current:
+            raise PreparationError("manual recovery context changed before provider launch")
+        return
     bound = data.get("routing")
     if bound is None:
         if os.environ.get(routing_binding.CONTEXT_ENV) or config.get("routing_policy"):
@@ -368,9 +439,15 @@ def recover(config, receipt_path, reason, fetch=_fetch, legacy_stop_evidence=Non
     reservation's evidence (prompt/result/receipt) is preserved untouched; a
     new, uniquely numbered attempt directory holds this recovery's own prompt,
     result path and receipt. The task must currently be ready-eligible for the
-    configured worker in WorkLane -- an operator must release or reassign the
-    task there first. Different-worker recovery is a legitimate handoff as
-    long as the ready feed already reflects that reassignment.
+    configured worker in WorkLane, OR -- the manual continuation case -- must be
+    the recovering worker's own currently active or parked (in_progress/in_review)
+    claim on the exact same original reservation, validated directly against
+    WorkLane's task detail rather than the ready feed (see
+    :func:`_same_owner_recovery_match`). Different-worker recovery is a legitimate
+    handoff as long as the ready feed already reflects that reassignment; an old
+    owner can never resume after a handoff, since the same-owner path additionally
+    requires the canonical reservation's own worker to still match the one
+    recovering.
 
     A canonical receipt written before LOCK_PROTOCOL_VERSION existed never
     held the reservation lock in the first place, so an absent or unlocked
@@ -409,13 +486,28 @@ def recover(config, receipt_path, reason, fetch=_fetch, legacy_stop_evidence=Non
         raise PreparationError("Recovery receipt belongs to a different project")
     task_id = _slug(old["task_id"])
     match = next((t for t in eligible if t.get("id") == task_id), None)
-    if match is None:
-        raise PreparationError(
-            "Task is not currently ready for this worker; release/reassign it in WorkLane before recovery")
     routing = _load_prepared_routing(config)
-    matched, qualification = _routed_task(config, [match], routing)
-    if matched is None:
-        raise PreparationError("recovery seat is not qualified for the preserved work")
+    same_owner_recovery = match is None
+    if not same_owner_recovery:
+        matched, qualification = _routed_task(config, [match], routing)
+        if matched is None:
+            raise PreparationError("recovery seat is not qualified for the preserved work")
+    else:
+        # Manual continuation: a correctly owned in_progress/in_review
+        # task is never in the backlog-only ready feed, so an empty match there does
+        # not by itself mean the task is unavailable. Explicit same-owner recovery is
+        # validated directly against WorkLane's task detail instead, and only for the
+        # worker that already holds the canonical reservation -- never a handoff, which
+        # remains the ready-feed/routed path above.
+        if old["worker"] != worker:
+            raise PreparationError(
+                "Task is not currently ready for this worker, and the canonical reservation "
+                "belongs to a different worker; release/reassign it in WorkLane before recovery")
+        if routing is not None:
+            raise PreparationError(
+                "qualified routing requires its guarded handoff path")
+        match = _same_owner_recovery_match(config, worker, task_id, fetch)
+        qualification = None
     repo = _path(config["repository"])
     _check_remote(repo, config)
     checkout = _path(old["checkout"])
@@ -465,6 +557,14 @@ def recover(config, receipt_path, reason, fetch=_fetch, legacy_stop_evidence=Non
     if legacy_stop_evidence:
         new_receipt["legacy_stop_acknowledged"] = True
         new_receipt["legacy_stop_evidence"] = legacy_stop_evidence
+    if same_owner_recovery:
+        new_receipt["recovery_kind"] = "same_owner"
+        new_receipt["manual_recovery"] = {
+            "runner_sha256": routing_binding.runner_digest(config),
+            "task_sha256": routing_binding.task_digest(match),
+            "head": _git(checkout, "rev-parse", "HEAD"),
+            "authority_sha256": hashlib.sha256(authority_text.encode()).hexdigest(),
+        }
     new_receipt_path = attempt / "preparation.json"
     new_receipt_path.write_text(json.dumps(new_receipt, indent=2) + "\n")
     return _record_launch_binding(config, {"argv": argv, "checkout": str(checkout), "receipt": str(new_receipt_path),
