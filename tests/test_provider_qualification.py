@@ -216,14 +216,17 @@ def test_write_qualification_report_creates_files(tmp_path):
     assert "Qualification matrix" in md
 
 
-def test_format_report_includes_related_work():
+def test_format_report_related_work_is_host_supplied_and_empty_by_default():
     report = pq.build_qualification_report(
         "/tmp/unused", {},
         window_days=7,
     )
+    assert report["related_work"] == []
+    assert report["provider_return_paths"] == []
     md = pq.format_qualification_report(report)
-    assert "wf-260" in md
-    assert "wf-262" in md
+    assert "Related work disposition" in md
+    assert "Provider return paths" in md
+    assert "_none supplied_" in md
 
 
 def test_qualify_cap_zero_exits_nonzero(tmp_path, monkeypatch, capsys):
