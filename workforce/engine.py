@@ -1091,8 +1091,19 @@ def startup_reconcile(
     return report
 
 
-def _preflight(worker: Worker) -> Tuple[Optional[int], List[dict]]:
-    """Pre-dispatch checks. Returns (ready count, ready task dicts)."""
+def _preflight(
+    worker: Worker, skip_ready_check: bool = False,
+) -> Tuple[Optional[int], List[dict]]:
+    """Pre-dispatch checks. Returns (ready count, ready task dicts).
+
+    ``skip_ready_check`` is set for an explicit, already-resolved recovery
+    target (explicit recovery): the recovered task is a specific reservation validated
+    on its own terms (receipt + task_runner's own under-lock re-check), not
+    a pick from the ordinary ready feed. Executable/auth/disk checks below
+    still apply — recovery is not exempt from them — but neither an empty
+    ordinary ready feed nor an unreachable one is evidence against a
+    verified recovery target, so the feed probe itself is skipped.
+    """
     try:
         free_mb = _free_mb(worker.workdir)
     except OSError as exc:
@@ -1116,6 +1127,8 @@ def _preflight(worker: Worker) -> Tuple[Optional[int], List[dict]]:
         found = shutil.which(cmd, path=worker.env.get("PATH")) is not None
     if not found:
         raise _Skip("CLI %r not installed" % cmd)
+    if skip_ready_check:
+        return None, []
     count, tasks = _probe_ready(worker)
     if count is not None and count <= 0:
         raise _Skip("queue empty")
@@ -1154,6 +1167,7 @@ def revalidate_ready_after_lock(
     ready_tasks: List[dict],
     ledger: Ledger,
     allow_empty: bool = False,
+    skip_ready_check: bool = False,
 ) -> Tuple[Optional[int], List[dict]]:
     """Second ready look after the single-flight lock.
 
@@ -1168,9 +1182,16 @@ def revalidate_ready_after_lock(
 
     Probe or per-task fetch failures fail open (WARN + keep prior set) so a
     flaky desk does not invent empty-queue SKIPs after a green first probe.
+
+    ``skip_ready_check`` (explicit recovery) mirrors ``_preflight``'s flag: an explicit,
+    already-resolved recovery target is not a pick from this ordinary ready
+    feed, so its TOCTOU re-probe is skipped entirely rather than raising or
+    swallowing an empty/unreachable feed.
     """
     tasks = list(ready_tasks or [])
     count = queue_count
+    if skip_ready_check:
+        return count, tasks
 
     if worker.queue_url:
         try:
@@ -2383,7 +2404,9 @@ def dispatch(
             return 1
         if not _scope_check(worker, ledger):
             return 1
-        queue_count, ready_tasks = _preflight(worker)
+        queue_count, ready_tasks = _preflight(
+            worker, skip_ready_check=bool(recovery_task_id),
+        )
         lock.acquire()
     except _Skip as skip:
         reason = str(skip)
@@ -2411,6 +2434,7 @@ def dispatch(
         try:
             queue_count, ready_tasks = revalidate_ready_after_lock(
                 worker, queue_count, ready_tasks, ledger,
+                skip_ready_check=bool(recovery_task_id),
             )
         except _Skip as skip:
             reason = str(skip)
