@@ -21,6 +21,14 @@ def _hermetic_no_desk(monkeypatch: pytest.MonkeyPatch) -> None:
     unaffected. Rare integration tests may set WORKFORCE_ALLOW_DESK=1 to
     opt back into live desk (still needs a reachable desk mock).
     """
+    # Test fixtures choose their own stores/rosters. Host execution context must
+    # never redirect those fixtures or their fake-provider child processes.
+    for name in ("WORKFORCE_DATA_DIR", "WORKFORCE_ROSTER", "WORKFORCE_AUTHORITY_CHAIN_PATHS",
+                 "WORKLANE_RUNTIME_DIR", "WORKLANE_DB", "WL_WORKFORCE_ROSTER",
+                 "WL_AGENT_ID", "TP_AGENT_ID", "TP_PRODUCT", "TP_DEFAULT_PRODUCT"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("WL_WAKE_DISABLE", "1")
+    monkeypatch.setenv("WL_NTFY_DISABLE", "1")
     monkeypatch.setenv("WORKFORCE_NO_DESK", "1")
     # Opt-in must not leak from the host environment into the suite.
     monkeypatch.delenv("WORKFORCE_ALLOW_DESK", raising=False)

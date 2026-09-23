@@ -7,11 +7,14 @@ on:
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.9"
+          python-version: ${{ matrix.python-version }}
       - name: Install
         run: |
           pip install pytest
@@ -19,4 +22,8 @@ jobs:
       - name: Pytest
         env:
           WORKFORCE_NO_DESK: "1"
+          WORKFORCE_DATA_DIR: ${{ runner.temp }}/workforce-fixtures
+          WORKLANE_RUNTIME_DIR: ${{ runner.temp }}/worklane-fixtures
+          WL_WAKE_DISABLE: "1"
+          WL_NTFY_DISABLE: "1"
         run: pytest tests/ -q

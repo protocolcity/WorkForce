@@ -154,6 +154,7 @@ def test_row_fields_from_rich_evidence(tmp_path):
 
 
 def test_report_model_includes_supervisor_section(tmp_path, monkeypatch):
+    _freeze_utcnow(monkeypatch, datetime.datetime(2026, 9, 12, 12, tzinfo=datetime.timezone.utc))
     local = _local(tmp_path)
     w = _worker(tmp_path, "lane", "hood")
     _patch_roster(monkeypatch, Roster(workers={"lane": w}, path="t"))
