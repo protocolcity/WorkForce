@@ -133,6 +133,7 @@ def prepared(tmp_path, task, monkeypatch, desk):
     initial_run = subprocess.run([sys.executable, "-m", "workforce.task_runner", "--config", str(config_path)],
                                  capture_output=True, text=True, timeout=20)
     assert initial_run.returncode == 0, initial_run.stdout + initial_run.stderr
+    desk.methods.clear()  # subsequent assertions observe only the recovery shift
     reservation = Path(config['state_dir']) / 'builder' / 'p-1'
     result = {'receipt': str(reservation / 'preparation.json'), 'lock': str(reservation / 'lock'),
               'checkout': str(reservation / 'checkout')}
