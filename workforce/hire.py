@@ -1095,6 +1095,11 @@ def generate_seat_folder(
     auth_check = adapter.auth_check()
     allow_list = adapter.allow_list(ctx)
 
+    qualification_files = [launch_path, mcp_path, contract_path, prompt_path]
+    if provider == "cursor":
+        qualification_files.append(os.path.join(seat_dir, "permissions.json"))
+    elif provider == "grok":
+        qualification_files.append(os.path.join(seat_dir, ".grok", "config.toml"))
     files = {
         "runner.json": json.dumps({
             "project": project,
@@ -1107,6 +1112,7 @@ def generate_seat_folder(
             "state_dir": state_dir,
             "prompt_template": prompt_path,
             "authority_chain": authority_chain,
+            "qualification_files": qualification_files,
             "auth_check": auth_check,
             "command": command,
         }, indent=2) + "\n",

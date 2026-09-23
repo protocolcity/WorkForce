@@ -18,86 +18,66 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, Iterable, List
 
-LAUNCH_PY = '''import json,os,subprocess,sys
+LAUNCH_PY = '''import sys
 from pathlib import Path
-from workforce.task_runner import prepare,_acquire_lock,main as task_runner_main
+from workforce.task_runner import main as task_runner_main
 h=Path(__file__).parent
-# Engine-mediated recovery: forward operator recovery flags to task_runner
-# unchanged. The roster command carries --config runner.json so the engine
-# can resolve state_dir; strip it here.
 argv=list(sys.argv[1:])
 while '--config' in argv:
     i=argv.index('--config'); del argv[i:i+2]
-if argv:
-    raise SystemExit(task_runner_main(['--config',str(h/'runner.json')]+argv))
-result=prepare(json.loads((h/'runner.json').read_text()))
-if result is None:raise SystemExit(0)
-lock_fd=_acquire_lock(result['lock'])
-raise SystemExit(subprocess.call(result['argv'],cwd=result['checkout'],env=dict(os.environ)))
+raise SystemExit(task_runner_main(['--config',str(h/'runner.json')]+argv))
 '''
 
-LAUNCH_PY_CURSOR = '''import json,os,subprocess,sys
+LAUNCH_PY_CURSOR = '''import sys
 from pathlib import Path
-from workforce.task_runner import prepare,_acquire_lock,exclude_from_git,main as task_runner_main
+from workforce.task_runner import main as task_runner_main
 h=Path(__file__).parent
-# Engine-mediated recovery: forward operator recovery flags to task_runner
-# unchanged. The roster command carries --config runner.json so the engine
-# can resolve state_dir; strip it here.
 argv=list(sys.argv[1:])
 while '--config' in argv:
     i=argv.index('--config'); del argv[i:i+2]
-def _plant_cursor(checkout):
-    # cursor-agent reads MCP servers and permissions from <cwd>/.cursor, and
-    # the provider runs inside the prepared checkout; plant the seat's own
-    # identity there so it signs WorkLane as itself. Never overwrite existing
-    # task settings, and never let the plant land in the seat's own commit.
-    if not checkout: return
-    _settings=Path(checkout)/'.cursor'; _settings.mkdir(exist_ok=True)
-    for _src,_dst in (('mcp.json','mcp.json'),('permissions.json','cli.json')):
-        _s=h/_src; _d=_settings/_dst
-        if _s.exists() and not _d.exists(): _d.write_text(_s.read_text())
-    exclude_from_git(checkout,['.cursor/'])
-if argv:
-    if '--recover-receipt' in argv:
-        try: _plant_cursor(json.loads(Path(argv[argv.index('--recover-receipt')+1]).read_text()).get('checkout'))
-        except Exception: pass
-    raise SystemExit(task_runner_main(['--config',str(h/'runner.json')]+argv))
-result=prepare(json.loads((h/'runner.json').read_text()))
-if result is None:raise SystemExit(0)
-lock_fd=_acquire_lock(result['lock'])
-_plant_cursor(result['checkout'])
-raise SystemExit(subprocess.call(result['argv'],cwd=result['checkout'],env=dict(os.environ)))
+SETTINGS=(('mcp.json','.cursor/mcp.json'),('permissions.json','.cursor/cli.json'))
+EXCLUDES=['.cursor/']
+from workforce.task_runner import exclude_from_git
+
+def _plant_settings(config,result):
+    checkout=Path(result['checkout'])
+    for source,destination in SETTINGS:
+        src=h/source; dst=checkout/destination
+        if not src.is_file():
+            raise ValueError('provider settings are missing: '+source)
+        if dst.exists() and dst.read_bytes()!=src.read_bytes():
+            raise ValueError('preserved provider settings differ; review before resuming')
+        dst.parent.mkdir(parents=True,exist_ok=True)
+        if not dst.exists(): dst.write_bytes(src.read_bytes())
+    exclude_from_git(str(checkout),EXCLUDES)
+
+raise SystemExit(task_runner_main(['--config',str(h/'runner.json')]+argv,before_exec=_plant_settings))
 '''
 
-LAUNCH_PY_GROK = '''import json,os,subprocess,sys
+LAUNCH_PY_GROK = '''import sys
 from pathlib import Path
-from workforce.task_runner import prepare,_acquire_lock,exclude_from_git,main as task_runner_main
+from workforce.task_runner import main as task_runner_main
 h=Path(__file__).parent
-# Engine-mediated recovery: forward operator recovery flags to task_runner
-# unchanged. The roster command carries --config runner.json so the engine
-# can resolve state_dir; strip it here.
 argv=list(sys.argv[1:])
 while '--config' in argv:
     i=argv.index('--config'); del argv[i:i+2]
-def _drop_grok_config(checkout):
-    import shutil
-    cfg=h/'.grok'/'config.toml'
-    if not cfg.exists() or not checkout: return
-    dst=Path(checkout)/'.grok'; dst.mkdir(exist_ok=True)
-    dst_cfg=dst/'config.toml'
-    # Never overwrite an existing task-provided config.toml in the checkout.
-    if not dst_cfg.exists(): shutil.copy(cfg,dst_cfg)
-    exclude_from_git(checkout,['.grok/'])
-if argv:
-    if '--recover-receipt' in argv:
-        try: _drop_grok_config(json.loads(Path(argv[argv.index('--recover-receipt')+1]).read_text()).get('checkout'))
-        except Exception: pass
-    raise SystemExit(task_runner_main(['--config',str(h/'runner.json')]+argv))
-result=prepare(json.loads((h/'runner.json').read_text()))
-if result is None:raise SystemExit(0)
-lock_fd=_acquire_lock(result['lock'])
-_drop_grok_config(result['checkout'])
-raise SystemExit(subprocess.call(result['argv'],cwd=result['checkout'],env=dict(os.environ)))
+SETTINGS=(('.grok/config.toml','.grok/config.toml'),)
+EXCLUDES=['.grok/']
+from workforce.task_runner import exclude_from_git
+
+def _plant_settings(config,result):
+    checkout=Path(result['checkout'])
+    for source,destination in SETTINGS:
+        src=h/source; dst=checkout/destination
+        if not src.is_file():
+            raise ValueError('provider settings are missing: '+source)
+        if dst.exists() and dst.read_bytes()!=src.read_bytes():
+            raise ValueError('preserved provider settings differ; review before resuming')
+        dst.parent.mkdir(parents=True,exist_ok=True)
+        if not dst.exists(): dst.write_bytes(src.read_bytes())
+    exclude_from_git(str(checkout),EXCLUDES)
+
+raise SystemExit(task_runner_main(['--config',str(h/'runner.json')]+argv,before_exec=_plant_settings))
 '''
 
 CONTRACT_TEMPLATE = """# {project} bounded implementation contract ({provider} seat)
@@ -120,7 +100,11 @@ permission or authentication failures or three no-progress corrections.
 Commit only explicit owned files in the prepared branch; the host
 publishes, reviews, integrates and installs. Record tests and revision on
 the same order with wl_comment and park with wl_park; the evidence-only MCP
-profile does not close work. Verify with: {test_commands}. Vendor CLI:
+profile does not close work. If this seat is configured for continuity, save an
+owner-signed wl_checkpoint after meaningful verified edits and before planned
+budget stops or parking: record actual source/instruction revisions, artifact
+hashes and the next action. Never invent missing facts or transfer ownership
+yourself; the qualified host recovery path owns handoff. Verify with: {test_commands}. Vendor CLI:
 {provider}. Model/effort pin: {model_display}. This contract does not
 authorize subagents or bypassing permissions.
 
@@ -205,7 +189,7 @@ def render_mcp_json_text(**kwargs: Any) -> str:
 # explicitly so a permissions file never has to be re-read to know a tool is
 # blocked (cursor's cli.json permissions model, wf-261 gap 15).
 _ALL_WORKLANE_TOOLS = (
-    "wl_show", "wl_ready", "wl_claim", "wl_comment", "wl_park",
+    "wl_show", "wl_ready", "wl_claim", "wl_comment", "wl_park", "wl_checkpoint", "wl_handoff",
     "wl_close", "wl_create", "wl_label", "wl_update",
 )
 

@@ -1859,6 +1859,28 @@ def _strip_recovery_flags(argv: List[str]) -> List[str]:
     return out
 
 
+def _roster_for_local_root(local_root: str):
+    from .roster import load as load_roster
+    base = os.path.dirname(os.path.abspath(local_root)) or local_root
+    return load_roster(base=base)
+
+
+def _qualified_recovery_context(worker: Worker) -> Optional[Tuple[dict, str, str]]:
+    """Return (runner_config, policy_path, host) when qualified recovery is wired."""
+    if not worker.qualified_recovery:
+        return None
+    try:
+        from . import routing_binding as rb
+        config = rb.configured_runner(worker)
+    except ValueError:
+        return None
+    path = config.get("routing_policy")
+    host = config.get("routing_host")
+    if not isinstance(path, str) or not path or not isinstance(host, str) or not host.strip():
+        return None
+    return config, str(path), str(host)
+
+
 def _classify_exit(out_path: str) -> str:
     """Return 'vendor limit: <trigger line>' or 'agent exit' for a non-zero rc.
 
@@ -2570,48 +2592,98 @@ def dispatch(
                 return 1
             if rc != 0:
                 reason = _classify_exit(out_path)
-                if worker.fallback_runtime and reason.startswith("vendor limit:"):
-                    if recover_receipt or routing_context:
-                        # Qualified dispatch must not bypass its selected runner.
-                        # wf-255 review — no silent takeover-by-fallback during
-                        # an operator-invoked recovery of a specific reservation.
+                if reason.startswith("vendor limit:"):
+                    if recover_receipt:
                         ledger.append(
                             "ERROR", reason="fallback skipped during recovery",
                             **recovery_kv,
                         )
                         return 1
-                    ledger.append("WARN", reason="quota-fallback",
-                                  primary=os.path.basename(worker.command[0]),
-                                  fallback=worker.fallback_runtime)
-                    fallback_argv = _build_fallback_argv(worker, prompt_text, chain_text)
-                    outfh.write("--- fallback: %s ---\n" % worker.fallback_runtime)
-                    outfh.flush()
-                    fb_pass_offset = outfh.tell()
-                    fb_t0 = time.monotonic()
-                    fb_proc = subprocess.Popen(fallback_argv, cwd=shift_cwd, env=env,
-                                               stdin=subprocess.DEVNULL, stdout=outfh,
-                                               stderr=subprocess.STDOUT, start_new_session=True)
-                    try:
-                        fb_rc = fb_proc.wait(timeout=max(deadline - time.monotonic(), 0.1))
-                    except subprocess.TimeoutExpired:
-                        _terminate_process_group(fb_proc)
-                        ledger.append("ERROR", reason="killed at budget (fallback)",
-                                      budget_secs=worker.budget_secs, **recovery_kv)
+                    qctx = _qualified_recovery_context(worker)
+                    if qctx is not None:
+                        runner_cfg, policy_path, routing_host = qctx
+                        receipt_path = _last_receipt_path(out_path, pass_offset)
+                        from . import continuity_recovery as cr
+                        try:
+                            if not receipt_path:
+                                raise ValueError("missing prepared receipt")
+                            receipt_data = json.loads(Path(receipt_path).read_text())
+                            task_id = receipt_data["task_id"]
+                            product = product_from_queue_url(worker.queue_url or "")
+                            if receipt_data.get("project") != product:
+                                raise ValueError("receipt project differs from registered seat")
+                            desk = desk_origin_from_queue_url(worker.queue_url or "")
+                            from urllib.parse import urlencode, quote
+                            url = desk + "/api/admin/tasks/" + quote(task_id, safe="") + "?" + urlencode({"product": product})
+                            task_payload = _http_json("GET", url).get("task")
+                            if not isinstance(task_payload, dict) or task_payload.get("product") != product:
+                                raise ValueError("WorkLane did not confirm task store")
+                            rules_revision = cr.instruction_revision(runner_cfg)
+                            workspace_id = runner_cfg.get("workspace_id")
+                            if not isinstance(workspace_id, str) or not workspace_id:
+                                raise ValueError("explicit workspace identity required")
+                            roster = _roster_for_local_root(local_root)
+                        except (OSError, ValueError, KeyError) as exc:
+                            ledger.append("ERROR", reason="qualified recovery paused: " + str(exc), **recovery_kv)
+                            return 1
+                        plan = cr.defer_after_quota_interruption(
+                            local_root=local_root,
+                            worker=worker,
+                            roster=roster,
+                            task=task_payload,
+                            receipt_path=receipt_path,
+                            reason=reason,
+                            policy_path=policy_path,
+                            host=routing_host,
+                            workspace_id=workspace_id,
+                            instruction_revision=rules_revision,
+                        )
+                        view = cr.pause_view(plan)
+                        ledger.append(
+                            "WARN",
+                            reason="qualified-recovery-deferred",
+                            recovery_task=task_id,
+                            pause_reason=view.get("pause_reason"),
+                            target_worker=plan.get("target_worker") or "",
+                            **recovery_kv,
+                        )
                         return 1
-                    if fb_rc != 0:
-                        ledger.append("ERROR", reason=_classify_exit(out_path),
-                                      rc=fb_rc, on_pass=passes + 1,
-                                      fallback_runtime=worker.fallback_runtime, **recovery_kv)
+                    if routing_context:
+                        ledger.append("ERROR", reason="fallback skipped during qualified dispatch", **recovery_kv)
                         return 1
-                    passes += 1
-                    outfh.flush()
-                    usage = _usage_from_output(out_path, fb_pass_offset, worker.usage_fields)
-                    ledger.append("DONE", rc=0, on_pass=passes,
-                                  secs=int(time.monotonic() - fb_t0),
-                                  fallback_runtime=worker.fallback_runtime, **usage, **recovery_kv)
-                    return _stop_ok(
-                        "fallback complete (%s)" % worker.fallback_runtime,
-                    )
+                    if worker.fallback_runtime:
+                        ledger.append("WARN", reason="quota-fallback",
+                                      primary=os.path.basename(worker.command[0]),
+                                      fallback=worker.fallback_runtime)
+                        fallback_argv = _build_fallback_argv(worker, prompt_text, chain_text)
+                        outfh.write("--- fallback: %s ---\n" % worker.fallback_runtime)
+                        outfh.flush()
+                        fb_pass_offset = outfh.tell()
+                        fb_t0 = time.monotonic()
+                        fb_proc = subprocess.Popen(fallback_argv, cwd=shift_cwd, env=env,
+                                                   stdin=subprocess.DEVNULL, stdout=outfh,
+                                                   stderr=subprocess.STDOUT, start_new_session=True)
+                        try:
+                            fb_rc = fb_proc.wait(timeout=max(deadline - time.monotonic(), 0.1))
+                        except subprocess.TimeoutExpired:
+                            _terminate_process_group(fb_proc)
+                            ledger.append("ERROR", reason="killed at budget (fallback)",
+                                          budget_secs=worker.budget_secs, **recovery_kv)
+                            return 1
+                        if fb_rc != 0:
+                            ledger.append("ERROR", reason=_classify_exit(out_path),
+                                          rc=fb_rc, on_pass=passes + 1,
+                                          fallback_runtime=worker.fallback_runtime, **recovery_kv)
+                            return 1
+                        passes += 1
+                        outfh.flush()
+                        usage = _usage_from_output(out_path, fb_pass_offset, worker.usage_fields)
+                        ledger.append("DONE", rc=0, on_pass=passes,
+                                      secs=int(time.monotonic() - fb_t0),
+                                      fallback_runtime=worker.fallback_runtime, **usage, **recovery_kv)
+                        return _stop_ok(
+                            "fallback complete (%s)" % worker.fallback_runtime,
+                        )
                 ledger.append("ERROR", reason=reason, rc=rc, on_pass=passes + 1, **recovery_kv)
                 return 1
 
