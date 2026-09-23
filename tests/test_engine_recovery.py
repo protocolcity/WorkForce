@@ -128,10 +128,11 @@ def prepared(tmp_path, task, monkeypatch, desk):
     monkeypatch.setenv("WL_AGENT_ID", "builder")
     # Start and stop a real harmless executor so the original receipt proves
     # guarded exec; a preparation-only fixture no longer proves lock lifetime.
-    initial = dict(config, desk_url="http://127.0.0.1:%d" % desk.server_port, command=["/bin/true"])
+    initial = dict(config, desk_url="http://127.0.0.1:%d" % desk.server_port, command=[sys.executable, "-c", "pass"])
     config_path.write_text(json.dumps(initial))
-    subprocess.run([sys.executable, "-m", "workforce.task_runner", "--config", str(config_path)],
-                   check=True, capture_output=True, text=True, timeout=20)
+    initial_run = subprocess.run([sys.executable, "-m", "workforce.task_runner", "--config", str(config_path)],
+                                 capture_output=True, text=True, timeout=20)
+    assert initial_run.returncode == 0, initial_run.stdout + initial_run.stderr
     reservation = Path(config['state_dir']) / 'builder' / 'p-1'
     result = {'receipt': str(reservation / 'preparation.json'), 'lock': str(reservation / 'lock'),
               'checkout': str(reservation / 'checkout')}
