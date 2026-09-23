@@ -132,7 +132,7 @@ def validate_model_pin(
 
 DEFAULT_COMMAND = [
     "claude", "--model", "{model}", "-p", "{prompt_text}",
-    "--dangerously-skip-permissions", "--no-session-persistence",
+    "--permission-mode", "dontAsk", "--no-session-persistence",
     "--output-format", "json",
 ]
 
@@ -189,8 +189,8 @@ def _land_it_contract_text(slug: str, remote_status: str) -> str:
         )
     if remote_status == "local-only":
         return (
-            "This project has no `origin` remote (local-only — see "
-            "HOST_REGISTRY.md). Work is not done until it is merged into "
+            "This project has no `origin` remote (local-only). Work is "
+            "not done until it is merged into "
             "the shared local `main`: from the **primary checkout** (not "
             "your shift tree), `git merge --ff-only "
             "workforce/shift/%s` (a real merge or rebase first if main has "
@@ -233,7 +233,7 @@ def _land_it_prompt_text(slug: str, remote_status: str) -> str:
     )
 
 
-_FALLBACK_CONTRACT = """# {slug} — Employment Contract (L2)
+_FALLBACK_CONTRACT = """# {slug} — Employment Contract
 
 ## Identity
 
@@ -244,11 +244,10 @@ _FALLBACK_CONTRACT = """# {slug} — Employment Contract (L2)
 ## Lane — what this worker may claim
 
 - Tickets labeled `worker:{slug}` in store `{store}`, and nothing else.
-  (Vocabulary law: routing label is worker:<id>, not lane: — pc-23 / STAFFING.)
 
 ## Never touch
 
-- Anything behind a citizen gate (L0/L1) — prepare, never ship.
+- Anything gated for human decision — prepare, never ship.
 - `local/roster.json` and other employment records.
 
 ## Procedure

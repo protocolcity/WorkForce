@@ -14,7 +14,8 @@
         "{model}",
         "-p",
         "{prompt_text}",
-        "--dangerously-skip-permissions",
+        "--permission-mode",
+        "dontAsk",
         "--no-session-persistence",
         "--output-format",
         "json"
