@@ -37,6 +37,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from . import engine
 from . import provider_qualification as pq_mod
 from . import roster as roster_mod
+from . import routing_policy as routing_policy_mod
+from . import task_routing
+from . import routing_binding
 from ._utils import _utc_iso_z
 from .ledger import parse_shifts
 from .schedule import maybe_cron
@@ -118,6 +121,21 @@ def load_config(path: str) -> Dict[str, Any]:
     if active_implementation_cap is not None:
         active_implementation_cap = _positive_int(
             active_implementation_cap, "active_implementation_cap")
+    # wf-279 — optional automatic task-fit/capacity routing gate. Absent by
+    # default: an operator who never sets routing_policy keeps today's
+    # worker+project-only dispatch unchanged (manual authorized dispatch
+    # stays backward-compatible). When set, routing_host must be set too —
+    # task_routing never scopes candidates against an unstated host.
+    routing_policy_path = raw.get("routing_policy")
+    routing_host = raw.get("routing_host")
+    if bool(routing_policy_path) != bool(routing_host):
+        raise SupervisorError(
+            "routing_policy and routing_host must be set together")
+    if routing_policy_path is not None:
+        routing_policy_path = str(_abs_path(routing_policy_path, "routing_policy"))
+        if not isinstance(routing_host, str) or not routing_host.strip():
+            raise SupervisorError("routing_host must be a non-empty string")
+        routing_host = routing_host.strip()
     return {
         "local_root": str(local_root),
         "roster_path": str(roster_path),
@@ -130,6 +148,8 @@ def load_config(path: str) -> Dict[str, Any]:
         "stop_file": stop_file,
         "max_consecutive_provider_failures": max_consecutive_provider_failures,
         "active_implementation_cap": active_implementation_cap,
+        "routing_policy": routing_policy_path,
+        "routing_host": routing_host,
     }
 
 
@@ -147,19 +167,22 @@ def _recent_outcomes(local_root: str, worker_name: str) -> List[str]:
     return [s.get("outcome", "") for s in shifts]
 
 
-def _fresh_eligible_task_ids(worker_name: str, product: str, tasks: List[dict]) -> List[str]:
-    """Ready task ids that are freshly, exactly eligible for this worker.
+def _fresh_eligible_tasks(worker_name: str, product: str, tasks: List[dict]) -> List[dict]:
+    """Ready task rows that are freshly, exactly eligible for this worker.
 
-    This is context only -- proof that real, currently-eligible work exists
-    for the worker -- never a binding target: ``engine.dispatch`` takes no
-    task id and always works its own ready feed in its own order. Membership
-    in the probe's task list alone is not enough: a task must also currently
-    carry exactly this worker's label, sit in ``backlog``, belong to the
-    configured project, and carry no blocking gate. Tasks missing the fields
-    needed to prove this (e.g. a count-only probe with no ``labels``) are
-    excluded rather than trusted by id alone.
+    Proof that real, currently-eligible work exists for the worker -- never
+    a binding target: ``engine.dispatch`` takes no task id and always works
+    its own ready feed in its own order. ``ready_task_ids`` (derived from
+    this) stays context only for that reason. Membership in the probe's
+    task list alone is not enough: a task must also currently carry exactly
+    this worker's label, sit in ``backlog``, belong to the configured
+    project, and carry no blocking gate. Tasks missing the fields needed to
+    prove this (e.g. a count-only probe with no ``labels``) are excluded
+    rather than trusted by id alone. The full row (not just the id) is kept
+    so an optional routing_policy pass can gate on its labels/status/gate
+    without a second, possibly-stale fetch.
     """
-    ids = set()
+    by_id: Dict[str, dict] = {}
     for t in tasks:
         if not isinstance(t, dict):
             continue
@@ -178,8 +201,8 @@ def _fresh_eligible_task_ids(worker_name: str, product: str, tasks: List[dict]) 
             continue
         if t.get("gate_type") in _BLOCKED_GATE_TYPES:
             continue
-        ids.add(tid)
-    return sorted(ids)
+        by_id[tid] = t
+    return [by_id[tid] for tid in sorted(by_id)]
 
 
 def _collect_worker_row(config: Dict[str, Any], rost, name: str) -> Tuple[Optional[dict], Optional[str]]:
@@ -210,10 +233,12 @@ def _collect_worker_row(config: Dict[str, Any], rost, name: str) -> Tuple[Option
         return None, "ready probe failed: %s" % exc
     recent = _recent_outcomes(config["local_root"], name)
     stale = any(o in _STALE_OUTCOMES for o in recent[:1])
+    ready_tasks = _fresh_eligible_tasks(name, product, tasks)
     row = {
         "project": product,
         "ready_count": count,
-        "ready_task_ids": _fresh_eligible_task_ids(name, product, tasks),
+        "ready_task_ids": [t["id"] for t in ready_tasks],
+        "ready_tasks": ready_tasks,
         "busy": busy,
         "recent_outcomes": recent,
         "monitoring_flag": "stale_or_failed_last_shift" if stale else None,
@@ -493,8 +518,27 @@ def _run_provider(argv: List[str], state: Dict[str, Any], time_budget_secs: int,
     return {"ok": True, "actions": parsed["actions"]}
 
 
+def _routing_refusal(row: Dict[str, Any], routing: Optional[Dict[str, Any]]) -> Optional[str]:
+    """None when *routing* is unset (feature off) or at least one of the
+    worker's fresh ready tasks passes task_routing; else the reason from
+    the first refused task's receipt -- a routing_policy configured but
+    every ready task refusing it must block dispatch, never fall back to
+    the old worker+project-only check silently."""
+    if routing is None:
+        return None
+    task, receipts = task_routing.first_accepted_task(
+        row.get("ready_tasks") or [], routing["seats"], routing["results"],
+        host=routing["host"],
+    )
+    if task is not None:
+        return None
+    if receipts:
+        return "routing: %s" % receipts[-1].reason
+    return "routing: no ready task to evaluate"
+
+
 def _validate_action(action: Any, state: Dict[str, Any], config: Dict[str, Any],
-                      seen_workers: set) -> Dict[str, Any]:
+                      seen_workers: set, routing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Reject anything not currently, freshly, and uniquely eligible.
 
     Actions are WORKER + PROJECT scoped only -- there is no task id to bind,
@@ -502,7 +546,11 @@ def _validate_action(action: Any, state: Dict[str, Any], config: Dict[str, Any],
     ``state`` must already be a re-fetched-after-provider snapshot; a
     proposal's own prose is data, never an instruction. Duplicates are
     rejected per WORKER (one worker can only run one shift at a time
-    regardless of how many proposals name it).
+    regardless of how many proposals name it). *routing* (wf-279), when
+    supplied, additionally requires at least one of the worker's fresh
+    ready tasks to pass :mod:`task_routing` against roster-validated seat
+    capability -- absent (``None``), this check is skipped entirely and
+    behavior is unchanged from before wf-279's routing integration.
     """
     if not isinstance(action, dict):
         return {"action": action, "valid": False, "reason": "action is not an object"}
@@ -534,12 +582,38 @@ def _validate_action(action: Any, state: Dict[str, Any], config: Dict[str, Any],
     if not row["ready_task_ids"]:
         return {"action": action, "valid": False,
                 "reason": "worker has no fresh eligible ready work"}
+    routing_reason = _routing_refusal(row, routing)
+    if routing_reason:
+        return {"action": action, "valid": False, "reason": routing_reason}
     seen_workers.add(worker_name)
     return {"action": action, "valid": True, "reason": ""}
 
 
+def _load_routing(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Load and roster-validate the optional wf-279 routing policy, or
+    ``None`` when ``routing_policy`` was never configured for this pass
+    (the default -- existing worker+project-only dispatch, unchanged).
+
+    Raises whatever the load/parse itself raises (missing file,
+    :class:`routing_policy.RoutingPolicyError`) -- a configured-but-broken
+    policy must stop the pass, never be silently treated as "no policy".
+    """
+    policy_path = config.get("routing_policy")
+    if not policy_path:
+        return None
+    rost = roster_mod.load(path=config["roster_path"])
+    policy = routing_policy_mod.load_routing_policy(policy_path)
+    valid_seats, _refusals = routing_policy_mod.validate_against_roster(policy, rost)
+    return {
+        "seats": valid_seats,
+        "results": policy.results_by_candidate,
+        "host": config["routing_host"],
+    }
+
+
 def _recheck_immediately_before_dispatch(
     config: Dict[str, Any], worker_name: str, project: str,
+    routing: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[dict], Optional[str]]:
     """Re-validate one worker's eligibility right before firing it.
 
@@ -569,6 +643,9 @@ def _recheck_immediately_before_dispatch(
         return None, None, "monitoring: %s" % row["monitoring_flag"]
     if not row["ready_task_ids"]:
         return None, None, "worker has no fresh eligible ready work at dispatch time"
+    routing_reason = _routing_refusal(row, routing)
+    if routing_reason:
+        return None, None, "%s at dispatch time" % routing_reason
     return worker, row, None
 
 
@@ -616,7 +693,8 @@ def _classify_ledger_delta(new_text: str, rc: int) -> Dict[str, Any]:
     }
 
 
-def _dispatch_one(config: Dict[str, Any], worker_name: str, project: str) -> Dict[str, Any]:
+def _dispatch_one(config: Dict[str, Any], worker_name: str, project: str,
+                   routing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Fire one worker's own manual shift via the existing engine, honestly.
 
     Rechecks eligibility immediately before calling ``engine.dispatch``
@@ -625,18 +703,43 @@ def _dispatch_one(config: Dict[str, Any], worker_name: str, project: str) -> Dic
     roster load), then classifies the outcome from both the ledger rows the
     shift itself wrote and its return code -- never from mere presence of a
     CANDIDATE row, and never treating a non-zero return or an explicit deny
-    as anything but failed.
+    as anything but failed. *routing* (wf-279), when configured, is also
+    re-checked as part of that same immediately-before-dispatch recheck --
+    ``engine.dispatch`` is never reached at all when it refuses.
     """
-    worker, row, reason = _recheck_immediately_before_dispatch(config, worker_name, project)
+    worker, row, reason = _recheck_immediately_before_dispatch(
+        config, worker_name, project, routing)
     if worker is None:
         return {"worker": worker_name, "project": project, "attempted": False,
                 "started": False, "completed": False, "failed": False,
                 "outcome": "rejected_at_dispatch_time",
                 "reason": "revalidation immediately before dispatch failed: %s" % reason}
+    routing_context = None
+    if config.get("routing_policy"):
+        try:
+            runner = routing_binding.configured_runner(worker)
+            accepted = None
+            for task in row["ready_tasks"]:
+                try:
+                    evidence = routing_binding.qualify(config["routing_policy"], config["routing_host"], runner, task, worker)
+                    accepted = task
+                    break
+                except ValueError:
+                    continue
+            if accepted is None:
+                raise ValueError("no ready task has a bound qualified runner and sufficient budget")
+            routing_context = {"policy": config["routing_policy"], "host": config["routing_host"],
+                               "task_id": accepted["id"], "task_sha256": routing_binding.task_digest(accepted),
+                               "runner_sha256": routing_binding.runner_digest(runner)}
+        except (ValueError, OSError, KeyError) as exc:
+            return {"worker": worker_name, "project": project, "attempted": False,
+                    "started": False, "completed": False, "failed": False,
+                    "outcome": "rejected_at_dispatch_time", "reason": str(exc)}
     log_path = os.path.join(config["local_root"], "ledger", "%s.log" % worker_name)
     offset = os.path.getsize(log_path) if os.path.exists(log_path) else 0
     try:
-        rc = engine.dispatch(worker, config["local_root"])
+        kwargs = {"routing_context": routing_context} if routing_context else {}
+        rc = engine.dispatch(worker, config["local_root"], **kwargs)
     except Exception as exc:  # pragma: no cover -- defensive; engine already fails closed
         return {"worker": worker_name, "project": project, "attempted": True,
                 "started": False, "completed": False, "failed": True,
@@ -677,6 +780,10 @@ def run(config: Dict[str, Any], mode: str = "inspect",
         _write_evidence(config["local_root"], result)
         return result
 
+    # wf-279 — load once per pass, fail closed before any provider call if a
+    # configured policy is itself broken/missing (never silently "no policy").
+    routing = _load_routing(config)
+
     state_before_provider = collect_state(config)
 
     if not _has_eligible_ready_work(state_before_provider):
@@ -704,7 +811,7 @@ def run(config: Dict[str, Any], mode: str = "inspect",
     state_after_provider = collect_state(config)
     seen_workers: set = set()
     validations = [
-        _validate_action(a, state_after_provider, config, seen_workers)
+        _validate_action(a, state_after_provider, config, seen_workers, routing)
         for a in provider_result["actions"]
     ]
     eligible = [v["action"] for v in validations if v["valid"]][: config["max_dispatch"]]
@@ -760,7 +867,7 @@ def run(config: Dict[str, Any], mode: str = "inspect",
     if mode == "execute" and eligible:
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(eligible)) as pool:
             futures = [
-                pool.submit(_dispatch_one, config, a["worker"], a["project"])
+                pool.submit(_dispatch_one, config, a["worker"], a["project"], routing)
                 for a in eligible
             ]
             dispatch_results = [f.result() for f in futures]

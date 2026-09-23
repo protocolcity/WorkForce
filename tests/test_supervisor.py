@@ -299,7 +299,7 @@ def test_dispatch_immediately_before_recheck_rejects_worker_gone_busy(tmp_path, 
     )
     # Simulate a lock appearing between post-provider validation and the
     # per-worker dispatch call by monkeypatching the recheck to see it busy.
-    def busy_at_dispatch_time(cfg, worker_name, project):
+    def busy_at_dispatch_time(cfg, worker_name, project, routing=None):
         return None, None, "worker is currently busy"
 
     monkeypatch.setattr(supervisor, "_recheck_immediately_before_dispatch", busy_at_dispatch_time)
@@ -1358,4 +1358,213 @@ def test_run_execute_headroom_clamp_rejects_all_on_negative_headroom(tmp_path, m
     assert dispatched == []
     assert result["capacity_blocked"] is True
     assert "headroom 0" in result["capacity_reason"]
+
+
+# ---------------------------------------------------------------- wf-279 routing_policy seam
+
+ROUTING_HOST = "test-host"
+
+
+def _routing_now():
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _routing_iso_ago(**delta):
+    import datetime
+    return (_routing_now() - datetime.timedelta(**delta)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _routing_iso_ahead(**delta):
+    import datetime
+    return (_routing_now() + datetime.timedelta(**delta)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _routing_task(task_id="wf-9", worker="tester", risk="low", **over):
+    row = fresh_task(
+        task_id, worker=worker,
+        labels=["worker:" + worker, "work-kind:implement", "risk:" + risk],
+    )
+    row.update(over)
+    return row
+
+
+def _routing_seat_row(worker="tester", project="workforce", **over):
+    spec = dict(
+        worker=worker, provider="claude", model="sonnet-5",
+        reasoning_effort="medium", host=ROUTING_HOST, tools=["wl_show"],
+        project=project, account_state="authenticated",
+        observed_at=_routing_iso_ago(hours=1), expires_at=_routing_iso_ahead(hours=1),
+        supported_efforts=["low", "medium", "high"], version=1,
+    )
+    spec.update(over)
+    return spec
+
+
+def _write_routing_policy(tmp_path, seats, evaluation_results=None, filename="routing_policy.json"):
+    doc = {"version": 1, "seats": seats, "evaluation_results": evaluation_results or []}
+    path = tmp_path / filename
+    path.write_text(json.dumps(doc))
+    return str(path)
+
+
+def _bounded_edit_result(candidate_id):
+    return {"candidate_id": candidate_id, "task_id": "edit-01", "accepted": True,
+            "regressions": 0, "retries": 0, "observed_at": _routing_iso_ago(minutes=2)}
+
+
+def test_load_config_requires_routing_host_with_routing_policy(tmp_path):
+    cfg = make_config(tmp_path, str(tmp_path / "roster.json"),
+                       routing_policy=str(tmp_path / "policy.json"))
+    path = tmp_path / "cfg.json"
+    path.write_text(json.dumps(cfg))
+    with pytest.raises(supervisor.SupervisorError):
+        supervisor.load_config(str(path))
+
+
+def test_load_config_accepts_routing_policy_with_routing_host(tmp_path):
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text("{}")
+    cfg = make_config(tmp_path, str(tmp_path / "roster.json"),
+                       routing_policy=str(policy_path), routing_host=ROUTING_HOST)
+    path = tmp_path / "cfg.json"
+    path.write_text(json.dumps(cfg))
+    loaded = supervisor.load_config(str(path))
+    assert loaded["routing_host"] == ROUTING_HOST
+    assert loaded["routing_policy"] == str(policy_path)
+
+
+def test_routing_policy_refuses_unqualified_seat_and_engine_dispatch_is_never_invoked(tmp_path, monkeypatch):
+    """A configured routing_policy that refuses the assigned seat must stop
+    the pass before ``engine.dispatch`` is ever called -- proving zero
+    provider invocation, not just a rejected proposal."""
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [_routing_task()]))
+    dispatched = []
+    monkeypatch.setattr(engine, "dispatch", lambda *a, **kw: dispatched.append(1) or 0)
+    policy_path = _write_routing_policy(
+        tmp_path, [_routing_seat_row(account_state="unauthenticated")])
+    config = make_config(
+        tmp_path, roster_path,
+        provider_argv=_provider_argv([{"worker": "tester", "project": "workforce"}]),
+        routing_policy=policy_path, routing_host=ROUTING_HOST,
+    )
+    result = supervisor.run(config, mode="execute")
+    assert dispatched == []
+    assert result["dispatch_attempted"] == 0
+    assert result["proposals"][0]["valid"] is False
+    assert "routing:" in result["proposals"][0]["reason"]
+
+
+def test_routing_policy_refuses_stale_quota_and_engine_dispatch_is_never_invoked(tmp_path, monkeypatch):
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [_routing_task()]))
+    dispatched = []
+    monkeypatch.setattr(engine, "dispatch", lambda *a, **kw: dispatched.append(1) or 0)
+    # No quota field at all -- unknown quota must refuse, never pass silently.
+    policy_path = _write_routing_policy(tmp_path, [_routing_seat_row()])
+    config = make_config(
+        tmp_path, roster_path,
+        provider_argv=_provider_argv([{"worker": "tester", "project": "workforce"}]),
+        routing_policy=policy_path, routing_host=ROUTING_HOST,
+    )
+    result = supervisor.run(config, mode="execute")
+    assert dispatched == []
+    assert result["dispatch_attempted"] == 0
+
+
+def test_routing_policy_gates_dispatch_at_recheck_time_when_seat_stops_qualifying(tmp_path, monkeypatch):
+    """The routing gate must apply at the immediately-before-dispatch
+    recheck too, not only at the earlier post-provider validation."""
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [_routing_task()]))
+    dispatched = []
+    monkeypatch.setattr(engine, "dispatch", lambda *a, **kw: dispatched.append(1) or 0)
+    candidate_id = "claude/sonnet-5@medium#%s::workforce" % ROUTING_HOST
+    seat_row = _routing_seat_row(quota={
+        "pool": "subscription", "pool_id": "acct-1", "units": "requests",
+        "observed_at": _routing_iso_ago(minutes=2), "remaining": 5,
+    })
+    policy_path = _write_routing_policy(
+        tmp_path, [seat_row], evaluation_results=[_bounded_edit_result(candidate_id)])
+    config = make_config(
+        tmp_path, roster_path,
+        provider_argv=_provider_argv([{"worker": "tester", "project": "workforce"}]),
+        routing_policy=policy_path, routing_host=ROUTING_HOST,
+    )
+    def denied_recheck(cfg, worker_name, project, routing=None):
+        assert routing is not None
+        return None, None, "worker is currently busy"
+
+    monkeypatch.setattr(supervisor, "_recheck_immediately_before_dispatch", denied_recheck)
+    result = supervisor.run(config, mode="execute")
+    assert dispatched == []
+    assert result["dispatched"][0]["outcome"] == "rejected_at_dispatch_time"
+
+
+def test_routing_policy_allows_dispatch_when_seat_is_qualified(tmp_path, monkeypatch):
+    from workforce.routing_binding import worker_digest, runner_digest
+    runner = dict(worker="tester", project="workforce", command=["provider", "--model", "sonnet-5"])
+    runner_path = tmp_path / "runner.json"
+    runner_path.write_text(json.dumps(runner))
+    w = make_worker(tmp_path, identity="tester", command=[sys.executable, "-m", "workforce.task_runner", "--config", str(runner_path)])
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [_routing_task()]))
+
+    def fake_dispatch(worker, local_root, dry_run=False, routing_context=None):
+        assert routing_context["task_id"] == "wf-9"
+        assert routing_context["runner_sha256"] == runner_digest(runner)
+        ledger_dir = os.path.join(local_root, "ledger")
+        os.makedirs(ledger_dir, exist_ok=True)
+        with open(os.path.join(ledger_dir, "%s.log" % worker.name), "a") as fh:
+            fh.write("2026-01-01T00:00:00Z START identity=x\n")
+            fh.write("2026-01-01T00:00:01Z STOP reason=ok\n")
+        return 0
+
+    monkeypatch.setattr(engine, "dispatch", fake_dispatch)
+    candidate_id = "claude/sonnet-5@medium#%s::workforce" % ROUTING_HOST
+    seat_row = _routing_seat_row(quota={
+        "pool": "subscription", "pool_id": "acct-1", "units": "requests",
+        "observed_at": _routing_iso_ago(minutes=2), "remaining": 5,
+    })
+    seat_row.update(worker_sha256=worker_digest(w), runner_sha256=runner_digest(runner),
+                    max_run_units=1, budget_units="requests")
+    policy_path = _write_routing_policy(
+        tmp_path, [seat_row], evaluation_results=[_bounded_edit_result(candidate_id)])
+    config = make_config(
+        tmp_path, roster_path,
+        provider_argv=_provider_argv([{"worker": "tester", "project": "workforce"}]),
+        routing_policy=policy_path, routing_host=ROUTING_HOST,
+    )
+    result = supervisor.run(config, mode="execute")
+    assert result["proposals"][0]["valid"] is True
+    assert result["dispatched"][0]["outcome"] == "completed"
+
+
+def test_routing_policy_seat_not_on_roster_refuses_dispatch(tmp_path, monkeypatch):
+    """A policy row naming a worker the roster never scoped to this project
+    must never grant it authority -- refuses like missing evidence."""
+    w = make_worker(tmp_path)
+    roster_path = write_roster(tmp_path, [w])
+    monkeypatch.setattr(engine, "_probe_ready", lambda *_a, **_kw: (1, [_routing_task()]))
+    dispatched = []
+    monkeypatch.setattr(engine, "dispatch", lambda *a, **kw: dispatched.append(1) or 0)
+    candidate_id = "claude/sonnet-5@medium#%s::workforce" % ROUTING_HOST
+    seat_row = _routing_seat_row(worker="ghost-seat", quota={
+        "pool": "subscription", "pool_id": "acct-1", "units": "requests",
+        "observed_at": _routing_iso_ago(minutes=2), "remaining": 5,
+    })
+    policy_path = _write_routing_policy(
+        tmp_path, [seat_row], evaluation_results=[_bounded_edit_result(candidate_id)])
+    config = make_config(
+        tmp_path, roster_path,
+        provider_argv=_provider_argv([{"worker": "tester", "project": "workforce"}]),
+        routing_policy=policy_path, routing_host=ROUTING_HOST,
+    )
+    result = supervisor.run(config, mode="execute")
+    assert dispatched == []
+    assert result["proposals"][0]["valid"] is False
     assert all(not v["valid"] for v in result["proposals"])

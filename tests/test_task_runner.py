@@ -177,6 +177,131 @@ def test_recover_rejects_missing_receipt(setup):
         recover(config, missing, "resume after crash", feed(task))
 
 
+# ---------------------------------------------------------------- wf-279 routing_policy seam
+
+import datetime as _dt  # noqa: E402
+
+
+def _routing_now():
+    return _dt.datetime.now(_dt.timezone.utc)
+
+
+def _routing_iso_ago(**delta):
+    return (_routing_now() - _dt.timedelta(**delta)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _routing_iso_ahead(**delta):
+    return (_routing_now() + _dt.timedelta(**delta)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+ROUTING_HOST = "test-host"
+
+
+def _write_routing_policy(tmp_path, seats, evaluation_results=None):
+    doc = {"version": 1, "seats": seats, "evaluation_results": evaluation_results or []}
+    path = tmp_path / "routing_policy.json"
+    path.write_text(json.dumps(doc))
+    return str(path)
+
+
+def _bind_test_policy(config):
+    from workforce.routing_binding import runner_digest
+    p = Path(config["routing_policy"])
+    raw = json.loads(p.read_text())
+    for row in raw["seats"]:
+        row.update(runner_sha256=runner_digest(config), max_run_units=1, budget_units="requests")
+    p.write_text(json.dumps(raw))
+
+
+def _routing_seat_row(worker="builder", project="product", **over):
+    spec = dict(
+        worker=worker, provider="claude", model="sonnet-5",
+        reasoning_effort="medium", host=ROUTING_HOST, tools=["wl_show"],
+        project=project, account_state="authenticated",
+        observed_at=_routing_iso_ago(hours=1), expires_at=_routing_iso_ahead(hours=1),
+        supported_efforts=["low", "medium", "high"], version=1,
+        quota={"pool": "subscription", "pool_id": "acct-1", "units": "requests",
+               "observed_at": _routing_iso_ago(minutes=2), "remaining": 5},
+    )
+    spec.update(over)
+    return spec
+
+
+def _bounded_edit_result(candidate_id):
+    return {"candidate_id": candidate_id, "task_id": "edit-01", "accepted": True,
+            "regressions": 0, "retries": 0, "observed_at": _routing_iso_ago(minutes=2)}
+
+
+def test_routing_policy_requires_routing_host(setup, tmp_path):
+    config, task = setup
+    task["labels"] = ["worker:builder", "execution:bounded", "work-kind:implement", "risk:low"]
+    config["routing_policy"] = _write_routing_policy(tmp_path, [_routing_seat_row()])
+    with pytest.raises(PreparationError, match="routing_host"):
+        prepare(config, feed(task))
+    assert not Path(config["state_dir"]).exists()
+
+
+def test_routing_policy_refuses_and_prepares_nothing(setup, tmp_path):
+    """A configured routing_policy that refuses the head-of-queue task must
+    stop before any reservation/worktree/provider launch is created --
+    proving zero provider invocation, not merely a returned refusal."""
+    config, task = setup
+    task["labels"] = ["worker:builder", "execution:bounded", "work-kind:implement", "risk:low"]
+    # No matching evidence for worker "builder" at all -> refuses.
+    config["routing_policy"] = _write_routing_policy(tmp_path, [_routing_seat_row(worker="someone-else")])
+    config["routing_host"] = ROUTING_HOST
+    _bind_test_policy(config)
+    with pytest.raises(ValueError, match="unambiguous"):
+        prepare(config, feed(task))
+    assert not Path(config["state_dir"]).exists()
+
+
+def test_routing_policy_unqualified_seat_prepares_nothing(setup, tmp_path):
+    config, task = setup
+    task["labels"] = ["worker:builder", "execution:bounded", "work-kind:implement", "risk:low"]
+    config["routing_policy"] = _write_routing_policy(
+        tmp_path, [_routing_seat_row(account_state="unauthenticated")])
+    config["routing_host"] = ROUTING_HOST
+    _bind_test_policy(config)
+    assert prepare(config, feed(task)) is None
+    assert not Path(config["state_dir"]).exists()
+
+
+def test_routing_policy_qualified_seat_prepares_normally(setup, tmp_path):
+    config, task = setup
+    task["labels"] = ["worker:builder", "execution:bounded", "work-kind:implement", "risk:low"]
+    candidate_id = "claude/sonnet-5@medium#%s::product" % ROUTING_HOST
+    config["routing_policy"] = _write_routing_policy(
+        tmp_path, [_routing_seat_row()], evaluation_results=[_bounded_edit_result(candidate_id)])
+    config["routing_host"] = ROUTING_HOST
+    _bind_test_policy(config)
+    result = prepare(config, feed(task))
+    assert result is not None
+    assert result["task_id"] == "p-1"
+
+
+def test_routing_policy_missing_work_kind_label_prepares_nothing(setup, tmp_path):
+    """Existing tasks without a work-kind label (e.g. legacy orders) must
+    refuse cleanly, not raise, when a routing_policy is configured."""
+    config, task = setup  # setup's task has no work-kind label
+    candidate_id = "claude/sonnet-5@medium#%s::product" % ROUTING_HOST
+    config["routing_policy"] = _write_routing_policy(
+        tmp_path, [_routing_seat_row()], evaluation_results=[_bounded_edit_result(candidate_id)])
+    config["routing_host"] = ROUTING_HOST
+    _bind_test_policy(config)
+    assert prepare(config, feed(task)) is None
+    assert not Path(config["state_dir"]).exists()
+
+
+def test_no_routing_policy_configured_keeps_legacy_eligible_zero_selection(setup):
+    """Absent routing_policy, behavior is unchanged from before wf-279's
+    integration: the head-of-queue task launches even with no work-kind
+    label at all."""
+    config, task = setup
+    result = prepare(config, feed(task))
+    assert result is not None
+
+
 @pytest.mark.parametrize("change", [
     {"status": "done"}, {"status": "in_progress"}, {"gate_type": "human"},
     {"labels": ["worker:other", "execution:bounded"]},
@@ -443,3 +568,50 @@ def test_exclude_from_git_noop_without_git_dir(tmp_path):
     checkout.mkdir()
     exclude_from_git(checkout, [".cursor/"])  # no .git at all -- must not raise
     assert not (checkout / ".git").exists()
+
+
+@pytest.mark.parametrize("change", ["model", "task", "head", "instructions", "quota", "budget", "tools"])
+def test_bound_launch_rechecks_before_provider_exec(setup, tmp_path, change):
+    from workforce.task_runner import _revalidate_launch
+    config, task = setup
+    task["labels"] += ["work-kind:implement", "risk:low"]
+    candidate_id = "claude/sonnet-5@medium#%s::product" % ROUTING_HOST
+    config["routing_policy"] = _write_routing_policy(tmp_path, [_routing_seat_row()],
+        [_bounded_edit_result(candidate_id)])
+    config["routing_host"] = ROUTING_HOST
+    _bind_test_policy(config)
+    result = prepare(config, feed(task))
+    _revalidate_launch(config, result, feed(task))
+    if change == "model":
+        config["command"] += ["--model", "different"]
+    elif change == "tools":
+        config["command"] += ["--tools", "extra"]
+    elif change == "task":
+        task["labels"] += ["risk:high"]
+    elif change == "head":
+        git(result["checkout"], "commit", "--allow-empty", "-m", "different revision")
+    elif change == "instructions":
+        Path(config["authority_chain"][0]).write_text("Changed instructions")
+    else:
+        p = Path(config["routing_policy"]); raw = json.loads(p.read_text())
+        if change == "quota": raw["seats"][0]["quota"]["remaining"] = None
+        else: raw["seats"][0]["max_run_units"] = 10
+        p.write_text(json.dumps(raw))
+    with pytest.raises((ValueError, PreparationError)):
+        _revalidate_launch(config, result, feed(task))
+
+
+def test_supervisor_context_cannot_launch_a_different_ready_task(setup, tmp_path, monkeypatch):
+    from workforce.routing_binding import CONTEXT_ENV, runner_digest, task_digest
+    config, task = setup
+    task["labels"] += ["work-kind:implement", "risk:low"]
+    config["routing_policy"] = _write_routing_policy(tmp_path, [_routing_seat_row()],
+        [_bounded_edit_result("claude/sonnet-5@medium#%s::product" % ROUTING_HOST)])
+    config["routing_host"] = ROUTING_HOST
+    _bind_test_policy(config)
+    monkeypatch.setenv(CONTEXT_ENV, json.dumps(dict(policy=config["routing_policy"],
+        host=ROUTING_HOST, task_id=task["id"], task_sha256=task_digest(task),
+        runner_sha256=runner_digest(config))))
+    with pytest.raises(PreparationError, match="selected work order changed"):
+        prepare(config, feed(dict(task, id="p-2")))
+    assert not Path(config["state_dir"]).exists()

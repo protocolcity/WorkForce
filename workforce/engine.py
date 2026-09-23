@@ -2324,6 +2324,7 @@ def dispatch(
     worker: Worker, local_root: str, dry_run: bool = False,
     recover_receipt: Optional[str] = None, recovery_reason: Optional[str] = None,
     legacy_stop_evidence: Optional[str] = None,
+    routing_context: Optional[dict] = None,
 ) -> int:
     """Run one shift for one worker. Returns the process exit code (0/1).
 
@@ -2435,6 +2436,11 @@ def dispatch(
             chain_paths=worker.authority_chain if chain_entries else None,
             shift_workdir=shift_cwd,
         )
+        # A supervisor decision is passed to the actual task selector, never
+        # inferred from a worker name or inherited from a parent session.
+        env.pop("WORKFORCE_ROUTING_CONTEXT", None)
+        if routing_context is not None:
+            env["WORKFORCE_ROUTING_CONTEXT"] = json.dumps(routing_context)
         argv = _build_argv(worker, prompt_text, chain_text=chain_text)
         if recover_receipt:
             argv = argv + ["--recover-receipt", recover_receipt, "--recovery-reason", recovery_reason]
@@ -2565,7 +2571,8 @@ def dispatch(
             if rc != 0:
                 reason = _classify_exit(out_path)
                 if worker.fallback_runtime and reason.startswith("vendor limit:"):
-                    if recover_receipt:
+                    if recover_receipt or routing_context:
+                        # Qualified dispatch must not bypass its selected runner.
                         # wf-255 review — no silent takeover-by-fallback during
                         # an operator-invoked recovery of a specific reservation.
                         ledger.append(

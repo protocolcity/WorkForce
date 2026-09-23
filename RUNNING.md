@@ -40,7 +40,15 @@ tool permissions and result option in argv; this helper is not a sandbox.
 
 Only the selected worker's ready feed is considered. A foreign assignment,
 malformed/truncated feed or changed repository destination fails closed. An
-empty eligible feed stops without launching a provider. Each selected task
+empty eligible feed stops without launching a provider. Optional
+`routing_policy` (absolute path) + `routing_host` (see "Task routing" below)
+add one more gate before selection: with both set, the first eligible task
+(preserving WorkLane's priority order) whose `work-kind`/`risk` labels pass
+`task_routing` against this seat's own roster-validated capability evidence
+is prepared; if none does, preparation stops the same as an empty feed — no
+reservation, no worktree, no provider launch. Neither key set (the default)
+keeps the unchanged legacy behavior: the head-of-queue eligible task is
+always selected. Each selected task
 reserves `state_dir/worker/task-id`, creates a separate checkout on
 `workforce/task/worker/task-id`, and retains a preparation receipt and prompt.
 The receipt explicitly says `claimed: false`: the provider must reread the order
@@ -232,13 +240,61 @@ checkouts is not proof of safe universal concurrency — retain serial
 execution until a bounded trial records memory pressure and non-overlapping
 paths.
 
+## Task routing and launch binding
+
+Automatic task qualification is opt-in through `routing_policy` (an absolute
+JSON path) and `routing_host` in the supervisor or task-runner configuration.
+Manual authorized dispatch remains available without this policy. A configured
+but invalid policy fails closed; it is never silently treated as absent.
+
+The policy is version 1 with `seats` and `evaluation_results` arrays. Each seat
+has a registered `worker` and the dated candidate fields described in the
+qualification section. It also requires:
+
+- `runner_sha256`: `routing_binding.runner_digest(runner_config)` from the exact
+  provider command, model/tool configuration and authority paths qualified.
+- `worker_sha256`: `routing_binding.worker_digest(loaded_worker)` for supervisory
+  dispatch. Changes to the roster configuration invalidate that observation.
+- `max_run_units` and `budget_units`: a finite positive run allowance in the
+  same units as the fresh quota observation, within its remaining amount.
+
+These hashes attest an operator's observed configuration. They do not discover
+model aliases, credentials or quota. Refresh evidence after configuration changes.
+Keep the policy private to the host; never put credentials in its records.
+
+Tasks require explicit project, work-kind and risk. Supported categories are
+`design` (architecture), `implement` (bounded edit), `docs` (documentation),
+`review` and `recovery`. Unknown metadata, missing risk, blocking gates, invalid
+timers, terminal status, unknown/stale quota and unsuitable evidence refuse.
+Existing active claims are preserved and never accepted as new dispatches.
+Implementation checks the assigned seat; candidate recommendations do not mutate
+assignments. Ownership transfer uses the separate continuation contract.
+
+The supervisor checks the registered seat and actual task-runner adapter, then
+passes the selected task and configuration digest through the engine. The task
+runner must select that same task and save a qualification receipt. Immediately
+before provider launch, under the reservation lock, it rechecks current task
+scope, policy, budget, source head and instruction contents. A changed model,
+tool configuration or task cannot inherit an earlier approval. Recovery uses
+that same gate when configured. No remote adapter is enabled by these settings.
+
+Default tests use synthetic candidate evidence and fake provider processes.
+Passing them does not establish real account quota or rank one vendor above
+another. Run the bounded qualification workflow against the actual configured
+seat before turning on automatic routing.
+
 ## Bounded AI supervisory pass
 
 `python -m workforce.supervisor --config /absolute/path/supervisor.json` is a
 single manual invocation, not a service: an explicit `local_root` (runtime
 home), `roster_path`, `projects`/`workers` allowlists, `provider_argv`, a
 `time_budget_secs`/`output_budget_bytes` pair, and `max_dispatch` are all
-required. Three checks run before any provider call is even considered, each
+required. Optional `routing_policy` (absolute path) + `routing_host`
+(required together) add the wf-279 task-fit gate described in "Task
+routing" above to both proposal validation and the immediately-before-
+dispatch recheck; a configured-but-broken policy fails the whole pass
+closed rather than silently dispatching unchecked. Three checks run before
+any provider call is even considered, each
 able to end the pass with no model call and evidence `pass_outcome` set
 accordingly: an optional absolute `stop_file` path — if that file exists at
 pass start, the pass stops immediately (`pass_outcome: "stopped_by_operator"`,
