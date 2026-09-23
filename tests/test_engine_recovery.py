@@ -98,7 +98,7 @@ def task():
 
 
 @pytest.fixture
-def prepared(tmp_path, task, monkeypatch):
+def prepared(tmp_path, task, monkeypatch, desk):
     repo = tmp_path / "repo"
     repo.mkdir()
     git(repo, "init", "-b", "main")
@@ -126,7 +126,18 @@ def prepared(tmp_path, task, monkeypatch):
     config_path = tmp_path / "runner.json"
 
     monkeypatch.setenv("WL_AGENT_ID", "builder")
-    result = task_runner.prepare(config, fetch=lambda url: dict(server_feed(task)))
+    # Start and stop a real harmless executor so the original receipt proves
+    # guarded exec; a preparation-only fixture no longer proves lock lifetime.
+    initial = dict(config, desk_url="http://127.0.0.1:%d" % desk.server_port, command=[sys.executable, "-c", "pass"])
+    config_path.write_text(json.dumps(initial))
+    initial_run = subprocess.run([sys.executable, "-m", "workforce.task_runner", "--config", str(config_path)],
+                                 capture_output=True, text=True, timeout=20)
+    assert initial_run.returncode == 0, initial_run.stdout + initial_run.stderr
+    desk.methods.clear()  # subsequent assertions observe only the recovery shift
+    reservation = Path(config['state_dir']) / 'builder' / 'p-1'
+    result = {'receipt': str(reservation / 'preparation.json'), 'lock': str(reservation / 'lock'),
+              'checkout': str(reservation / 'checkout')}
+    assert json.loads(Path(result['receipt']).read_text())['execution_lock_protocol'] == task_runner.LOCK_PROTOCOL_VERSION
     return config, config_path, result, out_marker
 
 
