@@ -146,13 +146,8 @@ DEFAULT_USAGE_FIELDS = {
 def git_remote_status(workdir: str) -> str:
     """'origin' | 'local-only' | 'no-git' — picks the Land-it wording.
 
-    Not every project has a GitHub ``origin`` (e.g. oneseo-pos, recipes are
-    documented "local-only" in HOST_REGISTRY.md) and not every workdir is
-    even a git repo. The Land-it law (PROCESS §5.1.3 / wf-172) previously
-    told every worker in every project to "push origin HEAD:main" — literally
-    impossible where there is no origin, which is how osp-817/osp-825
-    (binx/stock) shipped closed tickets with commits stranded on a shift
-    branch. Papers must match what the worker can actually do.
+    Projects may be local-only or outside Git. Generated instructions must
+    match the actual repository and configured publication destination.
     """
     try:
         probe = subprocess.run(
@@ -564,9 +559,7 @@ def plant_papers(
     prompt = os.path.join(workers_dir, "prompt.md")
     store = store or os.path.basename(workdir).lower().replace(" ", "-")
     neighborhood = neighborhood or os.path.basename(workdir)
-    # Not every project has an origin remote (HOST_REGISTRY.md documents
-    # oneseo-pos / recipes as local-only) — Land-it wording must match what
-    # this worker can actually do.
+    # Publication instructions follow this repository’s observed remote.
     remote_status = git_remote_status(workdir)
     mapping = {
         "WORKER_ID": slug,

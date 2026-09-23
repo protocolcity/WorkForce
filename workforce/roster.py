@@ -125,6 +125,7 @@ class Worker:
     # exit on its own before it force-ends the pass as a lingering DONE
     # instead of riding the full budget to an ERROR "killed at budget".
     linger_grace_secs: int = 60
+    skill_draft: bool = False  # Explicit permission to propose, never auto-promote, skills.
 
     @property
     def worker_type(self) -> str:
@@ -136,6 +137,8 @@ class Worker:
         return "staff" if self.staff else "job"
 
     def validate(self) -> None:
+        if type(self.skill_draft) is not bool:
+            raise RosterError("skill_draft must be a boolean")
         if not self.name:
             raise RosterError("worker missing name")
         for f in ("workdir", "contract", "prompt", "identity"):

@@ -8,8 +8,7 @@ Default is dry-run receipt; ``--live`` posts Blocked: when desk_writes_allowed()
 
 Host-neutral: desk URL from env / flag; product from CLI; local_root from
 CLI / env. Never writes local/ roster or run files, never invokes
-launchctl. OS seatbelt (option B) is out of scope — see
-workers/salem/designs/wf-160.md.
+launchctl. Operating-system sandbox policy remains a separate host control.
 """
 
 from __future__ import annotations

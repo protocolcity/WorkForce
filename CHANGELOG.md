@@ -44,12 +44,10 @@ Post-0.1.6 stable: lane drain multipass, CoS digest upsert, max_fires_per_day, h
   the suite Map can show a resting lane truthfully.
 
 ## v0.1.5 — 2026-07-27
-- **Persona rename** melanie → salem (Salem · Systems Engineer).
 
 - **WorkForce MCP** — `wf_status` / `wf_roster` / `wf_show` / `wf_hire` / `wf_dispatch`.
 - **Hire defaults** use `worker:` feed + exclusive `queue_url`.
 - **Orphan lock reclaim** by pid (kill-9 no longer blocks redispatch).
-- **Persona rename** otto → melanie (Systems Engineer).
 - **Daemon plist harden** — ProcessType Background, AbandonProcessGroup, ThrottleInterval.
 - **`workforce doctor`** + dual-home roster law (engine home authoritative).
 - **Light scene** sentinel contract + generation_token tests.

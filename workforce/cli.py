@@ -1386,7 +1386,13 @@ def main(argv=None) -> int:
         outdir = (getattr(args, "outdir", None) or "").strip()
         if not outdir and not dry:
             outdir = os.path.join("workers", args.worker, "skills-drafts")
+        try:
+            draft_roster = roster_mod.load(args.file, base=_base)
+        except roster_mod.RosterError as exc:
+            print("skill-draft: roster required: %s" % exc, file=sys.stderr)
+            return 1
         result = sd_mod.draft_from_closeout(
+            workers=draft_roster.workers,
             close_out_text=text,
             worker=args.worker,
             ticket_id=args.ticket_id,

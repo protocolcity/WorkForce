@@ -129,3 +129,10 @@ vendor you employ.
 ## License
 
 Apache-2.0. Copyright 2026 ProtocolCity.
+
+Skill drafts require `skill_draft: true` on the signing worker's roster entry.
+`workforce --file /path/to/roster.json skill-draft WORKER WORK_ORDER --title TITLE --text-file closeout.md`
+previews a draft; `--live --outdir /path/to/drafts` writes it. No worker receives
+this permission from its name, and drafting never promotes a skill into active
+instructions. Existing deployments using the removed implicit named-worker
+permission must set the roster flag explicitly if they still want that behavior.
