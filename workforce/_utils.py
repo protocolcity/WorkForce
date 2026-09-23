@@ -143,6 +143,32 @@ def latest_owner_id(comments: Optional[List[dict]]) -> Optional[str]:
     return owner or None
 
 
+def latest_signed_owner_id(comments: Optional[List[dict]]) -> Optional[str]:
+    """Latest unambiguous owner whose marker matches its persisted author.
+
+    Use the authoritative chronological comment stream. A later malformed
+    claim or release invalidates earlier ownership instead of falling back.
+    """
+    if not isinstance(comments, list):
+        return None
+    owner = None
+    for comment in comments:
+        if not isinstance(comment, dict):
+            return None
+        body = comment.get("body")
+        if not isinstance(body, str):
+            return None
+        if re.search(r"(?m)^(?:Released by|Reopened by|Blocked:)", body):
+            owner = None
+        if re.search(r"(?m)^Owner:", body):
+            lines = re.findall(r"(?m)^Owner:.*$", body)
+            match = (re.fullmatch(r"Owner:[ \t]*([^\s:()]+)[ \t]*", lines[0])
+                     if len(lines) == 1 else None)
+            owner = (match.group(1) if match and comment.get("id")
+                     and comment.get("author") == match.group(1) else None)
+    return owner
+
+
 def _atomic_write_json(
     path: str, raw: Dict[str, Any], *, prefix: str = ".roster-"
 ) -> None:

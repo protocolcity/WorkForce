@@ -35,7 +35,9 @@ def git(repo, *args):
 class _DeskHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.server.methods.append("GET")
-        body = json.dumps(self.server.feed).encode()
+        response = (getattr(self.server, "detail", self.server.feed)
+                    if "/ready?" not in self.path else self.server.feed)
+        body = json.dumps(response).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -145,7 +147,7 @@ def server_feed(task):
     return {"ok": True, "count": 1, "product": "product", "tasks": [task]}
 
 
-def make_worker(tmp_path, config, config_path, desk, **over):
+def make_worker(tmp_path, config, config_path, desk, queue_count=1, **over):
     config = dict(config, desk_url="http://127.0.0.1:%d" % desk.server_port)
     config_path.write_text(json.dumps(config))
     workdir = tmp_path / "hood"
@@ -155,7 +157,7 @@ def make_worker(tmp_path, config, config_path, desk, **over):
     contract.write_text("# contract v1\n")
     prompt.write_text("do one slice\n")
     queue = tmp_path / "queue.json"
-    queue.write_text(json.dumps({"ok": True, "count": 1}))
+    queue.write_text(json.dumps({"ok": True, "count": queue_count}))
     spec = dict(
         name="tester", workdir=str(workdir), contract=str(contract),
         prompt=str(prompt), identity="tester-id",
@@ -341,3 +343,124 @@ def test_direct_task_runner_recovery_is_not_engine_visible(tmp_path, prepared, d
                                                                   "labels": ["worker:builder", "execution:bounded"]}))
     assert direct["task_id"] == "p-1"
     assert ledger_text(tmp_path) == ""
+
+
+# an explicit, already-resolved recovery target is not a pick from
+# the ordinary ready feed — the recovered task can be legitimately absent
+# from it (a parked/in_review owner-held reservation). The ordinary feed
+# probe must not gate the shift with SKIP "queue empty" when a valid
+# recovery target was already resolved from the receipt.
+
+def test_recovery_proceeds_when_the_ordinary_ready_queue_is_empty(tmp_path, prepared, desk):
+    config, config_path, result, out_marker = prepared
+    worker = make_worker(tmp_path, config, config_path, desk, queue_count=0)
+
+    rc = engine.dispatch(worker, local(tmp_path),
+                          recover_receipt=result["receipt"], recovery_reason="empty ordinary queue")
+
+    assert rc == 0
+    assert out_marker.read_text() == "recovered-ok\n"
+    text = ledger_text(tmp_path)
+    assert "SKIP" not in text
+    start = next(l for l in text.splitlines() if " START " in l)
+    assert "recovery=1" in start
+    assert "queue=?" in start
+
+
+@pytest.mark.parametrize("status", ["in_progress", "in_review"])
+def test_empty_ready_queue_resumes_real_owned_task_subprocess(tmp_path, prepared, desk, status):
+    config, config_path, result, out_marker = prepared
+    worker = make_worker(tmp_path, config, config_path, desk, queue_count=0)
+    desk.feed = {"ok": True, "count": 0, "product": "product", "tasks": []}
+    task = dict(id="p-1", product="product", status=status,
+                labels=["worker:builder", "execution:bounded"],
+                comments=[dict(id=1, author="builder", body="Owner: builder\nPlan: Resume")])
+    desk.detail = {"ok": True, "product": "product", "task": task}
+    assert engine.dispatch(worker, local(tmp_path), recover_receipt=result["receipt"],
+                           recovery_reason="resume existing owner") == 0
+    assert out_marker.read_text() == "recovered-ok\n"
+    assert " STOP " in ledger_text(tmp_path)
+    assert "SKIP" not in ledger_text(tmp_path)
+    assert desk.detail["task"]["status"] == status
+
+
+def test_ordinary_empty_dispatch_without_recovery_stays_a_clean_skip(tmp_path, prepared, desk):
+    """Guard the other half of no-recovery empty-queue dispatch is unchanged."""
+    config, config_path, result, out_marker = prepared
+    worker = make_worker(tmp_path, config, config_path, desk, queue_count=0)
+
+    rc = engine.dispatch(worker, local(tmp_path))
+
+    assert rc == 0
+    assert not out_marker.exists()
+    text = ledger_text(tmp_path)
+    assert "SKIP" in text and "queue empty" in text
+    assert "START" not in text
+
+
+def test_recovery_with_empty_ready_queue_still_refuses_wrong_owner(tmp_path, prepared, desk):
+    config, config_path, result, out_marker = prepared
+    desk.feed["tasks"] = [dict(id="p-1", product="product", status="backlog",
+                                labels=["worker:other", "execution:bounded"])]
+    worker = make_worker(tmp_path, config, config_path, desk, queue_count=0)
+
+    rc = engine.dispatch(worker, local(tmp_path),
+                          recover_receipt=result["receipt"], recovery_reason="wrong owner check")
+
+    assert rc == 1
+    assert not out_marker.exists()
+    text = ledger_text(tmp_path)
+    assert "ERROR" in text and "recovery=1" in text
+    candidate_lines = [l for l in text.splitlines() if " CANDIDATE " in l]
+    assert len(candidate_lines) == 1 and "ticket=p-1" in candidate_lines[0]
+
+
+def test_recovery_with_empty_ready_queue_still_refuses_gated_task(tmp_path, prepared, desk):
+    config, config_path, result, out_marker = prepared
+    desk.feed["tasks"] = [dict(id="p-1", product="product", status="backlog",
+                                labels=["worker:builder", "execution:bounded"],
+                                gate_type="human")]
+    worker = make_worker(tmp_path, config, config_path, desk, queue_count=0)
+
+    rc = engine.dispatch(worker, local(tmp_path),
+                          recover_receipt=result["receipt"], recovery_reason="gated check")
+
+    assert rc == 1
+    assert not out_marker.exists()
+    text = ledger_text(tmp_path)
+    assert "ERROR" in text and "recovery=1" in text
+
+
+def test_recovery_with_empty_ready_queue_still_refuses_unavailable_target_feed(tmp_path, prepared, desk):
+    """task_runner's own re-check feed (not the ordinary ready probe) going
+    unavailable/malformed must still fail closed — only the ordinary,
+    already-superseded ready feed is irrelevant once a target is resolved."""
+    config, config_path, result, out_marker = prepared
+    del desk.feed["tasks"]  # malformed: count present, tasks list missing
+    worker = make_worker(tmp_path, config, config_path, desk, queue_count=0)
+
+    rc = engine.dispatch(worker, local(tmp_path),
+                          recover_receipt=result["receipt"], recovery_reason="unavailable target feed")
+
+    assert rc == 1
+    assert not out_marker.exists()
+    text = ledger_text(tmp_path)
+    assert "ERROR" in text and "recovery=1" in text
+
+
+def test_recovery_with_empty_ready_queue_still_refuses_invalid_receipt(tmp_path, prepared, desk):
+    config, config_path, result, out_marker = prepared
+    worker = make_worker(tmp_path, config, config_path, desk, queue_count=0)
+    foreign = tmp_path / "elsewhere" / "preparation.json"
+    foreign.parent.mkdir()
+    foreign.write_text(Path(result["receipt"]).read_text())
+
+    rc = engine.dispatch(worker, local(tmp_path),
+                          recover_receipt=str(foreign), recovery_reason="invalid receipt + empty queue")
+
+    assert rc == 1
+    assert not out_marker.exists()
+    text = ledger_text(tmp_path)
+    assert "outside the worker's state_dir" in text
+    assert "START" not in text
+    assert "SKIP" not in text
