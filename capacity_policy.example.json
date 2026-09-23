@@ -1,6 +1,6 @@
 {
   "schema": "workforce.capacity_policy/v1",
-  "# comment": "User-editable pin rails. Citizen copies this file to local/capacity_policy.json. Chief-of-staff staging and workforce repin read ONLY this envelope — never invent pairs from chat. Hands never write the live file.",
+  "# comment": "User-editable pin rails. Copy this file to local/capacity_policy.json and edit it there. Staging tooling and `workforce repin` read ONLY this envelope — never invent pairs from chat. Workers never write the live policy file.",
   "seats_per_day": 10,
   "cooldown_hours": 6,
   "allowed_fields": ["model", "command"],
@@ -8,7 +8,7 @@
     {
       "id": "generalist-claude-grok",
       "tier": "generalist",
-      "description": "Generalist seats (claude-sonnet-4-6 / Claude CLI). Emergency re-pin to Grok when Claude pool is walled; restore to Claude when capacity clears (CAPACITY_RESTORE_RUNBOOK).",
+      "description": "Generalist seats (claude-sonnet-4-6 / Claude CLI). Emergency re-pin to Grok when the Claude pool is walled; restore to Claude when capacity clears.",
       "a": {
         "model": "claude-sonnet-4-6",
         "runtime": "claude"
@@ -63,10 +63,9 @@
     }
   ],
   "stay_pinned_tiers": ["heavy_multipass"],
-  "stay_pinned_note": "Heavy multipass seats stay on their CONTRACT pin (typically Grok). Pool restore does not move them — stagers check CONTRACT intended pin, not this list alone.",
+  "stay_pinned_note": "Heavy multipass seats stay on their CONTRACT pin (typically Grok). Pool restore does not move them — staging checks the CONTRACT's intended pin, not this list alone.",
   "notes": [
-    "Founder rails encoded 2026-08-03 from docs/CAPACITY_RESTORE_RUNBOOK.md + 2026-08-02 capacity restore wave.",
-    "Edit seats_per_day / cooldown_hours / pin_pairs locally without a law edit.",
-    "Mode B only: staging never merges live roster.json (STAFFING §5)."
+    "Edit seats_per_day / cooldown_hours / pin_pairs locally; this file is data, not code.",
+    "Staging only ever edits pin fields listed in allowed_fields — it never merges the live roster.json."
   ]
 }

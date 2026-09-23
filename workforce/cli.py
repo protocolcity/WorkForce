@@ -78,6 +78,14 @@ def main(argv=None) -> int:
                             help="operator's retained proof a pre-lock-protocol receipt's process "
                                  "stopped; forwarded to task_runner recovery")
 
+    p_recover = sub.add_parser(
+        "recover",
+        help="execute a pending qualified checkpoint recovery plan for one task",
+    )
+    p_recover.add_argument("task_id", help="work order id with a pending recovery plan")
+    p_recover.add_argument("--dry-run", action="store_true",
+                           help="plan checkpoint/handoff/dispatch without WorkLane writes or engine spawn")
+
     p_hire = sub.add_parser("hire", help="employ a worker (papers + roster row)")
     p_hire.add_argument("name", help="persona name (becomes the identity slug)")
     p_hire.add_argument("--workdir",
@@ -1386,7 +1394,13 @@ def main(argv=None) -> int:
         outdir = (getattr(args, "outdir", None) or "").strip()
         if not outdir and not dry:
             outdir = os.path.join("workers", args.worker, "skills-drafts")
+        try:
+            draft_roster = roster_mod.load(args.file, base=_base)
+        except roster_mod.RosterError as exc:
+            print("skill-draft: roster required: %s" % exc, file=sys.stderr)
+            return 1
         result = sd_mod.draft_from_closeout(
+            workers=draft_roster.workers,
             close_out_text=text,
             worker=args.worker,
             ticket_id=args.ticket_id,
@@ -1434,6 +1448,55 @@ def main(argv=None) -> int:
             recover_receipt=args.recover_receipt, recovery_reason=args.recovery_reason,
             legacy_stop_evidence=args.legacy_stop_evidence,
         )
+
+    if args.cmd == "recover":
+        from . import continuity_recovery as cr
+        def fetch_task(worker, task_id):
+            origin = engine.desk_origin_from_queue_url(worker.queue_url or "")
+            if not origin:
+                raise ValueError("worker has no desk origin")
+            import urllib.parse
+            import urllib.request
+            product = engine.product_from_queue_url(worker.queue_url or "") or ""
+            url = origin + "/api/admin/tasks/" + urllib.parse.quote(str(task_id))
+            if product:
+                url += "?" + urllib.parse.urlencode({"product": product})
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                payload = json.load(resp)
+            task = payload.get("task") if isinstance(payload, dict) else None
+            if not isinstance(task, dict):
+                raise ValueError("task feed malformed")
+            return task
+
+        def dispatch_fn(target_name, lr, receipt_path, reason, *, routing_context):
+            w = r.worker(target_name)
+            return engine.dispatch(w, lr, recover_receipt=receipt_path, recovery_reason=reason,
+                                   routing_context=routing_context)
+
+        def post_fn(url, payload):
+            import urllib.request
+            body = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=body, headers={"Content-Type": "application/json"}, method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.load(resp)
+
+        try:
+            outcome = cr.execute_recovery_for_task(
+                local_root=local_root,
+                roster=r,
+                task_id=args.task_id,
+                fetch_task=fetch_task,
+                post_fn=post_fn,
+                dispatch_fn=dispatch_fn,
+                dry_run=args.dry_run,
+            )
+        except (OSError, ValueError) as exc:
+            print("recover failed: %s" % exc, file=sys.stderr)
+            return 1
+        print(json.dumps(outcome, indent=2))
+        return 0 if outcome.get("ok") else 1
 
     if args.cmd == "ledger":
         print(Ledger(os.path.join(local_root, "ledger"), args.worker).tail(args.n), end="")

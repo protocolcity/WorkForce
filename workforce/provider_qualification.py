@@ -50,61 +50,13 @@ CONSTRAINT_CLASSES = (
     "temporary_throttle",
 )
 
-# Static disposition notes for related work orders (host rollout remains
-# outside product source — these are guidance, not auto-actions).
-RELATED_WORK_DISPOSITIONS: Tuple[Dict[str, str], ...] = (
-    {
-        "task": "wf-260",
-        "disposition": (
-            "Seat regeneration / coverage — host rollout remains with the "
-            "authorized coordinator; do not duplicate regeneration here."
-        ),
-    },
-    {
-        "task": "wf-175",
-        "disposition": (
-            "Deferred historical drain-mode rollout — remains deferred; "
-            "qualification does not silently thaw unrelated gates."
-        ),
-    },
-    {
-        "task": "wf-258",
-        "disposition": (
-            "Remote-seat decision — GitHub events are delivery evidence, not "
-            "remote liveness; do not auto-hire all providers for every project."
-        ),
-    },
-    {
-        "task": "wf-262",
-        "disposition": (
-            "Grok adapter repair and real build acceptance — after verified "
-            "host reactivation and bounded implementation pass, a repaired "
-            "Grok seat may return to building; permission_cancelled on "
-            "run_terminal_command was the diagnosed blocker."
-        ),
-    },
-)
+# Related-work disposition and return-path guidance are host-supplied —
+# product source keeps the schema keys but never ships specific task
+# claims or vendor anecdotes; a host may pass its own via evidence files.
+RELATED_WORK_DISPOSITIONS: Tuple[Dict[str, str], ...] = ()
 
 # Provider return-path guidance (roles follow demonstrated capability).
-PROVIDER_RETURN_PATHS: Tuple[Dict[str, str], ...] = (
-    {
-        "provider": "grok",
-        "path": (
-            "Return to building only after wf-262 repair is merged, host "
-            "reactivates the seat, and a bounded pass demonstrates signed "
-            "claim, edit, test, commit, evidence/park, and independent "
-            "review — not merely a process exit."
-        ),
-    },
-    {
-        "provider": "codex",
-        "path": (
-            "Consider under the existing usage-conservation preference when "
-            "coordinator capacity and allocation are revised; demonstrated "
-            "delivery history exists but is not an automatic rank boost."
-        ),
-    },
-)
+PROVIDER_RETURN_PATHS: Tuple[Dict[str, str], ...] = ()
 
 # Known constraints the audit expects to remain in product source.
 _ADAPTER_CONSTRAINT_SPECS: Dict[str, List[Dict[str, str]]] = {
@@ -137,8 +89,6 @@ _ADAPTER_CONSTRAINT_SPECS: Dict[str, List[Dict[str, str]]] = {
          "detail": "--sandbox workspace-write is the safety boundary"},
         {"id": "enabled_tools_allowlist", "class": "necessary_boundary",
          "detail": "mcp_servers.worklane.enabled_tools scoped to wl_* hand tools"},
-        {"id": "usage_conservation", "class": "user_preference",
-         "detail": "Host conserves Codex usage until allocation is revised"},
     ],
 }
 
@@ -363,7 +313,7 @@ def audit_seat_template_constraints() -> List[Dict[str, str]]:
         "scope": "seat_templates",
         "id": "worklane_hand_tools",
         "class": "necessary_boundary",
-        "detail": "Five wl_* hand tools allowed; others explicitly denied",
+        "detail": "Work-order/checkpoint tools allowed; other tools explicitly denied",
         "present": "yes" if len(allow) >= 5 and any("wl_" in d for d in deny) else "drift",
     })
     return rows
@@ -695,10 +645,16 @@ def format_qualification_report(report: Dict[str, Any]) -> str:
         "## Provider return paths",
         "",
     ]
-    for item in report.get("provider_return_paths") or []:
+    return_paths = report.get("provider_return_paths") or []
+    if not return_paths:
+        lines.append("_none supplied_")
+    for item in return_paths:
         lines.append("- **%s**: %s" % (item.get("provider"), item.get("path")))
     lines += ["", "## Related work disposition", ""]
-    for item in report.get("related_work") or []:
+    related_work = report.get("related_work") or []
+    if not related_work:
+        lines.append("_none supplied_")
+    for item in related_work:
         lines.append("- **%s**: %s" % (item.get("task"), item.get("disposition")))
     lines.append("")
     return "\n".join(lines)

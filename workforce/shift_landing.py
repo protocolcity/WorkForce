@@ -317,7 +317,7 @@ def _dedupe_primary_by_workdir(
 
     Multi-seat neighborhoods share one primary HEAD. Counting
     ``primary_ahead`` on every seat multiplies the same unpushed commits
-    in the doctor rollup (e.g. 4 × 146 on oneseo-pos). First seat in
+    in the doctor rollup. First seat in
     stable name order keeps the primary contribution; later seats keep
     only their shift-branch unique patches.
     """
@@ -378,8 +378,7 @@ def _is_remote_landing_ref(landing_ref: str) -> bool:
     """True when *landing_ref* is a remote-tracking ref (``origin/main``…).
 
     :func:`resolve_landing_ref` falls back to a local ``refs/heads/main`` /
-    ``master`` when the workdir has no ``origin`` (e.g. oneseo-pos, recipes
-    — HOST_REGISTRY.md "local-only"). Advisory text must key off which one
+    ``master`` when the workdir has no ``origin``. Advisory text must key off which one
     it actually found, not assume remote.
     """
     ref = (landing_ref or "").strip()

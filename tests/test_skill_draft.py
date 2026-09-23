@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -33,7 +35,7 @@ def test_slugify_max_length():
 # ---------------------------------------------------------------------------
 
 SAMPLE_CLOSEOUT = """\
-Owner: salem
+Owner: example-builder
 Workdir: /tmp/repo
 Start: 2026-08-12T14:00:00Z
 
@@ -46,7 +48,7 @@ Wrote tests.
 Verification:
 - pytest tests/test_skill_draft.py -q → green (12 tests)
 - skill-draft --dry-run emits content without writing
-- workforce skill-draft salem wf-204 --title "Test" --dry-run exits 0
+- workforce skill-draft example-builder wf-204 --title "Test" --dry-run exits 0
 
 Links:
 - commit abc123def456 on origin/main
@@ -99,7 +101,7 @@ def test_build_skill_md_frontmatter():
         title="My Skill",
         slug="my-skill",
         ticket_id="wf-204",
-        worker="salem",
+        worker="example-builder",
         sha="abc123",
         completed="Step 1\nStep 2",
         verification="pytest green",
@@ -107,7 +109,7 @@ def test_build_skill_md_frontmatter():
     assert md.startswith("---\n")
     assert "name: my-skill" in md
     assert "ticket: wf-204" in md
-    assert "worker: salem" in md
+    assert "worker: example-builder" in md
     assert "status: draft" in md
 
 
@@ -116,7 +118,7 @@ def test_build_skill_md_procedure_section():
         title="My Skill",
         slug="my-skill",
         ticket_id="wf-204",
-        worker="salem",
+        worker="example-builder",
         sha="",
         completed="Do the thing",
         verification="",
@@ -130,7 +132,7 @@ def test_build_skill_md_promote_gate_present():
         title="T",
         slug="t",
         ticket_id="wf-1",
-        worker="salem",
+        worker="example-builder",
         sha="",
         completed="",
         verification="",
@@ -144,7 +146,7 @@ def test_build_skill_md_verification_section_omitted_when_empty():
         title="T",
         slug="t",
         ticket_id="wf-1",
-        worker="salem",
+        worker="example-builder",
         sha="",
         completed="step",
         verification="",
@@ -157,7 +159,7 @@ def test_build_skill_md_verification_section_present():
         title="T",
         slug="t",
         ticket_id="wf-1",
-        worker="salem",
+        worker="example-builder",
         sha="",
         completed="step",
         verification="pytest green",
@@ -171,8 +173,8 @@ def test_build_skill_md_verification_section_present():
 
 
 def test_is_draft_allowed_bootstrap_seat():
-    assert sd.is_draft_allowed("salem")
-    assert sd.is_draft_allowed("blossom")
+    assert not sd.is_draft_allowed("example-builder")
+    assert not sd.is_draft_allowed("example-reviewer")
 
 
 def test_is_draft_allowed_unknown_seat_no_roster():
@@ -210,8 +212,9 @@ def test_is_draft_allowed_roster_missing_flag():
 
 def test_draft_from_closeout_dry_run_returns_content():
     result = sd.draft_from_closeout(
+        workers={"example-builder": SimpleNamespace(skill_draft=True)},
         close_out_text=SAMPLE_CLOSEOUT,
-        worker="salem",
+        worker="example-builder",
         ticket_id="wf-204",
         title="My Skill Title",
         dry_run=True,
@@ -225,8 +228,9 @@ def test_draft_from_closeout_dry_run_returns_content():
 def test_draft_from_closeout_dry_run_no_file_written(tmp_path):
     outdir = str(tmp_path / "drafts")
     result = sd.draft_from_closeout(
+        workers={"example-builder": SimpleNamespace(skill_draft=True)},
         close_out_text=SAMPLE_CLOSEOUT,
-        worker="salem",
+        worker="example-builder",
         ticket_id="wf-999",
         title="Test Skill",
         outdir=outdir,
@@ -239,6 +243,7 @@ def test_draft_from_closeout_dry_run_no_file_written(tmp_path):
 
 def test_draft_from_closeout_denied_unknown_worker():
     result = sd.draft_from_closeout(
+        workers={"example-builder": SimpleNamespace(skill_draft=True)},
         close_out_text=SAMPLE_CLOSEOUT,
         worker="not-allowed",
         ticket_id="wf-204",
@@ -257,8 +262,9 @@ def test_draft_from_closeout_denied_unknown_worker():
 def test_draft_from_closeout_live_writes_file(tmp_path):
     outdir = str(tmp_path / "drafts")
     result = sd.draft_from_closeout(
+        workers={"example-builder": SimpleNamespace(skill_draft=True)},
         close_out_text=SAMPLE_CLOSEOUT,
-        worker="salem",
+        worker="example-builder",
         ticket_id="wf-204",
         title="Live Skill",
         sha="deadbeef1234",
@@ -277,8 +283,9 @@ def test_draft_from_closeout_live_writes_file(tmp_path):
 def test_draft_from_closeout_live_requires_outdir():
     with pytest.raises(ValueError, match="outdir"):
         sd.draft_from_closeout(
+            workers={"example-builder": SimpleNamespace(skill_draft=True)},
             close_out_text="Completed:\nfoo",
-            worker="salem",
+            worker="example-builder",
             ticket_id="wf-204",
             title="T",
             outdir="",
@@ -291,9 +298,14 @@ def test_draft_from_closeout_live_requires_outdir():
 # ---------------------------------------------------------------------------
 
 
-def test_cli_skill_draft_dry_run(capsys):
+def test_cli_skill_draft_dry_run(tmp_path, capsys):
+    roster_path = tmp_path / "roster.json"
+    roster_path.write_text(json.dumps({"workers": {"example-builder": {
+        "workdir": str(tmp_path), "contract": "CONTRACT.md", "prompt": "prompt.md",
+        "identity": "example-builder", "command": ["echo"], "skill_draft": True
+    }}}))
     rc = cli.main([
-        "skill-draft", "salem", "wf-204",
+        "--file", str(roster_path), "skill-draft", "example-builder", "wf-204",
         "--title", "My Skill",
         "--text", SAMPLE_CLOSEOUT,
     ])
@@ -303,9 +315,14 @@ def test_cli_skill_draft_dry_run(capsys):
     assert "my-skill" in out
 
 
-def test_cli_skill_draft_denied_worker(capsys):
+def test_cli_skill_draft_denied_worker(tmp_path, capsys):
+    roster_path = tmp_path / "roster.json"
+    roster_path.write_text(json.dumps({"workers": {"example-builder": {
+        "workdir": str(tmp_path), "contract": "CONTRACT.md", "prompt": "prompt.md",
+        "identity": "example-builder", "command": ["echo"], "skill_draft": True
+    }}}))
     rc = cli.main([
-        "skill-draft", "nobody", "wf-204",
+        "--file", str(roster_path), "skill-draft", "nobody", "wf-204",
         "--title", "T",
         "--text", "Completed:\nfoo",
     ])
@@ -316,8 +333,13 @@ def test_cli_skill_draft_denied_worker(capsys):
 
 def test_cli_skill_draft_live_writes(tmp_path, capsys):
     outdir = str(tmp_path / "drafts")
+    roster_path = tmp_path / "roster.json"
+    roster_path.write_text(json.dumps({"workers": {"example-builder": {
+        "workdir": str(tmp_path), "contract": "CONTRACT.md", "prompt": "prompt.md",
+        "identity": "example-builder", "command": ["echo"], "skill_draft": True
+    }}}))
     rc = cli.main([
-        "skill-draft", "salem", "wf-204",
+        "--file", str(roster_path), "skill-draft", "example-builder", "wf-204",
         "--title", "Live Skill",
         "--text", SAMPLE_CLOSEOUT,
         "--outdir", outdir,

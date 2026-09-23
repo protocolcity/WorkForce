@@ -132,7 +132,7 @@ def validate_model_pin(
 
 DEFAULT_COMMAND = [
     "claude", "--model", "{model}", "-p", "{prompt_text}",
-    "--dangerously-skip-permissions", "--no-session-persistence",
+    "--permission-mode", "dontAsk", "--no-session-persistence",
     "--output-format", "json",
 ]
 
@@ -146,13 +146,8 @@ DEFAULT_USAGE_FIELDS = {
 def git_remote_status(workdir: str) -> str:
     """'origin' | 'local-only' | 'no-git' — picks the Land-it wording.
 
-    Not every project has a GitHub ``origin`` (e.g. oneseo-pos, recipes are
-    documented "local-only" in HOST_REGISTRY.md) and not every workdir is
-    even a git repo. The Land-it law (PROCESS §5.1.3 / wf-172) previously
-    told every worker in every project to "push origin HEAD:main" — literally
-    impossible where there is no origin, which is how osp-817/osp-825
-    (binx/stock) shipped closed tickets with commits stranded on a shift
-    branch. Papers must match what the worker can actually do.
+    Projects may be local-only or outside Git. Generated instructions must
+    match the actual repository and configured publication destination.
     """
     try:
         probe = subprocess.run(
@@ -189,8 +184,8 @@ def _land_it_contract_text(slug: str, remote_status: str) -> str:
         )
     if remote_status == "local-only":
         return (
-            "This project has no `origin` remote (local-only — see "
-            "HOST_REGISTRY.md). Work is not done until it is merged into "
+            "This project has no `origin` remote (local-only). Work is "
+            "not done until it is merged into "
             "the shared local `main`: from the **primary checkout** (not "
             "your shift tree), `git merge --ff-only "
             "workforce/shift/%s` (a real merge or rebase first if main has "
@@ -233,7 +228,7 @@ def _land_it_prompt_text(slug: str, remote_status: str) -> str:
     )
 
 
-_FALLBACK_CONTRACT = """# {slug} — Employment Contract (L2)
+_FALLBACK_CONTRACT = """# {slug} — Employment Contract
 
 ## Identity
 
@@ -244,11 +239,10 @@ _FALLBACK_CONTRACT = """# {slug} — Employment Contract (L2)
 ## Lane — what this worker may claim
 
 - Tickets labeled `worker:{slug}` in store `{store}`, and nothing else.
-  (Vocabulary law: routing label is worker:<id>, not lane: — pc-23 / STAFFING.)
 
 ## Never touch
 
-- Anything behind a citizen gate (L0/L1) — prepare, never ship.
+- Anything gated for human decision — prepare, never ship.
 - `local/roster.json` and other employment records.
 
 ## Procedure
@@ -565,9 +559,7 @@ def plant_papers(
     prompt = os.path.join(workers_dir, "prompt.md")
     store = store or os.path.basename(workdir).lower().replace(" ", "-")
     neighborhood = neighborhood or os.path.basename(workdir)
-    # Not every project has an origin remote (HOST_REGISTRY.md documents
-    # oneseo-pos / recipes as local-only) — Land-it wording must match what
-    # this worker can actually do.
+    # Publication instructions follow this repository’s observed remote.
     remote_status = git_remote_status(workdir)
     mapping = {
         "WORKER_ID": slug,
@@ -1103,6 +1095,11 @@ def generate_seat_folder(
     auth_check = adapter.auth_check()
     allow_list = adapter.allow_list(ctx)
 
+    qualification_files = [launch_path, mcp_path, contract_path, prompt_path]
+    if provider == "cursor":
+        qualification_files.append(os.path.join(seat_dir, "permissions.json"))
+    elif provider == "grok":
+        qualification_files.append(os.path.join(seat_dir, ".grok", "config.toml"))
     files = {
         "runner.json": json.dumps({
             "project": project,
@@ -1115,6 +1112,7 @@ def generate_seat_folder(
             "state_dir": state_dir,
             "prompt_template": prompt_path,
             "authority_chain": authority_chain,
+            "qualification_files": qualification_files,
             "auth_check": auth_check,
             "command": command,
         }, indent=2) + "\n",

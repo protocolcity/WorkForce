@@ -1471,7 +1471,7 @@ def test_generate_seat_folder_grok_gets_trust_flag_and_project_config(tmp_path):
     seat_dir = tmp_path / "local" / "worker-config" / "demo"
     assert (seat_dir / ".grok" / "config.toml").is_file()
     launch_body = (seat_dir / "launch.py").read_text()
-    assert "_drop_grok_config" in launch_body
+    assert "_plant_settings" in launch_body
 
 
 def test_generate_seat_folder_cursor_gets_permissions_and_planting_launch(tmp_path):
@@ -1539,7 +1539,7 @@ def test_launch_py_cursor_plants_identity_on_recovery_path(tmp_path, monkeypatch
         hire_mod.seat_templates.LAUNCH_PY_CURSOR, seat_dir,
         ["--config", str(seat_dir / "runner.json"), "--recover-receipt", str(receipt),
          "--recovery-reason", "provider crashed"],
-        monkeypatch, main=lambda argv: 0, prepare=fail_prepare,
+        monkeypatch, main=lambda argv, **kw: kw['before_exec']({}, {'checkout': str(checkout)}) or 0, prepare=fail_prepare,
     )
 
     assert (checkout / ".cursor" / "mcp.json").read_text() == '{"mcpServers": {}}'
@@ -1561,16 +1561,22 @@ def test_launch_py_grok_never_overwrites_existing_checkout_config(tmp_path, monk
 
     from workforce import task_runner as task_runner_mod
     globs = {"__name__": "__main__", "__file__": str(seat_dir / "launch.py")}
-    monkeypatch.setattr(task_runner_mod, "main", lambda argv: 0)
+    def stub_main(argv, **kw):
+        try:
+            kw['before_exec']({}, {'checkout': str(checkout)})
+        except ValueError:
+            return 1
+        return 0
+    monkeypatch.setattr(task_runner_mod, "main", stub_main)
     monkeypatch.setattr(sys, "argv",
                          ["launch.py", "--config", str(seat_dir / "runner.json"),
                           "--recover-receipt", str(receipt), "--recovery-reason", "provider crashed"])
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as stopped:
         exec(compile(hire_mod.seat_templates.LAUNCH_PY_GROK, "<launch.py>", "exec"), globs)
 
     assert (checkout / ".grok" / "config.toml").read_text() == "# task-provided config, keep me\n"
-    exclude = (checkout / ".git" / "info" / "exclude").read_text()
-    assert ".grok/" in exclude
+    assert stopped.value.code == 1
+    assert not (checkout / ".git" / "info" / "exclude").exists()
 
 
 def test_launch_py_grok_plants_config_on_recovery_when_absent(tmp_path, monkeypatch):
@@ -1584,7 +1590,13 @@ def test_launch_py_grok_plants_config_on_recovery_when_absent(tmp_path, monkeypa
 
     from workforce import task_runner as task_runner_mod
     globs = {"__name__": "__main__", "__file__": str(seat_dir / "launch.py")}
-    monkeypatch.setattr(task_runner_mod, "main", lambda argv: 0)
+    def stub_main(argv, **kw):
+        try:
+            kw['before_exec']({}, {'checkout': str(checkout)})
+        except ValueError:
+            return 1
+        return 0
+    monkeypatch.setattr(task_runner_mod, "main", stub_main)
     monkeypatch.setattr(sys, "argv",
                          ["launch.py", "--config", str(seat_dir / "runner.json"),
                           "--recover-receipt", str(receipt), "--recovery-reason", "provider crashed"])
@@ -1637,3 +1649,22 @@ def test_generate_seat_folder_remote_defaults_to_repository_origin(tmp_path):
     er = load(again["roster_path"], base=str(tmp_path))
     assert "demo" in er.workers and er.skipped == {}
     assert er.workers["demo"].continuation_attempts == 0
+
+
+@pytest.mark.parametrize('provider',['claude','grok','cursor','codex'])
+def test_generated_adapter_and_tool_files_are_bound_to_qualification(tmp_path,provider):
+    from workforce import routing_binding as rb
+    from pathlib import Path
+    repo=_seat_base(tmp_path)
+    result=hire_mod.generate_seat_folder(name='demo',provider=provider,project='recipes',
+                                         repository=str(repo),base=str(tmp_path))
+    worker=load(result['roster_path'],base=str(tmp_path)).workers['demo']
+    config=rb.configured_runner(worker)
+    before=rb.runner_digest(config)
+    mcp=Path(result['seat_dir'])/'mcp.json'
+    mcp.write_text(mcp.read_text()+'\n')
+    assert rb.runner_digest(config)!=before
+    launch=Path(result['seat_dir'])/'launch.py'
+    launch.write_text(launch.read_text()+'\n# unqualified local change\n')
+    with pytest.raises(ValueError,match='adapter differs'):
+        rb.configured_runner(worker)

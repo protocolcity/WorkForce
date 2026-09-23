@@ -22,6 +22,11 @@ try:
 except ImportError:  # pragma: no cover -- exercised only on non-POSIX platforms
     fcntl = None
 
+from . import task_routing
+from . import routing_binding
+from .routing_policy import RoutingPolicyError, load_routing_policy
+from . import continuity_recovery as continuity_recovery_mod
+
 
 class PreparationError(RuntimeError):
     pass
@@ -32,7 +37,7 @@ class PreparationError(RuntimeError):
 # trusted to prove their tracked process ever held -- or would have released
 # -- the reservation lock, so an absent/unlocked lock file alone never proves
 # they stopped; recovery requires an explicit operator acknowledgement instead.
-LOCK_PROTOCOL_VERSION = 1
+LOCK_PROTOCOL_VERSION = 2  # provider children inherit exclusion in generated adapters
 
 
 def _git(repo, *args):
@@ -116,8 +121,98 @@ def _eligible_tasks(config, fetch):
                 or task.get("gate_type") in ("human", "deferred", "tracking")):
             raise PreparationError("Ready feed returned foreign or ineligible work")
         if required_label in labels:
-            eligible.append(task)
+            eligible.append(dict(task, product=project))
     return project, worker, eligible
+
+
+def _load_prepared_routing(config):
+    context_raw = os.environ.get(routing_binding.CONTEXT_ENV)
+    context = json.loads(context_raw) if context_raw else None
+    path, host = config.get("routing_policy"), config.get("routing_host")
+    if context is not None:
+        if not isinstance(context, dict) or context.get("runner_sha256") != routing_binding.runner_digest(config):
+            raise PreparationError("supervisor runner configuration changed")
+        if path and path != context.get("policy"):
+            raise PreparationError("supervisor and runner routing policy differ")
+        path, host = context.get("policy"), context.get("host")
+    if not path:
+        if context is not None:
+            raise PreparationError("supervisor routing policy is missing")
+        return None
+    if not isinstance(host, str) or not host.strip():
+        raise PreparationError("routing_host must be a non-empty string when routing_policy is set")
+    path = str(_path(path))
+    policy, seat = routing_binding.bound_seat(path, config)
+    return {"path": path, "seats": (seat,), "results": policy.results_by_candidate,
+            "host": host, "context": context}
+
+
+def _routed_task(config, eligible, routing):
+    if routing is None:
+        return eligible[0] if eligible else None, None
+    context = routing["context"]
+    if context:
+        eligible = [t for t in eligible if t.get("id") == context.get("task_id")]
+        if len(eligible) != 1 or routing_binding.task_digest(eligible[0]) != context.get("task_sha256"):
+            raise PreparationError("selected work order changed after supervisor qualification")
+    for task in eligible:
+        try:
+            receipt = routing_binding.qualify(routing["path"], routing["host"], config, task)
+            return task, receipt
+        except ValueError:
+            continue
+    return None, None
+
+
+def _record_launch_binding(config, result, routing, task, qualification):
+    if routing is None:
+        return result
+    data = json.loads(Path(result["receipt"]).read_text())
+    data["routing"] = {"policy": routing["path"], "host": routing["host"],
+        "runner_sha256": routing_binding.runner_digest(config),
+        "task_sha256": routing_binding.task_digest(task), "qualification": qualification,
+        "head": _git(result["checkout"], "rev-parse", "HEAD"),
+        "authority_sha256": hashlib.sha256(_authority_text(config).encode()).hexdigest()}
+    context = routing.get("context") or {}
+    if context.get("resume"):
+        data["routing"]["resume"] = context["resume"]
+    Path(result["receipt"]).write_text(json.dumps(data, indent=2) + "\n")
+    return result
+
+
+def _revalidate_launch(config, result, fetch=_fetch):
+    data = json.loads(Path(result["receipt"]).read_text())
+    bound = data.get("routing")
+    if bound is None:
+        if os.environ.get(routing_binding.CONTEXT_ENV) or config.get("routing_policy"):
+            raise PreparationError("qualified launch receipt missing")
+        return
+    if bound["runner_sha256"] != routing_binding.runner_digest(config):
+        raise PreparationError("runner changed before provider launch")
+    if bound["head"] != _git(result["checkout"], "rev-parse", "HEAD"):
+        raise PreparationError("source revision changed before provider launch")
+    if bound["authority_sha256"] != hashlib.sha256(_authority_text(config).encode()).hexdigest():
+        raise PreparationError("instructions changed before provider launch")
+    _, _, tasks = _eligible_tasks(config, fetch)
+    task = next((t for t in tasks if t.get("id") == result["task_id"]), None)
+    if task is None or routing_binding.task_digest(task) != bound["task_sha256"]:
+        raise PreparationError("work order changed before provider launch")
+    routing_binding.qualify(bound["policy"], bound["host"], config, task)
+    resume = bound.get("resume")
+    if resume:
+        canonical = _canonical_reservation(Path(result["receipt"])) / "preparation.json"
+        original = json.loads(canonical.read_text())
+        detail = fetch(config["desk_url"].rstrip("/") + "/api/admin/tasks/" + result["task_id"]
+                       + "?" + urlencode({"product": config["project"]}))
+        current = detail.get("task", {})
+        if current.get("product") != config["project"] or current.get("id") != result["task_id"]:
+            raise PreparationError("checkpoint work order identity changed before launch")
+        signed = continuity_recovery_mod.parse_latest_signed_checkpoint(current, owner=resume["checkpoint_owner"])
+        if (signed is None or signed["checkpoint_id"] != resume["checkpoint_id"]
+                or signed["checkpoint"] != resume["checkpoint"]):
+            raise PreparationError("signed checkpoint changed before provider launch")
+        continuity_recovery_mod._observed_resume(signed["checkpoint"], config, config, original, current)
+
 
 
 def _check_remote(repo, config):
@@ -157,7 +252,10 @@ def prepare(config, fetch=_fetch):
     project, worker, eligible = _eligible_tasks(config, fetch)
     if not eligible:
         return None
-    task = eligible[0]  # Preserve WorkLane's priority ordering.
+    routing = _load_prepared_routing(config)
+    task, qualification = _routed_task(config, eligible, routing)
+    if task is None:
+        return None
     task_id = _slug(task["id"])
     _check_remote(repo, config)
     base = _git(repo, "rev-parse", "--verify", config.get("base_ref", "origin/main") + "^{commit}")
@@ -192,9 +290,10 @@ def prepare(config, fetch=_fetch):
         argv = [_render(arg, fields) for arg in command]
         receipt.update(state="prepared", prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest())
         receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
-        return {"argv": argv, "checkout": str(checkout), "receipt": str(receipt_path),
+        result = _record_launch_binding(config, {"argv": argv, "checkout": str(checkout), "receipt": str(receipt_path),
                 "project": project, "worker": worker, "task_id": task_id,
-                "lock": str(reservation / "lock")}
+                "lock": str(reservation / "lock")}, routing, task, qualification)
+        return result
     except Exception:
         receipt["state"] = "preparation_failed"
         receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
@@ -312,6 +411,10 @@ def recover(config, receipt_path, reason, fetch=_fetch, legacy_stop_evidence=Non
     if match is None:
         raise PreparationError(
             "Task is not currently ready for this worker; release/reassign it in WorkLane before recovery")
+    routing = _load_prepared_routing(config)
+    matched, qualification = _routed_task(config, [match], routing)
+    if matched is None:
+        raise PreparationError("recovery seat is not qualified for the preserved work")
     repo = _path(config["repository"])
     _check_remote(repo, config)
     checkout = _path(old["checkout"])
@@ -363,9 +466,9 @@ def recover(config, receipt_path, reason, fetch=_fetch, legacy_stop_evidence=Non
         new_receipt["legacy_stop_evidence"] = legacy_stop_evidence
     new_receipt_path = attempt / "preparation.json"
     new_receipt_path.write_text(json.dumps(new_receipt, indent=2) + "\n")
-    return {"argv": argv, "checkout": str(checkout), "receipt": str(new_receipt_path),
+    return _record_launch_binding(config, {"argv": argv, "checkout": str(checkout), "receipt": str(new_receipt_path),
             "project": project, "worker": worker, "task_id": task_id,
-            "lock": str(reservation / "lock")}
+            "lock": str(reservation / "lock")}, routing, match, qualification)
 
 
 def _acquire_lock(lock_path):
@@ -392,7 +495,7 @@ def _acquire_lock(lock_path):
     return fd
 
 
-def main(argv=None):
+def main(argv=None, *, before_exec=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     parser.add_argument("--recover-receipt",
@@ -407,6 +510,7 @@ def main(argv=None):
         print("Task preparation stopped: --recover-receipt and --recovery-reason must be used together",
               file=sys.stderr)
         return 1
+    lock_fd = None
     try:
         config = json.loads(Path(args.config).read_text())
         if args.recover_receipt:
@@ -419,6 +523,10 @@ def main(argv=None):
             return 0
         print("Prepared %s; not yet claimed. Receipt: %s" % (result["task_id"], result["receipt"]), flush=True)
         lock_fd = _acquire_lock(result["lock"])  # noqa: F841 -- kept open across exec
+        _revalidate_launch(config, result)
+        if before_exec is not None:
+            before_exec(config, result)
+            _revalidate_launch(config, result)
         os.chdir(result["checkout"])
         env = dict(os.environ)
         env.update(WL_AGENT_ID=result["worker"], TP_AGENT_ID=result["worker"],
@@ -428,6 +536,9 @@ def main(argv=None):
     except (PreparationError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
         print("Task preparation stopped: %s" % exc, file=sys.stderr)
         return 1
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
 
 
 if __name__ == "__main__":
