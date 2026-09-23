@@ -7,7 +7,17 @@ import time
 
 import pytest
 
-from workforce.task_runner import PreparationError, _acquire_lock, exclude_from_git, prepare, recover
+from workforce.task_runner import PreparationError, _acquire_lock, exclude_from_git, prepare as prepare_only, recover
+
+
+def prepare(config, fetch):
+    """Most recovery fixtures simulate a prior executor that has stopped."""
+    result = prepare_only(config, fetch)
+    if result is not None:
+        path = Path(result['receipt']); data = json.loads(path.read_text())
+        data['execution_lock_protocol'] = data['lock_protocol']
+        path.write_text(json.dumps(data))
+    return result
 
 
 def git(repo, *args):
@@ -638,3 +648,10 @@ def test_before_exec_hook_runs_under_inherited_reservation_lock(setup, tmp_path,
     finally:
         os.chdir(original_cwd)
     assert seen==['hook','exec']
+
+
+def test_preparation_alone_cannot_prove_older_wrapper_stopped(setup):
+    config, task = setup
+    prepared = prepare_only(config, feed(task))
+    with pytest.raises(PreparationError, match="lock protocol"):
+        recover(config, prepared['receipt'], 'old custom wrapper stopped', feed(task))

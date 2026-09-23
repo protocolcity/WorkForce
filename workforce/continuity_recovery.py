@@ -530,7 +530,8 @@ def _desk_origin(worker: Worker) -> str:
 def _acquire_reservation_lock(lock_path, canonical_receipt, *, timeout_secs=0,
                               poll_secs=0.05, lock_probe=None):
     from . import task_runner as tr
-    if canonical_receipt.get("lock_protocol") != tr.LOCK_PROTOCOL_VERSION:
+    if (canonical_receipt.get("lock_protocol") != tr.LOCK_PROTOCOL_VERSION
+            or canonical_receipt.get("execution_lock_protocol") != tr.LOCK_PROTOCOL_VERSION):
         return None, "legacy lock protocol requires explicit operator stopped evidence and manual recovery"
     if not Path(lock_path).is_file():
         return None, "missing reservation lock; process state is unproven"

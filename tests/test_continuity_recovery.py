@@ -62,6 +62,8 @@ def case(tmp_path, monkeypatch):
     monkeypatch.setenv('WL_AGENT_ID','primary')
     prepared=tr.prepare(configs['primary'], feed)
     receipt=json.loads(Path(prepared['receipt']).read_text())
+    receipt['execution_lock_protocol']=tr.LOCK_PROTOCOL_VERSION  # simulate the prior guarded executor
+    Path(prepared['receipt']).write_text(json.dumps(receipt))
     Path(prepared['lock']).touch()
     checkout=Path(prepared['checkout']); (checkout/'README.md').write_text('partial verified edit\n')
     checkpoint=dict(version=1, project='widgets', workspace_id='workspace-example', objective='Preserve the edit',
@@ -140,7 +142,7 @@ def test_dry_run_checks_real_facts_without_writes_or_dispatch(case):
 
 
 @pytest.mark.parametrize('change', ['file','new-file','head','instructions','checkpoint','foreign-checkpoint',
-    'owner','project','human-gate','quota','policy','workspace','lock-missing','legacy-lock','auth','permission','cancel'])
+    'owner','project','human-gate','quota','policy','workspace','lock-missing','legacy-lock','unverified-wrapper','auth','permission','cancel'])
 def test_changed_or_uncertain_facts_refuse_without_handoff(case,change):
     if change=='file': (case.checkout/'README.md').write_text('unverified edit')
     elif change=='new-file': (case.checkout/'new.txt').write_text('uncheckpointed')
@@ -160,6 +162,8 @@ def test_changed_or_uncertain_facts_refuse_without_handoff(case,change):
     elif change=='workspace':
         d=case.configs['receiver'];d['workspace_id']='other';Path(case.workers['receiver'].command[-1]).write_text(json.dumps(d))
     elif change=='lock-missing': Path(case.prepared['lock']).unlink()
+    elif change=='unverified-wrapper':
+        d=case.receipt;d.pop('execution_lock_protocol');Path(case.prepared['receipt']).write_text(json.dumps(d))
     elif change=='legacy-lock':
         d=case.receipt;d.pop('lock_protocol');Path(case.prepared['receipt']).write_text(json.dumps(d))
     else:

@@ -206,7 +206,9 @@ supervisor state. The supervisor applies its policy, project/seat allowlists,
 capacity and operator stop controls, and attempts at most one recovery per pass.
 Lock protocol 2 routes generated provider launchers through the same guarded
 exec path, with identity settings planted only under exclusion. Receipts from
-older lock protocols require explicit operator stopped-process evidence. Newly
+older lock protocols, or custom wrappers without a guarded-exec attestation,
+require explicit operator stopped-process evidence. Preparing a receipt alone
+does not prove the provider inherited the reservation lock. Newly
 generated adapters bind launcher, MCP settings, permissions, prompt and contract
 contents into qualification; changed files require fresh qualification. Existing
 host seat folders are preserved until explicitly regenerated. Cross-host transfer still requires a separately verified artifact
