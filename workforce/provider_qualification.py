@@ -313,7 +313,7 @@ def audit_seat_template_constraints() -> List[Dict[str, str]]:
         "scope": "seat_templates",
         "id": "worklane_hand_tools",
         "class": "necessary_boundary",
-        "detail": "Five wl_* hand tools allowed; others explicitly denied",
+        "detail": "Work-order/checkpoint tools allowed; other tools explicitly denied",
         "present": "yes" if len(allow) >= 5 and any("wl_" in d for d in deny) else "drift",
     })
     return rows

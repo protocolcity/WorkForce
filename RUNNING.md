@@ -66,7 +66,7 @@ handoff and record completion on the same order after actual review/acceptance.
 
 `--recover-receipt /absolute/path/preparation.json --recovery-reason "..."`
 resumes a preserved reservation instead of preparing a new task. Both flags are
-required together; there is no automatic or unattended recovery path. The
+required together for operator-directed recovery. Qualified recovery below is a separate opt-in path. The
 operator, not the helper, first releases or reassigns the task in WorkLane —
 recovery only proceeds once the current authoritative ready feed shows the
 task backlog, ungated, and labeled for the configured worker. A gated, done,
@@ -161,6 +161,56 @@ canonical original receipt), not the live ready snapshot, which may still
 list other backlog this attempt is not touching; dispatch refuses before
 START (ERROR, no ledger writes) if the receipt is unreadable or resolves
 outside the worker's configured `state_dir`.
+
+### Qualified checkpoint recovery (opt-in)
+
+Roster `qualified_recovery: true` with an explicit `recovery_fallback_workers`
+order replaces `fallback_runtime` for quota-limited primary shifts. On an
+unambiguous vendor-limit exit, the engine writes a plan under
+`local/continuity/recovery/<task>.json`. Quota and transient transport
+interruptions are eligible for qualified recovery; authentication, permission,
+tool, user, and unknown failures refuse a seat swap. The engine automatically
+plans only recognized quota exits; other interruptions require explicit planning.
+
+A current **owner-signed WorkLane checkpoint** (`Work checkpoint v1:`) is
+required. Agents save it through `wl_checkpoint` while they still own active or
+parked work, after meaningful edits/tests and before planned budget stops. A
+checkpoint records the next action and every uncommitted artifact's path/hash.
+WorkForce does not invent or sign a checkpoint after an abrupt termination.
+Missing checkpoints preserve the receipt/files and pause for review.
+
+Both runner configurations must declare the same explicit `workspace_id` and
+`continuity_instructions` list of absolute, shared workspace/project rule files.
+The instruction revision is the SHA-256 of the task runner's authority text for
+that list; seat-specific contracts remain in each runner's `authority_chain`.
+Receiving seats need a bound, dated routing policy, compatible tools/project,
+a fresh known quota observation and a finite run allowance. Unknown quota is
+not available capacity; another seat on the exhausted pool is excluded.
+
+`workforce recover <task_id> --dry-run` checks the current facts without a
+handoff or provider run. Omit `--dry-run` to execute an eligible pending plan.
+The coordinator holds cross-process exclusion and the canonical reservation
+lock while it reads WorkLane and verifies actual Git HEAD, branch, registered
+worktree, instructions and artifact hashes. It transfers ownership through
+WorkLane using the latest checkpoint and optimistic version check, verifies
+the response/readback, then calls the receiving engine on the preserved receipt.
+The runner rechecks the checkpoint and files under the same reservation lock
+immediately before provider execution. It never resets the checkout.
+
+Recovery has at most three attempts and a one-minute cooldown. A lost or
+uncertain handoff response stops for reconciliation; it is never blindly
+replayed. A failed dispatch with work still unclaimed may retry within the
+existing allowance. `resumed` means the receiving executor progressed the same
+work order, not that it completed the work. Non-resumed plans remain visible in
+supervisor state. The supervisor applies its policy, project/seat allowlists,
+capacity and operator stop controls, and attempts at most one recovery per pass.
+Lock protocol 2 routes generated provider launchers through the same guarded
+exec path, with identity settings planted only under exclusion. Receipts from
+older lock protocols require explicit operator stopped-process evidence. Newly
+generated adapters bind launcher, MCP settings, permissions, prompt and contract
+contents into qualification; changed files require fresh qualification. Existing
+host seat folders are preserved until explicitly regenerated. Cross-host transfer still requires a separately verified artifact
+transport and execution adapter. Tests use disposable worktrees and stores.
 
 ## Generating a seat from a provider adapter
 

@@ -13,10 +13,9 @@ import shutil
 from dataclasses import dataclass, field
 from typing import Callable, FrozenSet, List, Sequence
 
-# Exclusive WorkLane hand feed — the same five tools every generated seat's
-# papers point at (STAFFING §2). Adapters may extend this per seat.
+# Explicit work-order and owner-checkpoint tools; ownership transfer stays host-owned.
 DEFAULT_ALLOWED_TOOLS: Sequence[str] = (
-    "wl_show", "wl_ready", "wl_claim", "wl_comment", "wl_park",
+    "wl_show", "wl_ready", "wl_claim", "wl_comment", "wl_park", "wl_checkpoint",
 )
 
 

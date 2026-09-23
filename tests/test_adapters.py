@@ -51,10 +51,10 @@ def test_adapter_command_carries_the_model_pin(provider):
 
 
 @pytest.mark.parametrize("provider", ["claude", "cursor", "grok", "codex"])
-def test_adapter_allow_list_is_the_five_worklane_hand_tools(provider):
+def test_adapter_allow_list_includes_owner_checkpoint_but_not_handoff(provider):
     adapter = ADAPTERS[provider]
     allow_list = adapter.allow_list(_ctx())
-    assert allow_list == ["wl_show", "wl_ready", "wl_claim", "wl_comment", "wl_park"]
+    assert allow_list == ["wl_show", "wl_ready", "wl_claim", "wl_comment", "wl_park", "wl_checkpoint"]
 
 
 @pytest.mark.parametrize("provider", ["claude", "cursor", "grok", "codex"])

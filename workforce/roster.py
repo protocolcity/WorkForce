@@ -117,6 +117,9 @@ class Worker:
     completion_field: str = ""          # dot-path into the pass's JSON result naming its stop reason
     completion_values: List[str] = field(default_factory=list)  # values of completion_field meaning "actually done"
     continuation_attempts: int = 0      # bounded auto-recoveries tried before giving up honestly (0 = none)
+    # wf-283 — qualified checkpoint recovery replaces fallback_runtime when enabled.
+    qualified_recovery: bool = False
+    recovery_fallback_workers: List[str] = field(default_factory=list)  # explicit seat order; same work order handoff
     # wf-266 — some vendor CLIs (cursor-agent) keep running after printing
     # their pass's own terminal result object (sandbox proxy / MCP session /
     # stdin never closing). Once that result has appeared AND the WorkLane
@@ -213,6 +216,24 @@ class Worker:
             raise RosterError(
                 "worker %r continuation_attempts requires completion_field" % self.name
             )
+        if type(self.qualified_recovery) is not bool:
+            raise RosterError("qualified_recovery must be a boolean")
+        if not isinstance(self.recovery_fallback_workers, list):
+            raise RosterError("recovery_fallback_workers must be a list")
+        if self.recovery_fallback_workers and not self.qualified_recovery:
+            raise RosterError(
+                "worker %r recovery_fallback_workers requires qualified_recovery" % self.name
+            )
+        if self.qualified_recovery and self.fallback_runtime:
+            raise RosterError(
+                "worker %r qualified_recovery replaces fallback_runtime; clear fallback_runtime"
+                % self.name
+            )
+        for fb in self.recovery_fallback_workers:
+            if not isinstance(fb, str) or not fb.strip():
+                raise RosterError("worker %r recovery_fallback_workers must be non-empty names" % self.name)
+        if len(set(self.recovery_fallback_workers)) != len(self.recovery_fallback_workers):
+            raise RosterError("recovery_fallback_workers must be unique")
         if int(self.linger_grace_secs) < 0:
             raise RosterError(
                 "worker %r linger_grace_secs must be >= 0" % self.name
@@ -356,4 +377,11 @@ def load(path: Optional[str] = None, base: Optional[str] = None) -> Roster:
             _log.error("roster: skipping worker %r — %s", name, exc)
             skipped[name] = str(exc)
     _validate_owners(workers)
+    for w in workers.values():
+        for fb in w.recovery_fallback_workers:
+            if fb not in workers:
+                raise RosterError(
+                    "worker %r recovery_fallback_workers references unknown seat %r"
+                    % (w.name, fb)
+                )
     return Roster(workers=workers, path=path, skipped=skipped)

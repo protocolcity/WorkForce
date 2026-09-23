@@ -40,6 +40,7 @@ from . import roster as roster_mod
 from . import routing_policy as routing_policy_mod
 from . import task_routing
 from . import routing_binding
+from . import continuity_recovery as continuity_recovery_mod
 from ._utils import _utc_iso_z
 from .ledger import parse_shifts
 from .schedule import maybe_cron
@@ -270,6 +271,9 @@ def collect_state(config: Dict[str, Any]) -> Dict[str, Any]:
         "projects": sorted(config["projects"]),
         "workers": eligible,
         "excluded_workers": excluded,
+        "recovery_pauses": [p for p in continuity_recovery_mod.list_pause_states(config["local_root"])
+                            if p.get("project") in config["projects"] and
+                            ({p.get("primary_worker"), p.get("target_worker")} & set(config["workers"]))],
     }
 
 
@@ -693,6 +697,90 @@ def _classify_ledger_delta(new_text: str, rc: int) -> Dict[str, Any]:
     }
 
 
+def _execute_pending_recoveries(config: Dict[str, Any], rost) -> List[Dict[str, Any]]:
+    """Run pending qualified recovery plans before normal supervisor dispatch."""
+    root = continuity_recovery_mod.recovery_root(config["local_root"])
+    if not os.path.isdir(root):
+        return []
+    results: List[Dict[str, Any]] = []
+
+    def fetch_task(worker, task_id):
+        origin = engine.desk_origin_from_queue_url(worker.queue_url or "")
+        if not origin:
+            raise ValueError("no desk origin")
+        import urllib.parse
+        import urllib.request
+        product = engine.product_from_queue_url(worker.queue_url or "") or ""
+        url = origin + "/api/admin/tasks/" + urllib.parse.quote(str(task_id))
+        if product:
+            url += "?" + urllib.parse.urlencode({"product": product})
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            payload = json.load(resp)
+        task = payload.get("task") if isinstance(payload, dict) else None
+        if not isinstance(task, dict):
+            raise ValueError("task feed malformed")
+        return task
+
+    def dispatch_fn(target, local_root, receipt_path, reason, *, routing_context):
+        worker = rost.workers.get(target)
+        if worker is None:
+            return 1
+        return engine.dispatch(
+            worker, local_root,
+            recover_receipt=receipt_path,
+            recovery_reason=reason,
+            routing_context=routing_context,
+        )
+
+    def post_fn(url, payload):
+        import urllib.request
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=body, headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.load(resp)
+
+    for name in sorted(os.listdir(root)):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(root, name)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                plan = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if plan.get("status") != "pending":
+            continue
+        # Recovery obeys the same explicit scope, stop/capacity and policy as
+        # fresh dispatch. At most one plan is attempted in a supervisor pass.
+        target = plan.get("target_worker")
+        if (not config.get("routing_policy")
+                or plan.get("policy_path") != config["routing_policy"]
+                or plan.get("host") != config.get("routing_host")
+                or target not in config["workers"] or plan.get("project") not in config["projects"]):
+            continue
+        row, reason = _collect_worker_row(config, rost, target)
+        if row is None or row["busy"] or row["monitoring_flag"]:
+            continue
+        if pq_mod.dispatch_blocked_by_capacity(config["local_root"], config=config,
+                                               proposed_seats=[target]):
+            continue
+        task_id = str(plan.get("task_id") or "")
+        result = continuity_recovery_mod.execute_pending_recovery(
+            local_root=config["local_root"],
+            roster=rost,
+            plan=plan,
+            fetch_task=fetch_task,
+            post_fn=post_fn,
+            dispatch_fn=dispatch_fn,
+        )
+        result["task_id"] = task_id
+        results.append(result)
+        break
+    return results
+
+
 def _dispatch_one(config: Dict[str, Any], worker_name: str, project: str,
                    routing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Fire one worker's own manual shift via the existing engine, honestly.
@@ -785,6 +873,19 @@ def run(config: Dict[str, Any], mode: str = "inspect",
     routing = _load_routing(config)
 
     state_before_provider = collect_state(config)
+
+    recovery_results: List[Dict[str, Any]] = []
+    if mode == "execute" and config.get("routing_policy") and (
+            acknowledge_provider_failures is not None or not _provider_failures_escalated(
+                config["local_root"], config.get("max_consecutive_provider_failures", 3))):
+        rost = roster_mod.load(path=config["roster_path"])
+        recovery_results = _execute_pending_recoveries(config, rost)
+        if recovery_results:
+            result = _skip_result(state_before_provider["generated_at"], mode,
+                                  "qualified_recovery_pass", state_before_provider=state_before_provider)
+            result["recovery_executions"] = recovery_results
+            _write_evidence(config["local_root"], result)
+            return result
 
     if not _has_eligible_ready_work(state_before_provider):
         result = _skip_result(
@@ -897,6 +998,7 @@ def run(config: Dict[str, Any], mode: str = "inspect",
         "dispatch_completed": sum(1 for d in dispatch_results if d.get("completed")),
         "dispatch_failed": sum(1 for d in dispatch_results if d.get("failed")),
         "dispatched": dispatch_results,
+        "recovery_executions": recovery_results,
     }
     if acknowledge_provider_failures is not None:
         result["provider_failure_acknowledgement"] = acknowledge_provider_failures

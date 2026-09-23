@@ -615,3 +615,26 @@ def test_supervisor_context_cannot_launch_a_different_ready_task(setup, tmp_path
     with pytest.raises(PreparationError, match="selected work order changed"):
         prepare(config, feed(dict(task, id="p-2")))
     assert not Path(config["state_dir"]).exists()
+
+
+def test_before_exec_hook_runs_under_inherited_reservation_lock(setup, tmp_path, monkeypatch):
+    from workforce import task_runner as tr
+    config,task=setup
+    path=tmp_path/'runner.json';path.write_text(json.dumps(config))
+    monkeypatch.setattr(tr,'prepare',lambda c: prepare(c,feed(task)))
+    original_cwd=os.getcwd()
+    seen=[]
+    def hook(c,result):
+        with pytest.raises(PreparationError,match='active'):
+            _acquire_lock(result['lock'])
+        seen.append('hook')
+    class Launched(BaseException): pass
+    def exec_stub(*args):
+        seen.append('exec')
+        raise Launched()
+    monkeypatch.setattr(os,'execvpe',exec_stub)
+    try:
+        with pytest.raises(Launched): tr.main(['--config',str(path)],before_exec=hook)
+    finally:
+        os.chdir(original_cwd)
+    assert seen==['hook','exec']
