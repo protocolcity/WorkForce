@@ -397,7 +397,8 @@ def recover(config, receipt_path, reason, fetch=_fetch, legacy_stop_evidence=Non
     for key in ("project", "worker", "task_id", "branch", "checkout", "base"):
         if not isinstance(old.get(key), str) or not old[key]:
             raise PreparationError("Canonical original receipt is missing required fields")
-    if old.get("lock_protocol") != LOCK_PROTOCOL_VERSION:
+    if (old.get("lock_protocol") != LOCK_PROTOCOL_VERSION
+            or old.get("execution_lock_protocol") != LOCK_PROTOCOL_VERSION):
         if not isinstance(legacy_stop_evidence, str) or not legacy_stop_evidence.strip():
             raise PreparationError(
                 "Canonical receipt predates the lock protocol; an absent or unlocked lock file cannot "
@@ -527,6 +528,12 @@ def main(argv=None, *, before_exec=None):
         if before_exec is not None:
             before_exec(config, result)
             _revalidate_launch(config, result)
+        # Preparation alone cannot prove an older/custom wrapper inherited
+        # the lock. Only this guarded exec path attests actual launch exclusion.
+        receipt_path = Path(result["receipt"])
+        receipt = json.loads(receipt_path.read_text())
+        receipt["execution_lock_protocol"] = LOCK_PROTOCOL_VERSION
+        receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
         os.chdir(result["checkout"])
         env = dict(os.environ)
         env.update(WL_AGENT_ID=result["worker"], TP_AGENT_ID=result["worker"],
