@@ -974,7 +974,7 @@ def reconcile_dead_shift(
         if not owner:
             receipt["skipped"].append("%s: no-owner-marker" % tid)
             continue
-        # Match identity or name (Owner: salem vs identity salem).
+        # Match the signed identity or configured worker name.
         if owner not in (identity, worker.name):
             receipt["skipped"].append("%s: owner=%s" % (tid, owner))
             continue

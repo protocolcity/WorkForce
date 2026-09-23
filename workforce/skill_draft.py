@@ -1,6 +1,6 @@
 """Skill-draft extractor: closed shift evidence → draft SKILL.md (no auto-L0).
 
-Core path (design wf-204 / research hermes-skill-accretion-bp-gap-2026-08.md §3.2):
+Data flow:
 
     close-out comment (Completed: / Verification: / Links:)
         → extract_sections()
@@ -8,8 +8,7 @@ Core path (design wf-204 / research hermes-skill-accretion-bp-gap-2026-08.md §3
         → workers/<slug>/skills-drafts/<ticket-id>/SKILL.md
           (git-tracked staging; NEVER ~/.agents/skills/ or local/)
 
-Allowlist: roster flag skill_draft=true per seat, or the SKILL_DRAFT_SEATS
-bootstrap set. Promote is always citizen-gated: copy the staging directory to
+Allowlist: explicit roster flag skill_draft=true per seat. Promote is always citizen-gated: copy the staging directory to
 the L0 skill shelf and run skills_sync.sh if applicable. Discard: delete the
 directory.
 
@@ -22,10 +21,6 @@ import os
 import re
 from typing import Dict, Optional
 
-
-# Bootstrap allowlist — seats that may propose drafts without a roster flag.
-# Roster skill_draft=true extends this per deployment.
-SKILL_DRAFT_SEATS = frozenset({"salem", "blossom"})
 
 
 def _slugify(text: str) -> str:
@@ -127,20 +122,13 @@ def build_skill_md(
 
 
 def is_draft_allowed(worker: str, workers: Optional[Dict] = None) -> bool:
-    """True when the worker seat may propose skill drafts.
-
-    Allowlist priority:
-      1. SKILL_DRAFT_SEATS bootstrap set (no roster needed).
-      2. Roster flag skill_draft=true on the worker row.
-    """
-    if worker in SKILL_DRAFT_SEATS:
-        return True
+    """True only for a registered seat explicitly permitted to propose drafts."""
     if workers is None:
         return False
     w = workers.get(worker)
     if w is None:
         return False
-    return bool(getattr(w, "skill_draft", False))
+    return getattr(w, "skill_draft", False) is True
 
 
 def draft_from_closeout(
